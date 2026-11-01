@@ -96,24 +96,38 @@ pub struct InterestSection {
     pub payment_credentials: Vec<String>,
 }
 
-/// Modules that cold-start a newly-subscribed predicate via the
-/// budget-safe chunked `rebootstrap` pump (the host drives it after
-/// `update-interest` on an Add) rather than the host's inline
-/// synthetic bootstrap. These page-oriented modules dropped their
-/// inline single-fuel cold-start (which trapped + emitted nothing
-/// for large collections) and seed a scoped onboard set instead.
+/// Modules that produce their state in `rebootstrap`, so a newly-subscribed
+/// predicate is cold-started by the budget-safe `rebootstrap` pump — the host
+/// drives it after `update-interest` on an Add, and again on the startup
+/// reconcile — rather than by the host's inline synthetic bootstrap.
 ///
-/// Hardcoded rather than manifest-driven: the natural home is a
-/// manifest `[interest]` flag, but `toml::to_string` drops a trailing
-/// nested table whose siblings are empty-skipped, silently losing the
-/// flag for exactly these (no static interest) modules. Revisit as a
-/// manifest field if the serializer is fixed or the manifest moves to
-/// CBOR. Other modules must NOT be listed here — a pump on a module
-/// that also cold-starts inline (burn-address) would double-emit.
+/// Two reasons an id is here, and the second one is not the name:
+///
+/// - **Page-oriented scanners** — `collection-holders`, `collection-metadata`,
+///   `holder-distribution`, `vesting-tracker` — dropped their inline single-fuel
+///   cold start (it trapped and emitted nothing for large collections) and seed
+///   a scoped onboard set instead.
+/// - **`holders-from-fold`** has no inline cold start at all. Its entire state
+///   is a published artifact it pages out of `fold-data`, and `handle-events` is
+///   a no-op, so the synthetic-event path would replay history at a module that
+///   ignores it and the companion would receive nothing. Subscribing is what has
+///   to drive `rebootstrap`, and this list is what makes subscribing do that.
+///
+/// Hardcoded rather than manifest-driven: the natural home is a manifest
+/// `[interest]` flag, but `toml::to_string` drops a trailing nested table whose
+/// siblings are empty-skipped, silently losing the flag for exactly these (no
+/// static interest) modules. Revisit as a manifest field if the serializer is
+/// fixed or the manifest moves to CBOR. Other modules must NOT be listed here —
+/// a pump on a module that also cold-starts inline (burn-address) would
+/// double-emit.
 pub fn is_chunked_cold_start_module(module_id: &str) -> bool {
     matches!(
         module_id,
-        "collection-holders" | "collection-metadata" | "holder-distribution" | "vesting-tracker"
+        "collection-holders"
+            | "collection-metadata"
+            | "holder-distribution"
+            | "vesting-tracker"
+            | "holders-from-fold"
     )
 }
 

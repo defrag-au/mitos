@@ -221,15 +221,15 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
 # The chain-neutral event vocabulary. `be4544a2` predates the crate, so this resolves
 # through the `[patch]` block at the bottom while the branch that carries it is local —
 # bump this `rev` and re-comment that block together, never one without the other.
-chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
-asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "e457f8913ebedf5dc18043b81d3ab8e68bfcd090" }
+chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }

@@ -10,7 +10,9 @@
 # `MITOS_BOOK_DIR` / `MITOS_DATUM_DIR` / `MITOS_FOLD_ARTIFACT` are container paths and are
 # always exported by `up.sh` (empty when the run does not use one), because a compose
 # file can only name a variable that resolves. An empty `MITOS_FOLD_ARTIFACT` is unset to
-# the host, not a directory — see `host_fns_v2/fold_data.rs`.
+# the host, not a directory — see `host_fns_v2/fold_data.rs`. A non-empty one names either
+# one artifact directory (served to every module) or a directory of them named by module
+# id, which is how one wasm serves several policies.
 #
 # The worker is the module owner: it serves `cip-25-mint` at the well-known
 # paths mitos derives from the announcement. `up.sh` starts a Cloudflare quick

@@ -158,8 +158,15 @@ needs no stack at all:
 direnv exec . cargo test -p mitos-platform --test holders_from_fold -- --nocapture
 ```
 
-That test boots the real host, activates the real built module, drives `rebootstrap`, and
-compares the emission against `holders.tsv` parsed independently in the test.
+That test boots the real host, activates the real built module, drives `rebootstrap`,
+and compares the emission against `holders.tsv` parsed independently in the test.
+
+**One wasm, several policies.** `--fold` also accepts a directory of artifacts named by
+module id: `<dir>/<module-id>/artifact.meta`. Each module then serves its own table, and
+because the wasm is content-addressed the host holds one copy of the bytes no matter how
+many variants name it. `fold-probe pilot --out .tmp/fold/holders-a` per policy, then
+`--fold .tmp/fold`. The acceptance test covers both shapes — a variant with an artifact
+emits, a variant without one stays silent.
 
 **Network mismatch is the point, not a bug.** The chunk store on this workstation is
 mainnet and the stack follows preprod, so a fold artifact served here is a mainnet table

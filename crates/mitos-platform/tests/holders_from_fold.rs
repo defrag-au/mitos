@@ -9,11 +9,13 @@
 //!
 //! Boots the real `mitos-platform` host with [`NullChainDataPlane`] — the module must
 //! never call a chain host fn, and a stub plane is how that is enforced rather than
-//! trusted — activates the real built `holders-from-fold` artifact, and calls
-//! `start(module, rebootstrap = true)`, which drives the module's `rebootstrap` on a
-//! disposable backfill instance to completion. The module reads `artifact.meta`, pages
-//! `holders.tsv` through `fold-data::read`, parses it, and emits
-//! `SnapshotBegin` → `SnapshotChunk`* → `SnapshotEnd`.
+//! trusted — activates the real built `holders-from-fold` artifact, and **subscribes a
+//! companion to the artifact's policy**. That subscription is the production trigger:
+//! `manifest::is_chunked_cold_start_module` names this module, so the host answers an
+//! interest add with `rebootstrap(Onboard)` on a disposable backfill instance instead
+//! of replaying history at a module whose `handle-events` is a no-op. The module then
+//! reads `artifact.meta`, pages `holders.tsv` through `fold-data::read`, parses it, and
+//! emits `SnapshotBegin` → `SnapshotChunk`* → `SnapshotEnd`.
 //!
 //! # What it asserts
 //!
@@ -49,11 +51,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cardano_assets::PolicyId;
 use mitos_platform::host_fns::{DataPlaneFacade, emit, state_kv};
-use mitos_platform::host_v2::{KvFactory, ModuleHostV2, SubscriptionFactory};
+use mitos_platform::host_v2::{InterestRouter, KvFactory, ModuleHostV2, SubscriptionFactory};
 use mitos_platform::registry_v2::ResourceBudget;
 use mitos_platform::storage::ModuleStorage;
-use mitos_protocol::Interest as WireInterest;
+use mitos_protocol::{AssetSelector, Interest as WireInterest, InterestOp as WireInterestOp};
 use pallas_addresses::Address;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -61,6 +64,8 @@ use tokio::sync::Mutex;
 use common::{NullChainDataPlane, OneShotSub, tempdir, write_companion_subscription};
 
 const MODULE_ID: &str = "holders-from-fold";
+/// The second variant: the same wasm, a directory the host serves nothing from.
+const SILENT: &str = "holders-from-fold-silent";
 const CLIENT_ID: &str = "fold-test";
 const COMPANION_KEY: &str = "fold-companion";
 
@@ -152,6 +157,16 @@ fn module_artifact_dir() -> PathBuf {
         .join("community-modules/holders-from-fold/target/mitos/holders-from-fold")
 }
 
+/// A copy of an artifact directory — two files, and what a second variant looks like on
+/// disk when both name the same wasm.
+fn copy_artifact(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("the variant's directory");
+    for entry in std::fs::read_dir(from).expect("read the pilot artifact") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).expect("copy");
+    }
+}
+
 // ── The expected snapshot, parsed here ──────────────────────────────────────
 
 /// A holder as a comparable string: the wire variant plus its identity.
@@ -226,16 +241,6 @@ async fn holders_from_fold_serves_the_artifact_it_is_given() {
         .with_test_writer()
         .try_init();
 
-    // The host resolves its artifact once, from the environment, the first time a
-    // module asks. No other test in this binary reads `MITOS_FOLD_ARTIFACT`, and the
-    // read happens after `start` below, so nothing races this write.
-    //
-    // SAFETY: `set_var` is unsafe because a concurrent `getenv` is UB on some
-    // platforms. This is the only writer and the only reader in this process.
-    unsafe {
-        std::env::set_var("MITOS_FOLD_ARTIFACT", &dir);
-    }
-
     // ── expected, from the artifact's own bytes ─────────────────────────────
     let rows = std::fs::read_to_string(dir.join("holders.tsv")).expect("holders.tsv");
     let (want, holders) = expected(&rows);
@@ -250,7 +255,26 @@ async fn holders_from_fold_serves_the_artifact_it_is_given() {
         want.len(),
     );
 
-    // ── the host, exactly as the bundle builds it ───────────────────────────
+    // ── two variants of one wasm ───────────────────────────────────────────
+    //
+    // A variant is a module id. The wasm is content-addressed, so both ids name the same
+    // bytes; what differs is the artifact each serves. `<root>/<module-id>/` is the whole
+    // of the rule, so `SILENT`'s directory exists and holds no manifest — it must serve
+    // nothing. That is what makes the resolution observable: under the process-wide
+    // artifact this used to be, `SILENT` would have emitted variant one's table.
+    let root = tempdir("fold-root");
+    copy_artifact(&dir, &root.join(MODULE_ID));
+    std::fs::create_dir_all(root.join(SILENT)).expect("the silent variant's directory");
+
+    // The root is resolved when an instance is built, not once per process, so this has
+    // to be set before either module starts and nothing else in this binary reads it.
+    //
+    // SAFETY: `set_var` is unsafe because a concurrent `getenv` is UB on some platforms.
+    // This is the only writer and the only reader in this process.
+    unsafe {
+        std::env::set_var("MITOS_FOLD_ARTIFACT", &root);
+    }
+
     let artifact = module_artifact_dir();
     let wasm_path = artifact.join(format!("{MODULE_ID}.wasm"));
     let wasm = std::fs::read(&wasm_path).unwrap_or_else(|error| {
@@ -261,23 +285,42 @@ async fn holders_from_fold_serves_the_artifact_it_is_given() {
             wasm_path.display()
         )
     });
-    let manifest = mitos_platform::manifest::Manifest::parse(
+    let base = mitos_platform::manifest::Manifest::parse(
         &std::fs::read_to_string(artifact.join("manifest.toml")).expect("manifest.toml"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest.module.id, MODULE_ID);
+    assert_eq!(base.module.id, MODULE_ID);
 
     let storage_dir = tempdir("holders-from-fold");
     let storage = ModuleStorage::new(&storage_dir);
-    storage.activate(&manifest, &wasm).expect("activate");
-    write_companion_subscription(
-        &storage,
-        MODULE_ID,
-        CLIENT_ID,
-        COMPANION_KEY,
-        // The module emits on the policy lane; a companion that matches everything
-        // receives the whole sequence.
-        vec![WireInterest::any()],
+    for id in [MODULE_ID, SILENT] {
+        let mut manifest = base.clone();
+        manifest.module.id = id.to_owned();
+        storage.activate(&manifest, &wasm).expect("activate");
+        write_companion_subscription(
+            &storage,
+            id,
+            CLIENT_ID,
+            COMPANION_KEY,
+            // The module emits on the policy lane; a companion that matches everything
+            // receives the whole sequence.
+            vec![WireInterest::any()],
+        );
+    }
+    assert_eq!(
+        storage
+            .read_manifest(MODULE_ID)
+            .expect("manifest")
+            .expect("activated")
+            .module
+            .sha256,
+        storage
+            .read_manifest(SILENT)
+            .expect("manifest")
+            .expect("activated")
+            .module
+            .sha256,
+        "one wasm artifact, two module ids — the CAS holds the bytes once",
     );
 
     let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine().expect("engine");
@@ -308,13 +351,26 @@ async fn holders_from_fold_serves_the_artifact_it_is_given() {
         ResourceBudget::default(),
     );
 
-    // `rebootstrap = true` is the recapture shape: the host drives the module's
-    // `rebootstrap` to `done` on a disposable instance. The emissions land in the sink
-    // the drain task writes from, and that task is spawned alongside the follower — so
-    // the store is read until the sequence closes rather than once `start` returns.
-    let ingested = host.start(MODULE_ID, true).await.expect("start");
-    println!("rebootstrap ingested {ingested} holding(s)");
+    // ── subscribe both, the production trigger ─────────────────────────────
+    //
+    // A companion names a policy; nothing else happens. `is_chunked_cold_start_module`
+    // is what turns that into the module's `rebootstrap` — without it the host would
+    // replay history through `handle-events`, which this module ignores, and the
+    // companion would receive nothing at all.
+    let manifest_policy = policy_hex(&dir);
+    let mut interest = WireInterest::any();
+    interest.asset = AssetSelector::Policy(PolicyId::new(manifest_policy.clone()).expect("policy"));
+    for id in [MODULE_ID, SILENT] {
+        host.start(id, false).await.expect("start");
+        host.route_interest(id, WireInterestOp::Add, vec![interest.clone()])
+            .await
+            .expect("route_interest");
+    }
+    println!("subscribed {manifest_policy} to {MODULE_ID} and {SILENT}");
 
+    // The emissions land in the sink the drain task writes from, and that task is
+    // spawned alongside the follower — so the store is read until the sequence closes
+    // rather than once the subscription returns.
     let store = storage.emissions_store(MODULE_ID).expect("emissions store");
     let deadline = Instant::now() + Duration::from_secs(30);
     let rows = loop {
@@ -336,7 +392,32 @@ async fn holders_from_fold_serves_the_artifact_it_is_given() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
-    host.stop(MODULE_ID).await.expect("stop");
+
+    // ── the variant with no artifact stays inert ───────────────────────────
+    //
+    // There is no terminal event to poll for, so this is a bounded quiet window rather
+    // than a wait: variant one's whole sequence completes in well under a second, so five
+    // is generous enough that a slow machine cannot pass this by being slow.
+    let silent = storage.emissions_store(SILENT).expect("emissions store");
+    let quiet_until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = silent
+            .list_queued_for_companion(COMPANION_KEY, CLIENT_ID)
+            .expect("list emissions");
+        assert!(
+            rows.is_empty(),
+            "{SILENT} has no artifact and must serve none; it emitted {} event(s)",
+            rows.len(),
+        );
+        if Instant::now() >= quiet_until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for id in [MODULE_ID, SILENT] {
+        host.stop(id).await.expect("stop");
+    }
     drop(tx);
 
     let mut events: Vec<CollectionEvent> = Vec::with_capacity(rows.len());
@@ -348,7 +429,6 @@ async fn holders_from_fold_serves_the_artifact_it_is_given() {
     }
 
     // ── assert ──────────────────────────────────────────────────────────────
-    let manifest_policy = policy_hex(&dir);
     let mut begins = 0usize;
     let mut ends = 0usize;
     let mut chunks = 0usize;

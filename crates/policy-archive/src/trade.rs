@@ -268,13 +268,14 @@ pub enum Event {
 /// is linked by wasm consumers and the whole job is splitting a known-shape
 /// address into two byte ranges.
 pub fn address_parts(addr: &str) -> Option<(String, Option<String>)> {
-    let out = bech32_payload(addr)?;
-    if out.len() < 29 {
+    let mut buf = [0u8; PAYLOAD_MAX];
+    let n = bech32_payload(addr, &mut buf)?;
+    if n < 29 {
         return None;
     }
     Some((
-        hex(&out[1..29]),
-        (out.len() >= 57).then(|| hex(&out[29..57])),
+        hex(&buf[1..29]),
+        (n >= 57).then(|| hex(&buf[29..57])),
     ))
 }
 
@@ -293,48 +294,85 @@ pub fn address_parts(addr: &str) -> Option<(String, Option<String>)> {
 /// half can produce from a `stake1…` address, so the two halves of one collection agree —
 /// which is what lets a holder fact and a sale be attributed to the same party.
 pub fn account_key(address: &str) -> String {
-    let Some(payload) = bech32_payload(address) else {
+    let mut buf = [0u8; PAYLOAD_MAX];
+    let Some(n) = bech32_payload(address, &mut buf) else {
         return address.to_string();
     };
-    let Some(header) = payload.first() else {
+    let Some(&header) = buf.first() else {
         return address.to_string();
     };
     match header >> 4 {
         // Base addresses: 28 bytes of payment credential, then 28 of stake.
-        0..=3 if payload.len() >= 57 => hex(&payload[29..57]),
+        0..=3 if n >= 57 => hex(&buf[29..57]),
         // Reward addresses: the payload is the stake credential and nothing else.
-        14 | 15 if payload.len() >= 29 => hex(&payload[1..29]),
+        14 | 15 if n >= 29 => hex(&buf[1..29]),
         // Enterprise, pointer, Byron, or something this decoder does not model.
         _ => address.to_string(),
     }
 }
 
-/// The bytes a bech32 string carries, separator and six-character checksum removed.
+/// The bytes a bech32 string carries, separator and six-character checksum
+/// removed, written into `out` and returned as a length.
+///
+/// ⚠️ A lookup table, not a scan of the alphabet per character. MEASURED with
+/// `sample`, after the hex encoder was fixed this was the largest self-time
+/// frame in a fold by 3×: the old loop searched 32 bytes of `CHARSET` for every
+/// input character, so one address cost ~3,000 comparisons to produce 57 bytes.
+///
+/// A fixed buffer rather than a `Vec`: a Shelley payload is at most 57 bytes
+/// (base) or 29 (reward, enterprise, pointer), so the push-and-grow this used to
+/// do was a reallocation per address for nothing.
 ///
 /// No checksum verification: every address here comes from a decoded transaction, and the
 /// checksum guards transmission rather than storage. A character outside the alphabet
 /// fails, which is what makes a hex string fall through rather than half-decode.
-fn bech32_payload(encoded: &str) -> Option<Vec<u8>> {
-    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+fn bech32_payload(encoded: &str, out: &mut [u8; PAYLOAD_MAX]) -> Option<usize> {
     let sep = encoded.rfind('1')?;
     let data = encoded.get(sep + 1..)?;
     if data.len() < 6 {
         return None;
     }
+    let data = &data.as_bytes()[..data.len() - 6];
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
-    let mut out: Vec<u8> = Vec::new();
-    for c in data[..data.len() - 6].bytes() {
-        let v = CHARSET.iter().position(|&x| x == c)? as u32;
-        acc = (acc << 5) | v;
+    let mut n = 0usize;
+    for &c in data {
+        let v = BECH32[c as usize];
+        if v == INVALID {
+            return None;
+        }
+        acc = (acc << 5) | v as u32;
         bits += 5;
         while bits >= 8 {
             bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
+            if n == out.len() {
+                return None;
+            }
+            out[n] = ((acc >> bits) & 0xff) as u8;
+            n += 1;
         }
     }
-    Some(out)
+    Some(n)
 }
+
+/// Longest Shelley payload this decoder will hold: a base address's 57 bytes
+/// with room to spare. Anything longer is not an address this models.
+const PAYLOAD_MAX: usize = 64;
+
+/// `0xFF` for a byte outside the alphabet.
+const INVALID: u8 = 0xFF;
+
+/// bech32's data alphabet, indexed by ASCII byte.
+const BECH32: [u8; 256] = {
+    const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut table = [INVALID; 256];
+    let mut i = 0;
+    while i < CHARSET.len() {
+        table[CHARSET[i] as usize] = i as u8;
+        i += 1;
+    }
+    table
+};
 
 /// Lower-case hex, two characters a byte.
 ///

@@ -77,6 +77,15 @@ pub struct HostStateV2 {
     /// `utxos-by-*` call returns; the host loop feeds it per-call
     /// budget telemetry between guest calls.
     pub(crate) adaptive: crate::budget::AdaptiveSizer,
+
+    /// The fold artifact this **instance** serves, opened when the instance was built.
+    ///
+    /// Per instance and not per process: two modules on one host may serve different
+    /// artifacts, and a variant of one wasm is a module id — see
+    /// [`crate::host_fns_v2::fold_data`]. Immutable for the instance's life, so this is
+    /// owned configuration rather than shared mutable state. `None` means this module
+    /// serves no artifact, which is a legal host shape.
+    pub(crate) fold: Option<Arc<mitos_data_plane::FoldArtifact>>,
 }
 
 impl HostStateV2 {
@@ -85,6 +94,7 @@ impl HostStateV2 {
         data_plane: Arc<dyn DataPlaneFacade>,
         kv: crate::host_fns::state_kv::ModuleKv,
         emitter: crate::host_fns::emit::EventSink,
+        fold: Option<Arc<mitos_data_plane::FoldArtifact>>,
     ) -> Self {
         Self {
             table: ResourceTable::new(),
@@ -102,6 +112,7 @@ impl HostStateV2 {
             limiter: crate::budget::BudgetLimiter::new(None),
             scan_cache: crate::host_fns_v2::scan_cache::ScanCache::default(),
             adaptive: crate::budget::AdaptiveSizer::default(),
+            fold,
         }
     }
 

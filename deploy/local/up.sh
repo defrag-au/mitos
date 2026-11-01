@@ -127,8 +127,13 @@ if [ -n "${DATUM_HOST}" ]; then
 fi
 if [ -n "${FOLD_HOST}" ]; then
     FOLD_DIR="$(container_path "${FOLD_HOST}")"
-    [ -f "${FOLD_HOST}/artifact.meta" ] \
-        || die "${FOLD_HOST} has no artifact.meta; point --fold at a fold artifact (fold-probe pilot … --out <dir>)"
+    # Either one artifact directory, served to every module, or a directory of them
+    # named by module id — one wasm, one variant per module. See
+    # `crates/mitos-platform/src/host_fns_v2/fold_data.rs`.
+    if [ ! -f "${FOLD_HOST}/artifact.meta" ] \
+        && ! ls "${FOLD_HOST}"/*/artifact.meta >/dev/null 2>&1; then
+        die "${FOLD_HOST} holds no artifact.meta, at its root or one directory down; point --fold at an artifact (fold-probe pilot … --out <dir>) or at a directory of them named by module id"
+    fi
 fi
 if [ "${PLANE}" = "book" ] && [ -z "${BOOK_DIR}" ]; then
     die "--plane book needs --book <dir> (or MITOS_BOOK_DIR)"

@@ -158,7 +158,10 @@ pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError
     let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
     let kv = state_kv::ModuleKv::new_in_memory();
     let (sink, _events) = emit::EventSink::new();
-    let host_state = HostStateV2::new("__inspect__".to_owned(), dp, kv, sink);
+    // The inspector loads a module to read its ABI, never to run it, so it serves no
+    // artifact: `fold-data` answering `none` is honest here and keeps the inspect path
+    // independent of whatever this host happens to be serving.
+    let host_state = HostStateV2::new("__inspect__".to_owned(), dp, kv, sink, None);
 
     let mut store = Store::new(&engine, host_state);
     let budget = ResourceBudget::default();

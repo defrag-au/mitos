@@ -299,6 +299,75 @@ aggregate and the view disagree.
   on `collection-holders` — one ledger cannot have a frozen artifact and a moving tip as
   two sources of truth. `collection-holders` keeps its interest handling, its live events
   and its scan; the fold reader has no interest to keep and no delta to compute.
+
+**Consuming it.** The fold reader emits `collection-holders`'s own wire shape, so a consumer's
+channel applies unchanged — `cnft.dev-workers`' `collection-ownership` already has one
+(`CollectionHoldersChannel`, same `CollectionEvent`, snapshot = wipe and repopulate). Three
+things follow from how the host and the companion trait work today, and each one constrains
+the wiring:
+
+- **The subscription must follow the artifact.** `POST /api/companions/subscribe` validates
+every target with `?` (`crates/mitos-platform/src/companions.rs::validate_and_persist_module`),
+so one target naming a module the host has no manifest for refuses the **whole**
+registration — taking every other channel down with it. A consumer cannot subscribe to
+`holders-from-fold` speculatively; the host that serves the artifact and the consumer that
+names it are one deployment.
+- **That is not expressible per deployment yet.** `MitosCompanion::subscribe_targets(&self)`
+takes no context and `OwnershipImpl` is a unit struct whose `Config` is `()`. Gating on a
+var means giving the companion a config it can read — a change to the companion trait and to
+every `impl` — or running a second, fold-backed consumer.
+- **It replaces, it does not accompany.** A fold snapshot for a policy and a chain snapshot for
+the same policy are two authoritative replacements for one `ownership` table; the later one
+wins. A DO picks one per policy, and the fold side is the honest choice for a collection
+whose answer was already computed to a base slot.
+
+**A subscription is the trigger, and it did not exist.** `follower_v2::apply_interest_update`
+answers a new predicate one of two ways: `rebootstrap` for a module that
+`manifest::is_chunked_cold_start_module` names, or the host's synthetic-event bootstrap for
+anything else. `holders-from-fold` is right for neither by nature — it has no inline cold start
+and its `handle-events` is a no-op — so a companion that subscribed received **nothing at all**.
+It is now named in that list, and the acceptance test measures both directions: not listed, 0
+emissions in 30 s; listed, the full sequence.
+
+`augminted-bots/workers/holder-roles` is the strongest first consumer we have, and it is a
+companion — the DO subscribes and the reconcile is driven by snapshot arrival, rather than by a
+cron that fetches a page:
+
+- **It is aggregate by construction.** `docs/HOLDER_ROLES_DESIGN.md` opens with "a holder role
+  is a reconciliation problem, not an event stream", and the object is forbidden from folding
+  balances itself — it receives one full candidate set per policy and plans against it.
+- **Its stated constraint is the page cap.** §15: 2,000 holders at the origin, 500 through the
+  flow-explorer, and "a token whose floor matches more than that needs a paged holder route".
+  An artifact is the whole set by construction — no cap, no truncation, no page.
+- **It already tolerates staleness.** Dwell timers, hysteresis, and §1's rule that "a role
+  removed on a transient gap is worse than a role added five minutes late" — so a position at a
+  base slot is the right freshness rather than a compromise.
+- **The sync seam is one function.** `src/sync.rs::snapshot_for` is the only thing that knows
+  where a holder set comes from; `resolve_owners` and `holder_roles_core::aggregate` are
+  source-agnostic. A channel that accumulates `CollectionEvent`s and calls the same two
+  functions produces the same `ReconcileRequest` the cron builds today, and the DO's plan path
+  does not change at all.
+
+The one thing the push path does not give for free is **identity**. The fold snapshot is
+`(asset_name, holder, quantity)` keyed by stake credential; a holder role is keyed by Discord
+user. That join is worker-side either way (`resolve_owners`, one batched call to `auth`), so it
+moves from the cron into the channel rather than disappearing. Two details the arm must keep:
+`trustworthy` means *complete*, not *current*, so the snapshot id should carry the base slot and
+let the operator see the age; and `min` still has to filter before the sum, or the linked/unlinked
+ratio the console reports changes meaning.
+
+Where the artifact lives is the host's business: `MITOS_FOLD_ARTIFACT` names a directory on the
+host, and the local stack mounts this repo's `.tmp`. Publishing to R2 is only needed for a *pull*
+consumer — a browser, or a worker with no host beside it — and is not on this path.
+
+**The variant axis is the module id.** `MITOS_FOLD_ARTIFACT` names either one artifact, served to
+every module on the host, or a directory of them named `<root>/<module-id>/`. A variant is
+therefore a module id: the wasm is content-addressed, so every variant names the same set of
+bytes and the host stores one copy, while the artifact each one serves is what differs. That is
+what lets one binary answer for several policies — a module id and a small manifest per policy,
+one wasm, one subscription per companion. Instances per module id stay capped
+(`MAX_INSTANCES_PER_MODULE` is a migration bound, not a fan-out), which is why the variant is a
+separate module rather than a second instance of one.
 - Parity: the artifact summary against the module's 396-ref snapshot, byte-identical where
   they overlap. The 995-ref and 9,625-ref policies exercise the delta path and the
   no-cap enumeration, not the snapshot builder.
@@ -350,10 +419,14 @@ The gate:
    emission is compared with `holders.tsv` parsed independently in the test —
    **1 begin · 1 chunk · 1 end · 294 holdings · 294 holders · Σ 68,994,134**, matching the
    pilot exactly. No chain, no book, no Dolos, `NullChainDataPlane` underneath so a stray
-   chain call would fail rather than pass silently. What remains unwired is a *subscriber*:
-   the module starts when a companion names it, and minting-engine names only
-   `cip-25-mint`, so on the stack it is activated and idle. Wiring it in belongs to the
-   consumer, in the consumer's repo.
+   chain call would fail rather than pass silently. The test drives the **subscription**, not a
+   recapture — a companion names the policy and the host answers with the module's `rebootstrap`
+   — and it runs **two variants of one wasm**: two module ids over the same content-addressed
+   bytes, one with an artifact directory and one with a directory the host serves nothing from.
+   The first emits the table, the second stays silent, which is the check that the artifact is
+   resolved per instance rather than per process. What remains unwired is a real companion in a
+   consumer repo, not the trigger. That is `augminted-bots/workers/holder-roles`, which is not in
+   production use and can be reshaped freely; see §7's "Consuming it".
 5. **No production path** — the first publish target is a local directory or a test prefix.
    `mitos-watch`, the box, and the edge are untouched. **Holds.**
 
@@ -427,6 +500,13 @@ Settled:
 
 Open:
 
+- **The emission envelope carries a slot and nothing else.** A companion cannot tell how
+  old an artifact is or which network it covers. `Stamp` is `base_slot`/`base_hash`/`source`,
+  a build timestamp in `artifact.meta` would fail the byte-identical rebuild gate, and the
+  tip lives in the host rather than in the deliberately chain-free module. One additive
+  field on `SnapshotBegin` naming the artifact's build time and network would answer both;
+  worth deciding before a second companion needs it. Found from the holder-roles companion,
+  2026-11-01.
 - Base cadence: full rebuild at an epoch boundary is the starting assumption; confirm
   against the publish path's cost.
 - Which aggregates get a delta in v1: proposed holder table and mint ledger only.

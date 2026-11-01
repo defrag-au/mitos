@@ -74,6 +74,16 @@ pub enum FoldError {
 }
 
 impl FoldArtifact {
+    /// Whether `dir` is an artifact directory — one with a manifest to name.
+    ///
+    /// A question about the layout, asked where the layout is known. A host that serves
+    /// several artifacts has to tell one artifact from a directory *of* them without
+    /// opening either, otherwise it would have to reconstruct the manifest's own file
+    /// name — which is the contract's business, not the caller's.
+    pub fn is_artifact(dir: &Path) -> bool {
+        dir.join(Artifact::FILE).is_file()
+    }
+
     /// Open `dir` and check that every file the manifest names is the length it claims.
     ///
     /// A file whose length is not the manifest's is an artifact a writer did not finish, and

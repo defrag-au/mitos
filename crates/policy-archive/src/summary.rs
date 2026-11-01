@@ -72,7 +72,13 @@ pub const SUMMARY: &str = "summary.bin";
 /// ⚠️ **3 adds [`Summary::unit`].** Same reason, same refusal: a version-2 file
 /// has no unit to read, and every reader of this crate checks the byte before
 /// it decodes anything.
-pub const SUMMARY_FORMAT: u8 = 3;
+///
+/// ⚠️ **4 adds [`LpProvider::address`] and [`VestOwner::address`].** A
+/// version-3 file's provider list has one field fewer per provider, so a
+/// version-3 read by this build would drift by four bytes per provider and then
+/// read the rest of the summary against the wrong offsets. Refused on byte zero
+/// like the rest, and the next fold rewrites it.
+pub const SUMMARY_FORMAT: u8 = 4;
 /// The directory, beside the manifest, holding one file per checkpoint.
 pub const CHECKPOINTS: &str = "checkpoints";
 /// Bumped whenever [`Checkpoint`] changes shape.
@@ -249,6 +255,15 @@ pub struct VestLock {
 pub struct VestOwner {
     /// The owner's holder key.
     pub key: String,
+    /// The address the owner is shown by, where the fold saw one. A lock
+    /// script's own address is the PLATFORM's — the units sit at a script that
+    /// delegates to the platform's stake key — so an unrolled row has no address
+    /// to name the owner by unless this carries one.
+    ///
+    /// Empty where the owner's payment credential never appears in this
+    /// policy's movements, which is the only place the fold can learn it.
+    #[serde(default)]
+    pub address: String,
     pub amount: u64,
     pub locks: Vec<VestLock>,
 }
@@ -258,6 +273,16 @@ pub struct VestOwner {
 pub struct LpProvider {
     /// The provider's holder key.
     pub key: String,
+    /// The address the provider is shown by, from the LP policy's own fold —
+    /// which is the only place an LP-only party's address exists, because it
+    /// never moved the token this archive folds and so has no row here.
+    ///
+    /// Empty where the attribution came from a farm's staking datum: that
+    /// names a credential and nothing else, and the pool datum it sits in names
+    /// no address either. A reader resolves a name by the key itself in that
+    /// case, or leaves it shortened.
+    #[serde(default)]
+    pub address: String,
     /// LP tokens held (or staked) by the provider.
     pub lp_tokens: u64,
     /// The policy's units their LP share accounts for.
@@ -398,13 +423,13 @@ impl Summary {
     pub fn apply_segmentation(&mut self, seg: Segmentation) {
         use std::collections::{HashMap, HashSet};
 
-        let lp: HashMap<&str, u64> = seg
+        let lp: HashMap<&str, (u64, &str)> = seg
             .lp
             .as_ref()
             .map(|lp| {
                 lp.providers
                     .iter()
-                    .map(|p| (p.key.as_str(), p.amount))
+                    .map(|p| (p.key.as_str(), (p.amount, p.address.as_str())))
                     .collect()
             })
             .unwrap_or_default();
@@ -428,7 +453,7 @@ impl Summary {
                     out
                 });
         for h in &mut self.top {
-            h.lp_amount = lp.get(h.key.as_str()).copied().unwrap_or(0);
+            h.lp_amount = lp.get(h.key.as_str()).map_or(0, |(amount, _)| *amount);
             let vested = vests
                 .get(h.key.as_str())
                 .copied()
@@ -450,27 +475,39 @@ impl Summary {
         //
         // ⚠️ These rows are why a reader selects on `amount > 0 || lp_amount > 0`
         // and never on `amount > 0` alone.
+        //
+        // The address comes from the provider, not from this token's fold: a
+        // party with no balance here has no address HERE, and the LP policy's
+        // fold is the only place its address exists. It is what `/api/handles`
+        // is asked about, so a row this appends is namable rather than a
+        // shortened credential that can never resolve.
         let known: HashSet<&str> = self.top.iter().map(|h| h.key.as_str()).collect();
-        let mut missing: Vec<(&str, u64)> = lp
+        let mut missing: Vec<(&str, (u64, &str))> = lp
             .iter()
-            .filter(|(key, amount)| **amount > 0 && !known.contains(*key))
-            .map(|(key, amount)| (*key, *amount))
+            .filter(|(key, (amount, _))| *amount > 0 && !known.contains(*key))
+            .map(|(key, provider)| (*key, *provider))
             .collect();
         // Biggest pool position first, then the key. `lp` is a HashMap, so
         // emitting these in arrival order would not be byte-stable.
-        missing.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        self.top.extend(missing.into_iter().map(|(key, lp_amount)| TopHolder {
-            key: key.to_string(),
-            // No address: this party never moved the token, so the archive has
-            // none to give. A name is asked for by the key instead.
-            address: String::new(),
-            amount: 0,
-            role: Role::Person,
-            label: None,
-            movements: 0,
-            lp_amount,
-            vested: 0,
-        }));
+        missing.sort_by(|a, b| {
+            b.1.0
+                .cmp(&a.1.0)
+                .then_with(|| a.0.cmp(b.0))
+        });
+        self.top.extend(
+            missing
+                .into_iter()
+                .map(|(key, (lp_amount, address))| TopHolder {
+                    key: key.to_string(),
+                    address: address.to_string(),
+                    amount: 0,
+                    role: Role::Person,
+                    label: None,
+                    movements: 0,
+                    lp_amount,
+                    vested: 0,
+                }),
+        );
 
         self.segmentation = seg;
     }
@@ -1179,6 +1216,7 @@ mod tests {
             as_of: 10,
             vests: vec![VestOwner {
                 key: a.clone(),
+                address: A.into(),
                 amount: 40,
                 locks: vec![VestLock {
                     amount: 40,
@@ -1194,6 +1232,7 @@ mod tests {
                 total_lp: 1_000,
                 providers: vec![LpProvider {
                     key: a.clone(),
+                    address: A.into(),
                     lp_tokens: 100,
                     amount: 30,
                 }],
@@ -1223,6 +1262,7 @@ mod tests {
         let held = s.distribution.held;
         let provider = |key: &str, lp_tokens: u64, amount: u64| LpProvider {
             key: key.into(),
+            address: String::new(),
             lp_tokens,
             amount,
         };
@@ -1262,6 +1302,42 @@ mod tests {
         assert_eq!(s.distribution.held, held, "and moves no supply");
     }
 
+    /// The row a provider with no balance gets is the one a reader has to NAME,
+    /// and this token's fold has no address for it — so the provider's own
+    /// address, from the LP policy's fold, is carried onto the row. Without it
+    /// the row is a 56-character credential that no name lookup can resolve.
+    #[test]
+    fn an_appended_provider_row_carries_the_providers_address() {
+        let movements = vec![mv(1, 10, 1, A, 100)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: Vec::new(),
+            lp: Some(LpDecomposition {
+                pool_address: "addr_pool".into(),
+                pool_key: "pool".into(),
+                reserve: 100,
+                total_lp: 1_000,
+                providers: vec![LpProvider {
+                    key: "bb".into(),
+                    address: "addr_bprovider".into(),
+                    lp_tokens: 10,
+                    amount: 5,
+                }],
+                residual: 95,
+                status: LpStatus::Complete,
+            }),
+        });
+        let row = s
+            .top
+            .iter()
+            .find(|h| h.key == "bb")
+            .expect("the provider's row");
+        assert_eq!(row.address, "addr_bprovider");
+        assert_eq!(row.amount, 0, "it still holds no units of the token");
+        assert_eq!(row.lp_amount, 5);
+    }
+
     /// `vested` must never exceed the raw balance: a caller subtracting it to
     /// get `free` would otherwise wrap.
     #[test]
@@ -1272,6 +1348,7 @@ mod tests {
             as_of: 10,
             vests: vec![VestOwner {
                 key: crate::holders::key_of(A),
+                address: A.into(),
                 amount: 999,
                 locks: Vec::new(),
             }],
@@ -1294,6 +1371,7 @@ mod tests {
             as_of: 10,
             vests: vec![VestOwner {
                 key: crate::holders::key_of(A),
+                address: A.into(),
                 amount: 4_063_508,
                 locks: vec![VestLock {
                     amount: 4_063_508,
@@ -1326,6 +1404,7 @@ mod tests {
             as_of: 10,
             vests: vec![VestOwner {
                 key,
+                address: String::new(),
                 amount: 40,
                 locks: vec![VestLock {
                     amount: 40,
@@ -1588,6 +1667,7 @@ mod tests {
             as_of: 10,
             vests: vec![VestOwner {
                 key: A.into(),
+                address: String::new(),
                 amount: 1,
                 locks: vec![VestLock {
                     amount: 1,
@@ -1603,6 +1683,7 @@ mod tests {
                 total_lp: 500,
                 providers: vec![LpProvider {
                     key: A.into(),
+                    address: String::new(),
                     lp_tokens: 100,
                     amount: 200,
                 }],
