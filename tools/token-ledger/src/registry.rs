@@ -75,8 +75,8 @@ impl LockPlatform {
     }
 }
 
-/// An address tokens can reach but never leave.
-///
+// An address tokens can reach but never leave.
+//
 // `SinkEntry` lived here until 2026-09-08. Its rule — that `evidence` is
 // mandatory, because "provably unspendable" and "believed unspendable" are
 // different claims about an address that removes supply from the float —

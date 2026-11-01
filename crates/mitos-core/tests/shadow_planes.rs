@@ -76,6 +76,14 @@ async fn the_same_module_emits_the_same_bytes_from_both_planes() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10u64);
 
+    // The host reports a pump's outcome — completed, partial, trapped and why —
+    // only through `tracing`. Without a subscriber a cold start that emits a
+    // begin and stops is indistinguishable from one that never ran.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+
     let artifact = artifact_dir(&module_id);
     let wasm = std::fs::read(artifact.join(format!("{module_id}.wasm"))).unwrap_or_else(|e| {
         panic!(

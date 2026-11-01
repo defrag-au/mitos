@@ -87,3 +87,6 @@ mitos-config = { path = "../mitos-config" }
 # Sandbox dirs for community-modules auto-load tests.
 tempfile = "3"
 toml = "0.8"
+# The shadow test has to install a subscriber: the host reports a pump's
+# outcome (completed / partial / trapped, and why) only through `tracing`.
+tracing-subscriber = { workspace = true }

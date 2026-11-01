@@ -2695,6 +2695,19 @@ pub async fn holders(
         .iter()
         .map(|v| (v.key.as_str(), v.amount))
         .collect();
+    // A lock script that does NOT delegate is keyed by its own ADDRESS in the
+    // holder fold while the vest scan names the owner's credential. The same
+    // fallback `Summary::apply_segmentation` uses: this endpoint folds its own
+    // table (it can hold more parties than `Summary.top`), so it cannot take
+    // the joined rows wholesale.
+    let vested_by_lock: HashMap<&str, u64> = segmentation
+        .vests
+        .iter()
+        .flat_map(|v| v.locks.iter())
+        .fold(HashMap::new(), |mut out, lock| {
+            *out.entry(lock.lock_address.as_str()).or_default() += lock.amount;
+            out
+        });
 
     let matching: Vec<_> = fold
         .holders
@@ -2728,6 +2741,7 @@ pub async fn holders(
             let vested = vested_by_key
                 .get(h.key.as_str())
                 .copied()
+                .or_else(|| vested_by_lock.get(h.address.as_str()).copied())
                 .unwrap_or(0)
                 .min(u64::try_from(h.amount).unwrap_or(0));
             HolderDto {

@@ -61,7 +61,18 @@ use crate::series::{DAY, HOUR, Series};
 pub const SUMMARY: &str = "summary.bin";
 /// Bumped whenever any type here changes shape. Checked on byte zero before
 /// anything is deserialised, as [`crate::SERIES_FORMAT`] is.
-pub const SUMMARY_FORMAT: u8 = 1;
+///
+/// ⚠️ **2 adds [`Summary::decimals`] and [`Summary::segmentation`].** Postcard
+/// encodes a struct as its fields in order, so a version-1 file has nothing for
+/// the new fields to read and a version-1 read by this build fails deep inside
+/// with "Hit the end of buffer" — which reads as a corrupt artifact when the
+/// artifact is fine and the CACHE is old. Version 1 is refused on byte zero
+/// instead, and the next fold rewrites it.
+///
+/// ⚠️ **3 adds [`Summary::unit`].** Same reason, same refusal: a version-2 file
+/// has no unit to read, and every reader of this crate checks the byte before
+/// it decodes anything.
+pub const SUMMARY_FORMAT: u8 = 3;
 /// The directory, beside the manifest, holding one file per checkpoint.
 pub const CHECKPOINTS: &str = "checkpoints";
 /// Bumped whenever [`Checkpoint`] changes shape.
@@ -206,6 +217,10 @@ pub struct TopHolder {
     /// [`TopHolder::amount`]: a CrowdLock address delegates to its owner's
     /// stake credential, so the holder fold already counts the locked units in
     /// the row. `free = amount - vested`.
+    ///
+    /// Joined from the owner's stake credential where the lock delegates, and
+    /// from [`VestLock::lock_address`] where it does not — a script that holds
+    /// its own units is keyed by its address, not by the owner's credential.
     #[serde(default)]
     pub vested: u64,
 }
@@ -327,6 +342,18 @@ pub struct Checkpoint {
 pub struct Summary {
     pub format: u8,
     pub policy: String,
+    /// The policy's user unit — its asset name, HEX (`c373…`), not bytes.
+    ///
+    /// It is identity, not a figure: the unit is what a picture, a registry
+    /// entry and a market route are all asked for by, and the summary is the
+    /// one read every token view already makes. `decimals` above belongs to
+    /// THIS unit, so a reader that carried the scale without the subject could
+    /// not say what the scale applied to.
+    ///
+    /// `None` on a fold that saw no user unit (a policy whose rows are all
+    /// plumbing — a reference twin, a royalty declaration).
+    #[serde(default)]
+    pub unit: Option<String>,
     /// The archive's immutable ceiling when this was folded: what makes it
     /// stale, as for [`crate::SeriesFile::immutable_to`].
     pub immutable_to: u64,
@@ -382,16 +409,31 @@ impl Summary {
             .iter()
             .map(|v| (v.key.as_str(), v.amount))
             .collect();
+        // A lock script that does NOT delegate holds its units itself, so the
+        // holder fold keys that row by the script ADDRESS while the vest scan
+        // attributes the lock to the OWNER's stake credential. The lock address
+        // is the join left over; sum per address, because one script may serve
+        // several owners. A row that matched by key never consults this, which
+        // is what keeps a delegating CrowdLock from being counted twice.
+        let vests_by_lock: HashMap<&str, u64> =
+            seg.vests
+                .iter()
+                .flat_map(|v| v.locks.iter())
+                .fold(HashMap::new(), |mut out, lock| {
+                    *out.entry(lock.lock_address.as_str()).or_default() += lock.amount;
+                    out
+                });
         for h in &mut self.top {
             h.lp_amount = lp.get(h.key.as_str()).copied().unwrap_or(0);
-            // A lock address delegates to the owner's stake credential, so the
-            // holder row already includes the locked units. Keeping `vested`
-            // within `amount` is what makes `free = amount - vested` true.
-            h.vested = vests
+            let vested = vests
                 .get(h.key.as_str())
                 .copied()
-                .unwrap_or(0)
-                .min(h.amount);
+                .or_else(|| vests_by_lock.get(h.address.as_str()).copied())
+                .unwrap_or(0);
+            // Keeping `vested` within `amount` is what makes
+            // `free = amount - vested` true, and it stops a lock that outlived
+            // its units from wrapping.
+            h.vested = vested.min(h.amount);
         }
         self.segmentation = seg;
     }
@@ -400,6 +442,10 @@ impl Summary {
 /// What [`build`] folds.
 pub struct Inputs<'a> {
     pub policy: &'a str,
+    /// The policy's user unit, asset name HEX, where the caller knows it.
+    /// Computed there rather than here: which unit is the user's is
+    /// `cardano-assets`' rule, and this crate folds whatever it is handed.
+    pub unit: Option<&'a str>,
     /// The whole life's series, as [`crate::series::fold`] made it.
     pub series: &'a Series,
     /// Every movement in the archive, in any order.
@@ -634,6 +680,7 @@ pub fn build(inp: &Inputs) -> (Summary, Vec<Checkpoint>) {
         Summary {
             format: SUMMARY_FORMAT,
             policy: inp.policy.to_string(),
+            unit: inp.unit.map(str::to_string),
             immutable_to: inp.immutable_to,
             settled_to,
             complete: inp.complete,
@@ -1034,6 +1081,7 @@ mod tests {
         let movements = vec![mv(1, 10, 1, POOL_B, 100), mv(1, 10, 2, POOL_A, 300)];
         let (s, _) = build(&Inputs {
             policy: "p",
+            unit: None,
             series: &Series::default(),
             movements: &movements,
             immutable_to: 0,
@@ -1065,6 +1113,7 @@ mod tests {
     ) -> (Summary, Vec<Checkpoint>) {
         build(&Inputs {
             policy: "p",
+            unit: None,
             series,
             movements,
             immutable_to: 0,
@@ -1132,6 +1181,65 @@ mod tests {
             lp: None,
         });
         assert_eq!(s.top[0].vested, 10);
+    }
+
+    /// A lock script that does not delegate holds its units at its own
+    /// address, so the holder row is keyed by that address while the vest scan
+    /// names the owner's stake credential. The lock address is the join that
+    /// remains; without it the row reads as entirely free. 4,063,508 units is
+    /// the snek.fun vesting script measured on $Aliens, 2026-10-31.
+    #[test]
+    fn a_non_delegating_lock_script_gets_its_vested_by_address() {
+        const SCRIPT: &str = "addr_vesting_script";
+        let movements = vec![mv(1, 10, 1, SCRIPT, 4_063_508)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: vec![VestOwner {
+                key: crate::holders::key_of(A),
+                amount: 4_063_508,
+                locks: vec![VestLock {
+                    amount: 4_063_508,
+                    unlock_ts_ms: 0,
+                    lock_address: SCRIPT.into(),
+                    style: VestStyle::SnekFun,
+                }],
+            }],
+            lp: None,
+        });
+        let row = s
+            .top
+            .iter()
+            .find(|h| h.address == SCRIPT)
+            .expect("the script's row");
+        assert_eq!(row.vested, 4_063_508);
+        assert_eq!(row.amount - row.vested, 0, "no free part");
+    }
+
+    /// The fallback must not ADD to a key match: a delegating CrowdLock is
+    /// named by its owner's credential and its units sit at the owner's row,
+    /// so consulting the lock address as well would double them.
+    #[test]
+    fn a_key_match_is_not_summed_with_a_lock_address_match() {
+        let movements = vec![mv(1, 10, 1, A, 40)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        let key = s.top[0].key.clone();
+        let address = s.top[0].address.clone();
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: vec![VestOwner {
+                key,
+                amount: 40,
+                locks: vec![VestLock {
+                    amount: 40,
+                    unlock_ts_ms: 0,
+                    lock_address: address,
+                    style: VestStyle::CrowdLock,
+                }],
+            }],
+            lp: None,
+        });
+        assert_eq!(s.top[0].vested, 40);
     }
 
     #[test]
@@ -1324,6 +1432,51 @@ mod tests {
             Err(SummaryError::Version { .. })
         ));
         assert!(matches!(Summary::decode(&[]), Err(SummaryError::Empty(_))));
+    }
+
+    /// The unit is identity and rides beside the scale: a reader holding
+    /// `decimals` alone could not say what the scale applies to. `Some("c373")`
+    /// must survive the wire, and an absent unit must stay absent rather than
+    /// becoming an empty string.
+    #[test]
+    fn the_unit_rides_with_the_summary_and_an_absent_one_stays_absent() {
+        let classify = |_: &str| (Role::Person, None);
+        let movements = vec![mv(1, 10, 1, A, 5)];
+        let named = |unit: Option<&str>| {
+            build(&Inputs {
+                policy: "p",
+                unit,
+                series: &Series::default(),
+                movements: &movements,
+                immutable_to: 0,
+                complete: true,
+                decimals: None,
+                classify: &classify,
+            })
+            .0
+        };
+        let with = named(Some("c373"));
+        assert_eq!(with.unit.as_deref(), Some("c373"));
+        assert_eq!(Summary::decode(&with.encode().unwrap()).unwrap(), with);
+        assert_eq!(named(None).unit, None);
+    }
+
+    /// A summary from the format before `unit` must say it is STALE, not
+    /// corrupt: the same payload minus one field is a prefix of this one, and
+    /// decoding it as this one fails on the missing bytes.
+    #[test]
+    fn a_summary_from_the_previous_format_reads_as_stale() {
+        let (s, _) = summary(&[mv(1, 10, 1, A, 1)], &Series::default(), true);
+        let mut older = s.encode().unwrap();
+        older[0] = SUMMARY_FORMAT - 1;
+        match Summary::decode(&older) {
+            Err(SummaryError::Version {
+                found, expected, ..
+            }) => {
+                assert_eq!((found, expected), (SUMMARY_FORMAT - 1, SUMMARY_FORMAT));
+            }
+            other => panic!("wanted a version error, got {other:?}"),
+        }
     }
 
     /// The segmentation rides inside the summary's postcard payload, so every

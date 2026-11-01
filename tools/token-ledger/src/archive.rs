@@ -436,6 +436,25 @@ pub(crate) fn is_user_unit(name: &[u8]) -> bool {
     cardano_assets::AssetRole::of_bytes(name).standing() == cardano_assets::UnitStanding::Unit
 }
 
+/// The policy's user unit: the one most of its movements are in, HEX.
+///
+/// A policy can carry more than one user unit — a CIP-68 `(222)` fungible
+/// beside its `(333)` twin — and the summary names the one the archive is
+/// about. Dominance is counted rather than taken from the first row, because
+/// a metadata twin can be minted first and would then be the identity of a
+/// token nobody pictures. A tie is broken by the lower hex, so a re-fold on the
+/// same rows names the same unit and the picture does not flip.
+fn dominant_unit(movements: &[Movement]) -> Option<String> {
+    let mut counts: BTreeMap<&[u8], usize> = BTreeMap::new();
+    for m in movements {
+        *counts.entry(m.unit_name.as_slice()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| b.cmp(a)))
+        .map(|(name, _)| hex::encode(name))
+}
+
 /// One policy's archive, opened to its footers.
 pub struct PolicyArchive {
     pub manifest: Manifest,
@@ -1741,11 +1760,15 @@ pub fn tail_series(
 /// the replacement on top of the original. Readers fold the tail themselves,
 /// from the live files. This costs one more decode here (the immutable half,
 /// then the whole archive for the summary) and saves every reader the history.
+/// [`write_derived_at`] with no scale. The archive tests fold through here;
+/// the scheduler and the `summary` command state the registry's decimals
+/// instead, so this wrapper is not in the shipped binary.
+#[cfg(test)]
 pub fn write_derived(dir: &Path) -> Result<()> {
     write_derived_at(dir, None)
 }
 
-/// [`write_derived`], stating what the token's display decimals are.
+/// The derived-artifact fold, stating what the token's display decimals are.
 ///
 /// The scale is the registry's to know and this module's to carry: a summary
 /// that names it lets every reader draw a human number without owning a table
@@ -1796,6 +1819,7 @@ pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
     let (mut summary, checkpoints) =
         policy_archive::summary::build(&policy_archive::summary::Inputs {
             policy: &policy,
+            unit: dominant_unit(&movements).as_deref(),
             series: &full.series,
             movements: &movements,
             immutable_to: key,
@@ -3265,6 +3289,23 @@ mod tests {
             net_mint,
             tx_index: tx as u32,
         }
+    }
+
+    /// The unit named by a summary is the one the archive mostly moves, not
+    /// whichever row came first, and a tie is broken deterministically so a
+    /// re-fold cannot flip the picture.
+    #[test]
+    fn the_dominant_unit_is_the_one_most_movements_are_in() {
+        let rows = [
+            mv(1, "(333)twin", "addr1", 1, 0),
+            mv(2, "(222)token", "addr1", 1, 0),
+            mv(3, "(222)token", "addr2", 1, 0),
+        ];
+        assert_eq!(dominant_unit(&rows).as_deref(), Some("2832323229746f6b656e".into()));
+        // Equal counts: the lower hex wins, whichever order the rows arrive in.
+        let tie = [mv(1, "b", "addr1", 1, 0), mv(2, "a", "addr1", 1, 0)];
+        assert_eq!(dominant_unit(&tie).as_deref(), Some("61"));
+        assert_eq!(dominant_unit(&[]), None);
     }
 
     fn stamp_for(policy: &str) -> policy_archive::Stamp {

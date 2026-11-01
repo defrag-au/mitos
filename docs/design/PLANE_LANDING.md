@@ -296,6 +296,26 @@ on 2026-10-30; the shadow diff is what remains:
    policy-scoped, so it covers `collection-holders` and `holder-distribution`; the address-
    and credential-scoped modules need the interest selector extended first.
 
+   **First results, at slot 43,199,989** (a Dolos import and a book over chunks 0–2000, so
+   both planes answer for the same block):
+
+   - `collection-holders`, policy `0a85dd…`, 995 live refs — 5 events, 362,185 B,
+     **byte-identical**.
+   - `holder-distribution`, policy `407ca4…`, 396 live refs — 3 events, 49,537 B,
+     **byte-identical**.
+   - `holder-distribution` at 995 and at 9,625 refs emits the `SnapshotBegin` and then
+     nothing, on **both** planes. It is not a plane disagreement — `collection-holders`
+     completes the same 9,625 refs (49 steps, 256/page, 11 events, 1.2 MB, byte-identical).
+     The cause is the emit unit, not the scan: the kit emits `SnapshotBegin` at the
+     Decomp→Emit transition, so the scan and the LP/vesting decomposition both finished, and
+     the trap is `step_emit` reading `chunk_size()` entries — `holder-distribution`'s
+     `SNAPSHOT_CHUNK_HOLDERS = 1_000` — decoding and serialising them in one call. That task
+     exceeds the host's 100 M fuel per call above roughly 400–900 holders. Shrinking the page
+     does not help, and cannot: `retry_page` only lowers the scan page handed to
+     `utxos_by_policy`, while the emit cursor stays in `Phase::Emit` and repeats the same
+     chunk. The fix is a smaller emit chunk (module) or a size-bounded emit page (kit); the
+     harness refuses to report a one-event run as a pass, so this cannot go quiet.
+
 That is enough to know whether the L1 cutover is real, without betting on the delta,
 the merge, the tail, or the mint ledger.
 
