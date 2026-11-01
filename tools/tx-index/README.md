@@ -23,6 +23,10 @@ tx-index compact --immutable <db/immutable> --index-dir <dir>
 # Re-read every Nth body of each segment, re-hash, check prefix + decode.
 tx-index verify --immutable <db/immutable> --index-dir <dir> [--stride 97] [--chunks 9000,9050]
 
+# Put base.idx and its pointer where a reader can range them. Prints the rclone
+# plan; --run executes it, and the --run form belongs on the arm box.
+tx-index publish --index-dir <dir> --dest r2:mithril-snapshots/index/tx/v1 [--run]
+
 # One hash → body + outputs (or --index N → one output). JSON.
 tx-index lookup --immutable <db/immutable> --index-dir <dir> <hash> [--index N]
 
@@ -42,10 +46,26 @@ tx-index serve --immutable <db/immutable> --index-dir <dir> [--reload-secs 30]
                        rebuilt whole (tmp + rename) after a refresh
 ```
 
-Entry = 16 bytes: 8-byte hash prefix, chunk `u16`, body offset `u32`, body
-length `u16`. Era is per chunk (segment header / base era table). A hit is
-always verified by re-hashing the body against the full requested hash, so
-the 8-byte prefix can never yield a wrong answer, only a wasted read.
+## Hosted
+
+`publish` writes two objects, and only the second ever changes:
+
+```
+<prefix>/<build>/base.idx   the base · build-addressed · cached a year
+<prefix>/current            the pointer naming the current build · 60 s TTL
+```
+
+`<build>` is `{last_chunk}-{12 hex of the base's SHA-256}` — the coverage **and** the content.
+A coverage-only id would collide with a rebuild of that coverage, and the upload would then be
+skipped as already present, leaving the old bytes served under a name claiming to be the new
+build. The rationale, and the read plan a locator follows, are in
+`crates/tx-index/src/hosted.rs`.
+
+Entry = **24 bytes**: 8-byte hash prefix, chunk `u16`, body offset `u32`, body
+length `u16`, aux-data offset `u32`, aux-data length `u16` (`0` = this tx
+carries none), 2 reserved. Era is per chunk (segment header / base era table).
+A hit is always verified by re-hashing the body against the full requested
+hash, so the 8-byte prefix can never yield a wrong answer, only a wasted read.
 
 The newest chunk file is never indexed — Mithril keeps appending to it
 until the next one seals — so a hash newer than the last sealed chunk is

@@ -1,0 +1,10 @@
+[package]
+name = "token-tape"
+version = "0.0.1"
+edition.workspace = true
+description = "A token's history as compact binary chunks: stable party numbers, and day chunks of market, transfer and order events"
+
+# No dependencies, deliberately: the same crate is written on cardano-infra,
+# passed through by a Worker, and read by a macroquad client, which cannot
+# link wasm-bindgen. Keep it that way.
+[dependencies]

@@ -1,0 +1,18 @@
+[package]
+name = "policy-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Reads a policy archive and reports what its movement rows become as chain events — the Cardano ingest proof"
+
+[[bin]]
+name = "policy-events"
+path = "src/main.rs"
+
+[dependencies]
+chain-events = { workspace = true }
+chain-events-cardano = { path = "../../crates/chain-events-cardano" }
+hex = { workspace = true }
+policy-archive = { path = "../../crates/policy-archive" }
+serde_json = { workspace = true }

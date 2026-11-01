@@ -208,6 +208,9 @@ pub fn write_companion_subscription(
         resume_from: None,
         interests,
         dial_back: None,
+        // These fixtures announce nothing, which is every companion until an
+        // operator opts one in — so the request they encode is unchanged.
+        announced: Vec::new(),
     };
     std::fs::write(
         dir.join(format!("{companion_key}.cbor")),
@@ -247,6 +250,10 @@ pub fn manifest_v2(wasm: &[u8]) -> Manifest {
             crate_version: "0.0.0".to_owned(),
         },
         interest: InterestSection::default(),
+        // The default section — revision 0, schema 0, no upgrades — is what
+        // every artifact built before `[lifecycle]` existed IS, so these
+        // fixtures are unchanged by its addition.
+        lifecycle: Default::default(),
     }
 }
 

@@ -281,9 +281,18 @@ pub struct StoryStream {
     /// and its pricing model. Kept out of `EventRow` so the 90% of rows that
     /// are not pool states do not carry two dead fields.
     pub pool_quote: Vec<u32>,
-    /// `0` = constant-product, `1` = bonding curve. ⚠️ A consumer computing a
-    /// rate from reserves MUST check this: a bonding curve's reserves are real
-    /// and its rate is not `quote / base`.
+    /// `0` = constant-product, `1` = bonding curve, `2` = constant product
+    /// over a curve's EFFECTIVE reserves (LumpFun v5).
+    ///
+    /// ⚠️ A consumer computing a rate from reserves MUST check this: a bonding
+    /// curve's reserves are real and its rate is not `quote / base`.
+    ///
+    /// `0` and `2` are arithmetically identical — both are `quote / base` over
+    /// the reserves the row carries, and `2`'s reserves are already effective,
+    /// so a reader that does not know `2` and falls back to `0` computes the
+    /// right number. What it loses is the statement that those reserves are
+    /// not the UTxO's balances. `1` is the value that must never be computed
+    /// from.
     pub pool_pricing: Vec<u8>,
     /// Every pool and curve the rows refer to, stated once.
     ///
@@ -557,6 +566,10 @@ pub fn encode(
                 pool_quote.push(t.quote(&p.quote_policy, &p.quote_name));
                 pool_pricing.push(match p.pricing.as_str() {
                     crate::observation::pricing::BONDING_CURVE => 1,
+                    crate::observation::pricing::CONSTANT_PRODUCT_VIRTUAL => 2,
+                    // An unknown model encodes as the plain one, which is the
+                    // safe direction: the arithmetic is identical and the
+                    // model string is a claim the row did not make.
                     _ => 0,
                 });
                 pool_key.push(p.pool);
@@ -774,6 +787,7 @@ pub fn decode(s: &StoryStream) -> Story {
                     quote_name: (!qn.is_empty()).then_some(qn),
                     pricing: match pricing {
                         1 => crate::observation::pricing::BONDING_CURVE.into(),
+                        2 => crate::observation::pricing::CONSTANT_PRODUCT_VIRTUAL.into(),
                         _ => crate::observation::pricing::CONSTANT_PRODUCT.into(),
                     },
                 })
@@ -1087,6 +1101,35 @@ mod tests {
         )]);
         match &round_trip(&s, Txs::Include)[0].kind {
             Kind::PoolState(p) => assert_eq!(p.quote, None),
+            k => panic!("{k:?}"),
+        }
+    }
+
+    /// A priceable curve keeps the fact that its reserves are EFFECTIVE ones.
+    ///
+    /// `2` is additive: a reader from before it existed decodes it as `0` and
+    /// computes the same rate, because the effective reserves are already what
+    /// a constant product needs. The test asserts the model survives for a
+    /// reader that knows it, and that the value is not `1` — which a consumer
+    /// must never compute a rate from.
+    #[test]
+    fn the_virtual_curve_model_survives_the_wire() {
+        let s = story(vec![ev(
+            1,
+            Kind::PoolState(PoolState {
+                pool: 0,
+                base: 858_381_090,
+                quote: Some(6_555_000_130),
+                quote_policy: None,
+                quote_name: None,
+                pricing: crate::observation::pricing::CONSTANT_PRODUCT_VIRTUAL.into(),
+            }),
+        )]);
+        match &round_trip(&s, Txs::Include)[0].kind {
+            Kind::PoolState(p) => assert_eq!(
+                p.pricing,
+                crate::observation::pricing::CONSTANT_PRODUCT_VIRTUAL
+            ),
             k => panic!("{k:?}"),
         }
     }

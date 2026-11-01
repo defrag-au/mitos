@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::auth::AuthToken;
+use crate::auth::{AuthToken, Authenticator};
 use crate::coordinator::TxClaimCoordinator;
 use crate::handle::{IndexerAdapter, IndexerHandle};
 use crate::indexer::Indexer;
@@ -74,11 +74,15 @@ pub struct Bundle {
     /// indexer names can't accidentally shadow them. Populated via
     /// `nest_extra` — e.g. the minibf bridge in `bundles/default`.
     extra_routes: Vec<(String, axum::Router)>,
-    /// Shared-secret token loaded from `MITOS_AUTH_TOKEN` at
-    /// construction time. Stored here so bundle authors can apply
-    /// the same auth to extra routers (e.g. minibf) without calling
-    /// `AuthToken::from_env()` a second time.
+    /// Shared secret loaded from `MITOS_AUTH_TOKEN` at construction time.
+    /// OUTBOUND only now — the dial-back credential the `Replicator` and the
+    /// indexer bridge present. Inbound gating is `authenticator`'s.
     auth: AuthToken,
+    /// The host's one authenticator, built once at construction so a
+    /// misconfigured namespace registry fails before anything is served.
+    /// Bundle authors hand it to extra routers (e.g. minibf) via
+    /// [`Bundle::authenticator`].
+    authenticator: Arc<Authenticator>,
 }
 
 impl Bundle {
@@ -90,13 +94,18 @@ impl Bundle {
     /// `--modules-dir`. The bundle currently has no shared
     /// non-module state, but the binary still accepts
     /// `--data-dir` so operator scripts don't need updating.
+    ///
+    /// Fallible because the namespace registry (`MITOS_NAMESPACES_FILE`) is
+    /// loaded here. A host that declares a security boundary and cannot
+    /// enforce it must not start serving — see
+    /// [`mitos_platform::auth::AuthSetupError`] for every refusal.
     pub fn new(
         domain: DomainAdapter,
         config: RootConfig,
         listen: SocketAddr,
         _data_dir: PathBuf,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             domain,
             config,
             listen,
@@ -106,7 +115,8 @@ impl Bundle {
             residual_coordinator: None,
             extra_routes: Vec::new(),
             auth: AuthToken::from_env(),
-        }
+            authenticator: Arc::new(Authenticator::from_env()?),
+        })
     }
 
     /// Enable residual-pass mode for `Domain::AssetMovement`
@@ -187,10 +197,16 @@ impl Bundle {
         self
     }
 
-    /// The auth token loaded from `MITOS_AUTH_TOKEN` at construction.
-    /// Bundle authors can use this to apply the same shared-secret to
-    /// extra routers (e.g. `from_fn_with_state(bundle.auth().clone(), require_auth)`)
-    /// rather than reading a separate env var.
+    /// The host's authenticator. Bundle authors hand this to an extra router
+    /// along with the `Attempt` that router's callers make — e.g. minibf
+    /// takes `authenticate` + `require_read_chain`, because `wallet-viewer`
+    /// reads it and is not a subscriber in any namespace.
+    pub fn authenticator(&self) -> &Arc<Authenticator> {
+        &self.authenticator
+    }
+
+    /// The outbound dial-back credential from `MITOS_AUTH_TOKEN`. This is no
+    /// longer an inbound gate — see [`Bundle::authenticator`] for that.
     pub fn auth(&self) -> &AuthToken {
         &self.auth
     }
@@ -210,6 +226,7 @@ impl Bundle {
             residual_coordinator,
             extra_routes,
             auth,
+            authenticator,
         } = self;
 
         let sync_handle = spawn_sync_pipeline(domain.clone(), &config, exit.clone())?;
@@ -300,7 +317,11 @@ impl Bundle {
         // the three legacy in-tree indexers — platform-v2 wasm
         // modules use the companion runtime's HTTPS subscribe path
         // instead (`/api/companions/subscribe`).
-        app = app.merge(replicate_router(&indexers, domain.clone(), auth.clone()));
+        app = app.merge(replicate_router(
+            &indexers,
+            domain.clone(),
+            authenticator.clone(),
+        ));
 
         // Wasm-module hosting (Bundle::enable_modules). Mounts
         // /_admin/modules/* and auto-starts followers for any
@@ -313,22 +334,122 @@ impl Bundle {
         let mut module_host: Option<Arc<dyn mitos_platform::host_v2::ModuleHostHandle>> = None;
         let mut module_compaction_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut module_watchdog_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut module_lifecycle_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut module_moves_handle: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(modules_dir) = modules_dir.as_ref() {
             std::fs::create_dir_all(modules_dir).map_err(|e| {
                 anyhow::anyhow!("creating modules dir {}: {e}", modules_dir.display())
             })?;
             let storage = mitos_platform::storage::ModuleStorage::new(modules_dir.clone());
+
+            // v2 → v3 storage layout migration. It runs HERE and nowhere
+            // else: after the storage root exists, and BEFORE anything opens
+            // a redb file, auto-loads a community module or calls
+            // `auto_resume`. It moves `kv.redb` / `cursor.redb` /
+            // `watched.redb` / `emissions.redb` into an instance directory,
+            // so a handle opened before it would be holding the old path.
+            {
+                use mitos_platform::storage::migrate_v2::{self, MigrationMode};
+
+                let mode = MigrationMode::from_env()?;
+                let report = migrate_v2::run(&storage, mode)
+                    .map_err(|e| anyhow::anyhow!("module storage migration: {e}"))?;
+                info!(
+                    ?mode,
+                    migrated = report.migrated.len(),
+                    already_v3 = report.already_v3.len(),
+                    failed = report.failed.len(),
+                    orphaned_artifacts = report.orphaned_artifacts,
+                    modules = ?report.migrated,
+                    "module storage layout checked",
+                );
+                // Its own line at `error`, keyed on a stable message, so a
+                // deploy check can grep for it the way `step_verify_modules`
+                // reads the auto-load summary. A failed module is NOT RUNNING
+                // — the facade reports it as unregistered — and the host is
+                // deliberately left up so the other modules keep serving.
+                if !report.failed.is_empty() {
+                    tracing::error!(
+                        failed = ?report.failed,
+                        "module storage migration INCOMPLETE — these modules are not running",
+                    );
+                }
+                if mode == MigrationMode::Plan {
+                    // `plan` is a different outcome, not a quieter one: the
+                    // operator reads the moves above and then decides.
+                    anyhow::bail!(
+                        "{}=plan: nothing was changed — the moves logged above are what an \
+                         `apply` run would do. Unset the variable (or set it to `apply`) to \
+                         migrate.",
+                        MigrationMode::ENV,
+                    );
+                }
+            }
             let engine = mitos_platform::registry_v2::ModuleRegistryV2::build_engine()
                 .map_err(|e| anyhow::anyhow!("module engine: {e}"))?;
-            // Single DomainDataPlane instance: v2 wires it as the
-            // concrete `Arc<DomainDataPlane<_>>` so the dispatch
-            // composer's generic bound resolves without a vtable
-            // hop. The `dp` view (`Arc<dyn DataPlaneFacade>`) is
-            // what the per-instance host fns see.
-            let chain_plane = Arc::new(mitos_platform::host_fns::DomainDataPlane::new(
-                domain.clone(),
-            ));
+            // Plane selection. `MITOS_DATA_PLANE` is `dolos` (the default) or
+            // `book`; `book` requires `MITOS_BOOK_DIR` and a stamped artifact,
+            // because every follower and paginated query anchors on `tip()`.
+            // The Dolos domain is still constructed either way: it is the tail,
+            // not the selection.
+            let plane_mode = std::env::var("MITOS_DATA_PLANE").unwrap_or_else(|_| "dolos".into());
+            let selected = match plane_mode.as_str() {
+                "dolos" => mitos_platform::selected_plane::SelectedPlane::Dolos(
+                    mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
+                ),
+                "book" => {
+                    // A compose file can only pass a variable it can name, so an
+                    // unset optional setting arrives as an empty string rather
+                    // than an absent one. Treat empty as absent here, or the
+                    // datum dir would be opened as the empty path.
+                    let book_dir = std::env::var("MITOS_BOOK_DIR")
+                        .ok()
+                        .filter(|dir| !dir.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "MITOS_DATA_PLANE=book requires MITOS_BOOK_DIR to name the \
+                                 live-book directory"
+                            )
+                        })?;
+                    let book_dir = std::path::Path::new(&book_dir);
+                    let datum_dir = std::env::var("MITOS_DATUM_DIR")
+                        .ok()
+                        .filter(|dir| !dir.is_empty());
+                    let plane = match datum_dir {
+                        Some(datum_dir) => mitos_platform::BookDataPlane::open_with_datums(
+                            book_dir,
+                            std::path::Path::new(&datum_dir),
+                        ),
+                        None => mitos_platform::BookDataPlane::open(book_dir),
+                    }
+                    .map_err(|e| {
+                        anyhow::anyhow!("open live book at {}: {e}", book_dir.display())
+                    })?;
+                    if plane.base().meta().base_slot.is_none() {
+                        anyhow::bail!(
+                            "live book at {} has no base_slot; stamp it with `fold-probe \
+                             stamp-boundary` before serving it",
+                            book_dir.display()
+                        );
+                    }
+                    mitos_platform::selected_plane::SelectedPlane::Book(Box::new(plane))
+                }
+                other => {
+                    anyhow::bail!("unknown MITOS_DATA_PLANE={other}; expected `dolos` or `book`")
+                }
+            };
+            info!(plane = selected.label(), "data plane selected");
+            let chain_plane = Arc::new(selected);
             let dp: Arc<dyn mitos_platform::host_fns::DataPlaneFacade> = chain_plane.clone();
+            // The admin routes answer from the plane the host serves. `/_admin/status`
+            // and `/_admin/metrics` report its tip, which is the one place an operator
+            // can see which plane the cohort is actually reading — reporting dolos's
+            // tip while a book serves would hide exactly the thing a book run is
+            // checking. `/_admin/utxos/{address}` reads the same rows the modules do.
+            // The block routes have no book equivalent: under `book` they hit the
+            // trait's default and answer "no block at this slot", which is true of an
+            // artifact that carries no blocks.
+            let admin_chain_data: Arc<dyn mitos_platform::ChainDataPlane> = chain_plane.clone();
 
             // Subscription factory: each follower gets its own
             // tip-watch. Two layers of fix applied:
@@ -380,8 +501,12 @@ impl Bundle {
             // a second `Database::open` of the same file fails
             // with `Database already open`.
             let storage_for_kv = storage.clone();
-            let kv_factory: mitos_platform::host_v2::KvFactory = Arc::new(move |id: &str| {
-                match storage_for_kv.kv_store(id, None) {
+            // Keyed by INSTANCE: two instances of one module have two KVs,
+            // and handing both the same handle is the overwrite the whole
+            // instance-addressing change exists to make impossible.
+            let kv_factory: mitos_platform::host_v2::KvFactory = Arc::new(move |key| {
+                let id = key.module.as_str();
+                match storage_for_kv.kv_store_at(key, None) {
                     Ok(kv) => mitos_platform::host_fns::state_kv::ModuleKv::Redb(kv),
                     Err(e) => {
                         // Fall back to in-memory rather than refusing
@@ -488,14 +613,41 @@ impl Bundle {
                 }
             }
 
-            // Auto-resume: walk every manifest on disk and start
-            // it. Single bad module is logged and skipped so it
-            // can't abort bundle startup.
-            host.auto_resume().await;
+            // The instance lifecycle. REPLACES `host.auto_resume()`: what a
+            // restart resumes is now the persisted `DesiredState`, not "every
+            // directory with a manifest", so a module an operator stopped
+            // stays stopped. Constructed here because the admin router, the
+            // companion router and the watchdog all share this one instance.
+            let lifecycle = Arc::new(mitos_platform::lifecycle::LifecycleManager::new(
+                storage.clone(),
+                host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>,
+                authenticator.clone(),
+                event_ring.clone(),
+                mitos_platform::lifecycle::system_clock(),
+            ));
+            // Adopt every module, reconcile it against the registrations on
+            // disk, and re-issue what its record says should already be true.
+            // The dialer is deliberately NOT set yet: `start_all()` below
+            // reconciles every module's interest itself, so a `StartFollower`
+            // during boot must not duplicate that work.
+            lifecycle.boot().await;
 
-            // The platform admin router has its own AuthToken
-            // type — same shape, same env var, separate crate.
+            // The dialer's OUTBOUND credential — the token it presents when
+            // it calls a companion back. Same env var, same value; it is not
+            // the inbound gate any more.
             let platform_auth = mitos_platform::admin::AuthToken::from_env();
+
+            // Registrations on disk whose client no namespace owns. Nothing
+            // is removed and nothing stops being dialled — this is a rollout
+            // signal, logged ONCE at boot and served on `/_admin/status`.
+            let unowned = authenticator.unowned_clients(&storage);
+            if !unowned.is_empty() {
+                tracing::warn!(
+                    clients = ?unowned,
+                    "companion registrations exist for clients no namespace lists; they keep \
+                     running, but their next subscribe is a 403 — add them to a namespace",
+                );
+            }
             let host_for_admin = host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>;
 
             // Companion dial supervisor: maintains an outbound
@@ -539,19 +691,50 @@ impl Bundle {
             // `docs/design/RECAPTURE.md`.
             host.set_dialer(dialer.clone());
             dialer.start_all().await;
+            // AFTER `start_all`, for the reason above: from here on a
+            // lifecycle `StartFollower` also re-asserts the module's
+            // scan-interest, exactly as the watchdog does after a revive.
+            lifecycle.set_dialer(dialer.clone());
+
+            // Client rows and artifact pulls. A worker announces the module
+            // it was BUILT against; the host records it, fetches it into the
+            // CAS, and works out what the move would involve — and stops
+            // there. Nothing grants a catch-up slot yet, so an announcement
+            // changes only what `GET …/rows` shows.
+            let fetcher: Arc<dyn mitos_platform::fetch::ArtifactFetcher> =
+                Arc::new(mitos_platform::fetch::HttpFetcher::new()?);
+            let puller = Arc::new(mitos_platform::fetch::ArtifactPuller::new(
+                storage.clone(),
+                fetcher,
+            ));
+            let moves = mitos_platform::moves::MoveManager::new(
+                storage.clone(),
+                puller,
+                authenticator.clone(),
+                lifecycle.clone(),
+                event_ring.clone(),
+                mitos_platform::lifecycle::system_clock(),
+            );
+            // Re-issue whatever each row says is already in flight. STARTS
+            // interrupted fetches; does not wait for them.
+            moves.boot().await;
+
             app = app.merge(mitos_platform::companions::companion_router(
                 storage.clone(),
-                platform_auth.clone(),
+                authenticator.clone(),
                 Some(dialer.clone()),
                 Some(indexer_bridge),
                 event_ring.clone(),
+                Some(lifecycle.clone()),
+                Some(moves.clone()),
             ));
 
             // Transaction submission: let a consumer (the minting engine) push a
             // signed tx through mitos into dolos's mempool, which the sync
-            // submit-stage diffuses to the chain. Same `MITOS_AUTH_TOKEN` gate as
-            // the companion API. See `crate::tx`.
-            app = app.merge(crate::tx::tx_router(domain.clone(), auth.clone()));
+            // submit-stage diffuses to the chain. `Attempt::SubmitTx`, so a
+            // namespace token works — the six `tx-submit` consumers hold the
+            // secret through a wrangler binding. See `crate::tx`.
+            app = app.merge(crate::tx::tx_router(domain.clone(), authenticator.clone()));
 
             // Pass the reserved-names set so the upload handler
             // rejects modules whose id collides with an in-tree
@@ -561,9 +744,7 @@ impl Bundle {
             // pull real-chain block CBOR straight out of the live
             // archive for `mitos-run` fixtures.
             let reserved_names = core_bridge.reserved_names_owned();
-            let chain_data: Arc<dyn mitos_platform::ChainDataPlane> = Arc::new(
-                mitos_platform::host_fns::DomainDataPlane::new(domain.clone()),
-            );
+            let chain_data = admin_chain_data;
             app = app.merge(mitos_platform::admin::admin_router_with_host(
                 storage.clone(),
                 host_for_admin,
@@ -571,7 +752,9 @@ impl Bundle {
                 Some(chain_data),
                 started_at,
                 event_ring.clone(),
-                platform_auth,
+                authenticator.clone(),
+                lifecycle.clone(),
+                moves.clone(),
             ));
 
             // Module watchdog — revives any module that has
@@ -585,10 +768,23 @@ impl Bundle {
             let watchdog_handle = mitos_platform::watchdog::spawn(
                 storage.clone(),
                 host.clone() as Arc<dyn mitos_platform::host_v2::ModuleHostHandle>,
+                lifecycle.clone(),
                 dialer.clone(),
                 event_ring.clone(),
                 exit.clone(),
             );
+
+            // The lifecycle's own 60s timer: reconcile every module against
+            // the registrations on disk, then feed `Tick`. This is what
+            // expires a drain grace period and reaps a retained instance —
+            // and what corrects any path that forgot to reconcile.
+            let lifecycle_handle =
+                mitos_platform::lifecycle::spawn_tick(lifecycle.clone(), exit.clone());
+
+            // The rows' own timer, on the same cadence: a client that no
+            // longer has any registration for a module loses its pending
+            // move, and then its row.
+            let moves_handle = mitos_platform::moves::spawn_tick(moves, exit.clone());
 
             // Periodic emissions-log compaction. Hourly sweep
             // ages out Acked rows (7d) + flips stuck Pending
@@ -602,6 +798,8 @@ impl Bundle {
             module_host = Some(host);
             module_compaction_handle = Some(compaction_handle);
             module_watchdog_handle = Some(watchdog_handle);
+            module_lifecycle_handle = Some(lifecycle_handle);
+            module_moves_handle = Some(moves_handle);
             info!(
                 modules_dir = %modules_dir.display(),
                 "wasm-module hosting enabled"
@@ -661,6 +859,17 @@ impl Bundle {
         // now. Await it so a mid-sweep restart can't race the
         // follower teardown below.
         if let Some(handle) = module_watchdog_handle {
+            let _ = handle.await;
+        }
+
+        // Same for the lifecycle tick: a `Reap` mid-flight removes a module
+        // directory, which must not race the follower teardown below.
+        if let Some(handle) = module_lifecycle_handle {
+            let _ = handle.await;
+        }
+
+        // …and the rows' tick, which writes row files under the same dirs.
+        if let Some(handle) = module_moves_handle {
             let _ = handle.await;
         }
 

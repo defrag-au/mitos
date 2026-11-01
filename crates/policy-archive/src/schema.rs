@@ -28,6 +28,7 @@ pub const MESSAGE_TYPE: &str = "
         REQUIRED BYTE_ARRAY address;
         REQUIRED INT64 amount;
         REQUIRED INT64 net_mint;
+        REQUIRED INT64 tx_index;
     }
 ";
 
@@ -42,10 +43,22 @@ pub enum Column {
     Address,
     Amount,
     NetMint,
+    /// The transaction's position in its block, 0-based.
+    ///
+    /// ⚠️ ADDED AS A TRAILING COLUMN, which the format's own rule allows without
+    /// a version bump. A reader from before it existed addresses columns 0–6 and
+    /// ignores this one; a new reader of an old file gets 0, which is the only
+    /// honest answer — the order was never recorded.
+    ///
+    /// It exists because `slot` (and `block_time`) is block-granular: within one
+    /// block the rows were ordered by TRANSACTION HASH, so a sell's fill could
+    /// appear before the placement that created it. Chain order is a fact the
+    /// walk has and the archive was throwing away.
+    TxIndex,
 }
 
 impl Column {
-    pub const ALL: [Column; 7] = [
+    pub const ALL: [Column; 8] = [
         Column::Slot,
         Column::BlockTime,
         Column::TxHash,
@@ -53,6 +66,7 @@ impl Column {
         Column::Address,
         Column::Amount,
         Column::NetMint,
+        Column::TxIndex,
     ];
 
     pub fn index(self) -> usize {
@@ -64,6 +78,7 @@ impl Column {
             Column::Address => 4,
             Column::Amount => 5,
             Column::NetMint => 6,
+            Column::TxIndex => 7,
         }
     }
 
@@ -76,6 +91,7 @@ impl Column {
             Column::Address => "address",
             Column::Amount => "amount",
             Column::NetMint => "net_mint",
+            Column::TxIndex => "tx_index",
         }
     }
 }
@@ -94,6 +110,13 @@ pub struct Movement {
     pub amount: i64,
     /// This transaction's net mint of this unit: 0 transfer, + mint, − burn.
     pub net_mint: i64,
+    /// The transaction's position in its block, 0-based.
+    ///
+    /// The tiebreak `slot` cannot provide. Rows of one block share a slot, and
+    /// ordering them by hash is arbitrary; this is the chain's own order. `0`
+    /// for a row written before the column existed, and for a correction row —
+    /// corrections are attached to their transaction by hash, not ordered.
+    pub tx_index: u32,
 }
 
 impl Movement {

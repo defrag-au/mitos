@@ -20,6 +20,12 @@ cardano-assets = { workspace = true }
 
 # Wire format served by `serve` (shared with consumers — egui frontends etc).
 market-ledger-wire = { path = "../../crates/market-ledger-wire" }
+# The translation this ledger reads itself through: one `ChainEvent` per market row, in
+# the vocabulary the achievements fold and the OpenSea feed share. It is the same
+# adapter `serve`'s pages go through, so a row exported from sqlite and a row fetched
+# over HTTP cannot translate differently.
+chain-events-cardano = { path = "../../crates/chain-events-cardano" }
+chain-events = { workspace = true }
 
 # Operational ledger.
 rusqlite = { workspace = true }

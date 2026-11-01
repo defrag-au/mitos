@@ -49,6 +49,7 @@ use std::time::Duration;
 use anyhow::Result;
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -248,6 +249,11 @@ impl Live {
 struct View<'a> {
     archive: Option<PolicyArchive>,
     lives: Vec<std::sync::MutexGuard<'a, Live>>,
+    /// A pass has LANDED: the manifest exists. Not `archive.is_some()`, which
+    /// a first walk's segments make true before anything has landed — and
+    /// "first walk running" and "archive being topped up" are different
+    /// statuses.
+    landed: bool,
 }
 
 fn view<'a>(hub: &PolicyHub, policy: &str, jobs: &'a [Arc<Mutex<Live>>]) -> Result<View<'a>> {
@@ -269,7 +275,11 @@ fn view<'a>(hub: &PolicyHub, policy: &str, jobs: &'a [Arc<Mutex<Live>>]) -> Resu
     let segments: Vec<(PathBuf, archive::FileKind)> =
         lives.iter().flat_map(|l| l.segments.clone()).collect();
     let archive = PolicyArchive::open_with(&dir, &segments)?;
-    Ok(View { archive, lives })
+    Ok(View {
+        archive,
+        lives,
+        landed: manifest.is_some(),
+    })
 }
 
 pub struct PolicyHub {
@@ -284,12 +294,20 @@ pub struct PolicyHub {
     pub(crate) index: Option<tx_index::IndexHandle>,
     /// (policy → its first mint's chunk) over the same snapshot. Held OPEN
     /// rather than opened per lookup: the answer is a binary search over a
-    /// resident table, so opening a 666 MiB mapping each time would cost
-    /// orders of magnitude more than the lookup it serves.
+    /// Where the policy's first mint is known from — the `runs.pidx` sidecar
+    /// when the build wrote one, else `base.pidx`.
+    ///
+    /// MEASURED: the sidecar is 16 bytes a policy (3.7 MiB at 232,745), against
+    /// 668 MiB for the whole base. Admission asks exactly one question of it, so
+    /// it stays mapped for the life of the process.
     ///
     /// `None` without `--policy-index-dir`, and the walk then falls back to
     /// Koios exactly as before.
-    pub(crate) policy_index: Option<policy_index::Base>,
+    pub(crate) policy_index: Option<policy_index::Floors>,
+    /// Where that index lives, so the tail can extend its floor sidecar.
+    ///
+    /// `None` without `--policy-index-dir`, and then nothing tries.
+    pub(crate) policy_index_dir: Option<PathBuf>,
     /// The pool: walk jobs, seek jobs, what is in flight. See
     /// `scheduler.rs`.
     pub(crate) sched: crate::scheduler::Scheduler,
@@ -315,6 +333,39 @@ pub struct PolicyHub {
     /// observations merged with every movement. Keyed on the archive's own
     /// version, so it is recomputed when the archive moves and not before.
     series: Mutex<HashMap<String, (u64, Arc<policy_archive::series::Series>)>>,
+    /// policy → the pool view folded from its observations.
+    ///
+    /// ⚠️ Not an artefact on disk, deliberately. The VIEW is tiny — a handful of
+    /// pools — while what costs ~1 s on the widest archive here is READING AND
+    /// DECODING the observation tier. So the thing worth keeping is the fold,
+    /// in memory, where it can be refreshed by delta.
+    ///
+    /// Keyed on the archive's IMMUTABLE ceiling, not `updated_unix`: the tail
+    /// writes observations every 300 s, and re-reading 40 MB to pick up a
+    /// handful of rows is the mistake the series artefact already made once.
+    /// Between immutable changes the view is refreshed above its own ceiling,
+    /// which [`policy_archive::view::PolicyView::apply`] allows because it keeps
+    /// the NEWEST sighting of each pool.
+    views: Mutex<HashMap<String, CachedView>>,
+    /// policy → unix second this service last served it.
+    ///
+    /// The tip warms the folds above after it writes a tail, and that warm is
+    /// 56% of the tick's cost (2,014 ms of 3,614 MEASURED 2026-10-25) because
+    /// it re-folds a cache keyed on `updated_unix`, which every tail write
+    /// moves. A policy nobody is asking for is warmed for nobody — `/live`
+    /// falls back to folding on the miss — and a COMPLETE archive is read from
+    /// KV at the edge without reaching this process at all.
+    reads: Mutex<HashMap<String, u64>>,
+}
+
+/// A policy's pool view, and what it cost to fold.
+#[derive(Clone)]
+struct CachedView {
+    /// The archive's immutable ceiling when this was last folded from scratch.
+    immutable_to: u64,
+    view: Arc<policy_archive::view::PolicyView>,
+    /// Observation rows folded. `/price` reports it.
+    observations: usize,
 }
 
 /// What a [`PolicyHub`] is built from.
@@ -328,9 +379,6 @@ pub struct HubConfig {
     pub data_dir: PathBuf,
     pub tokens: PathBuf,
     pub archive_dir: PathBuf,
-    /// Where a landed archive goes — R2 and the KV bundle — or `None` to
-    /// leave it on disk. See `publish.rs`.
-    pub publish: Option<crate::publish::Targets>,
     /// A tx-index over the same snapshot, for seeks.
     pub tx_index_dir: Option<PathBuf>,
     /// A policy-index over the same snapshot, for first mints at admission.
@@ -346,7 +394,6 @@ impl PolicyHub {
             data_dir,
             tokens,
             archive_dir,
-            publish,
             tx_index_dir,
             policy_index_dir,
             pool,
@@ -370,33 +417,33 @@ impl PolicyHub {
                 }
             }
         });
-        let policy_index = policy_index_dir.and_then(|dir| {
-            let path = policy_index::base_path(&dir);
-            match policy_index::Base::open(&path) {
-                Ok(b) => {
-                    let (from, to) = b.covers();
+        let policy_index = policy_index_dir.clone().and_then(|dir| {
+            match policy_index::Floors::open(&dir) {
+                Ok(Some(f)) => {
+                    let (from, to) = f.covers();
                     tracing::info!(
-                        path = %path.display(),
-                        records = b.len(),
-                        policies = b.policies(),
+                        dir = %dir.display(),
+                        source = f.source(),
+                        policies = f.len(),
                         covers = format!("{from}..={to}"),
                         "policy: policy-index open — first mints resolve locally"
                     );
-                    Some(b)
+                    Some(f)
+                }
+                Ok(None) => {
+                    tracing::warn!(dir = %dir.display(), "policy: no policy-index under this directory — first mints fall back to koios");
+                    None
                 }
                 Err(e) => {
                     // A warning, not a failure: the floor probe falls back to
                     // Koios, and a walk with no floor is slow rather than
                     // wrong. Refusing to start over a missing index would make
                     // an optimisation load-bearing.
-                    tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "policy: policy-index NOT open — first mints fall back to koios");
+                    tracing::warn!(dir = %dir.display(), error = %format!("{e:#}"), "policy: policy-index NOT open — first mints fall back to koios");
                     None
                 }
             }
         });
-        if let Some(t) = &publish {
-            tracing::info!(targets = %t.describe(), "policy: publishing landed archives");
-        }
         let hub = Arc::new(Self {
             data_dir,
             tokens,
@@ -404,12 +451,15 @@ impl PolicyHub {
             jobs: Mutex::new(HashMap::new()),
             index,
             policy_index,
+            policy_index_dir,
             sched: crate::scheduler::Scheduler::new(),
             bearer,
             holders: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
         });
-        crate::scheduler::spawn(Arc::clone(&hub), pool, publish);
+        crate::scheduler::spawn(Arc::clone(&hub), pool);
         hub
     }
 
@@ -430,15 +480,15 @@ impl PolicyHub {
     /// newly-minted policy the snapshot predates, and precisely why the Koios
     /// fallback still earns its place.
     pub(crate) fn first_mint_from_index(&self, policy_hex: &str) -> Option<u64> {
-        let base = self.policy_index.as_ref()?;
+        let index = self.policy_index.as_ref()?;
         let policy = hex::decode(policy_hex).ok()?;
-        let chunk = base.first_chunk_of(policy_index::policy_prefix(&policy))?;
+        let chunk = index.first_chunk_of(policy_index::policy_prefix(&policy))?;
         let slot = u64::from(chunk) * crate::registry::CHUNK_SLOTS;
         tracing::info!(
             policy = policy_hex,
             slot,
             chunk,
-            source = "policy-index",
+            source = index.source(),
             "policy: first mint at admission"
         );
         Some(slot)
@@ -497,6 +547,31 @@ impl PolicyHub {
         self.sched.lock_for(policy)
     }
 
+    /// Record that this service served `policy`, so the tip knows whether
+    /// warming its folds is for a reader or for nobody.
+    ///
+    /// ⚠️ Capped. The path this is called from is public, so an unbounded map
+    /// keyed by a caller-supplied hex string is a memory leak with extra steps.
+    /// Past the cap a NEW key is simply not tracked, and an untracked policy is
+    /// warmed never — that costs a reader one fold, not the box its memory.
+    pub(crate) fn touch(&self, policy: &str) {
+        const TRACK_LIMIT: usize = 1024;
+        let mut reads = self.reads.lock().expect("reads");
+        if reads.len() >= TRACK_LIMIT && !reads.contains_key(policy) {
+            return;
+        }
+        reads.insert(policy.to_string(), unix_now());
+    }
+
+    /// Has anything asked for `policy` within `window`?
+    pub(crate) fn recently_read(&self, policy: &str, window: Duration) -> bool {
+        let reads = self.reads.lock().expect("reads");
+        let Some(last) = reads.get(policy) else {
+            return false;
+        };
+        unix_now().saturating_sub(*last) <= window.as_secs()
+    }
+
     /// The snapshot's tip: the first slot of the chunk after the newest on
     /// disk. Read from the directory each time — a refresh can land while
     /// the service runs, and listing nine thousand names is milliseconds.
@@ -526,8 +601,15 @@ impl PolicyHub {
 
 /// Coverage as a reader sees it: the archive's, widened by whatever the
 /// running jobs have reached. Nothing for either is a policy nobody has
-/// touched.
-fn merged_coverage(archive: Option<&PolicyArchive>, lives: &[&Live], walking: bool) -> CoverageDto {
+/// touched. `status` is judged from `landed`, a walk being `wanted`, and the
+/// last `job` — see [`walk_status`].
+fn merged_coverage(
+    archive: Option<&PolicyArchive>,
+    lives: &[&Live],
+    landed: bool,
+    wanted: bool,
+    job: Option<&PolicyJob>,
+) -> CoverageDto {
     let cov = archive.map(|a| a.coverage());
     let live_floor = lives
         .iter()
@@ -563,7 +645,7 @@ fn merged_coverage(archive: Option<&PolicyArchive>, lives: &[&Live], walking: bo
             .map(|l| l.pending as u64)
             .max()
             .unwrap_or_else(|| cov.as_ref().map_or(0, |c| c.unresolved)),
-        walking,
+        status: walk_status(landed, wanted, job),
         // While a job runs the verdict is not in yet; the archive's stands
         // until the job lands and the manifest is rederived.
         completeness: cov
@@ -682,8 +764,10 @@ pub struct CoverageDto {
     /// progressive walk and must reach the screen — a feed that hides it
     /// presents a partial history as a whole one.
     pub unresolved: u64,
-    /// A pass is running and coverage is still moving.
-    pub walking: bool,
+    /// Where the walk stands: whether a pass has landed, and whether one is
+    /// queued, running or failed. See [`WalkStatus`]; coverage is still
+    /// moving while it is `queued`, `walking` or `refreshing`.
+    pub status: WalkStatus,
     /// `complete` | `partial` | `unrecorded` — whether these numbers are
     /// holdings, a window of movement, or unknown.
     ///
@@ -899,7 +983,7 @@ pub async fn feed(
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
     let job = hub.get(&policy);
-    let walking = hub.walking(&policy);
+    let wanted = hub.walking(&policy);
     let limit = q.limit.unwrap_or(200).clamp(0, 5_000);
     let before = q.before_slot.unwrap_or(u64::MAX);
 
@@ -908,7 +992,11 @@ pub async fn feed(
     // folded once, so a correction a live job found for an archived
     // transaction lands on it.
     let jobs = hub.sched.inflight_for(&policy);
-    let View { mut archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View {
+        mut archive,
+        lives,
+        landed,
+    } = view(&hub, &policy, &jobs).map_err(internal)?;
     let mut rows: Vec<Movement> = match archive.as_mut() {
         Some(a) if limit > 0 => a.movements_page(limit, q.before_slot).map_err(internal)?,
         _ => Vec::new(),
@@ -920,7 +1008,7 @@ pub async fn feed(
         }
     }
     let live_refs: Vec<&Live> = lives.iter().map(|g| &**g).collect();
-    let coverage = merged_coverage(archive.as_ref(), &live_refs, walking);
+    let coverage = merged_coverage(archive.as_ref(), &live_refs, landed, wanted, job.as_ref());
     let mut folded = crate::archive::fold_rows(rows);
     folded.truncate(limit as usize);
     Ok(Json(PolicyFeedResponse {
@@ -944,7 +1032,11 @@ pub async fn density(
     // request for the raw rows, which is the feed's job.
     let bucket_secs = q.bucket.unwrap_or(86_400).clamp(3_600, 31 * 86_400);
     let jobs = hub.sched.inflight_for(&policy);
-    let View { archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View {
+        archive,
+        lives,
+        landed,
+    } = view(&hub, &policy, &jobs).map_err(internal)?;
     // The footers' histogram — segments included — plus every buffer's.
     let from_archive = archive
         .as_ref()
@@ -953,7 +1045,13 @@ pub async fn density(
         crate::archive::merge_density(acc, l.buffered_density(bucket_secs))
     });
     let live_refs: Vec<&Live> = lives.iter().map(|g| &**g).collect();
-    let coverage = merged_coverage(archive.as_ref(), &live_refs, hub.walking(&policy));
+    let coverage = merged_coverage(
+        archive.as_ref(),
+        &live_refs,
+        landed,
+        hub.walking(&policy),
+        hub.get(&policy).as_ref(),
+    );
     let buckets = crate::archive::merge_density(from_archive, from_live)
         .into_iter()
         .map(|b| DensityBucketDto {
@@ -1097,17 +1195,17 @@ pub async fn price(
 fn price_of(
     hub: &PolicyHub,
     policy: String,
-) -> anyhow::Result<(PolicyPriceResponse, policy_archive::view::PolicyView)> {
+) -> anyhow::Result<(PolicyPriceResponse, Arc<policy_archive::view::PolicyView>)> {
     let dir = hub.policy_dir(&policy);
     let manifest = archive::load_manifest(&dir)?;
-    let rows = match &manifest {
-        Some(m) => crate::archive::read_observations(&dir, m)?,
-        None => Vec::new(),
-    };
-    let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+    let (view, observations) = view_of(hub, &policy)?;
+    // Judged at the coverage ceiling, as the pool table is: see `judged_at`.
+    let at = judged_to(
+        manifest.as_ref().and_then(|m| m.walk_to()),
+        view.ceiling().unwrap_or(0),
+    );
     // ONE fold; the response and anything else asked of this policy this
     // request are projections off it.
-    let view = policy_archive::view::PolicyView::from_observations(&rows);
     let spot = view.spot(at, &policy_archive::view::Projection::default());
     let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
     Ok((
@@ -1126,10 +1224,615 @@ fn price_of(
             unpriceable: spot.unpriceable.iter().map(depth_dto).collect(),
             stale: spot.stale.iter().map(depth_dto).collect(),
             stale_after_slots: policy_archive::price::DEFAULT_STALE_AFTER_SLOTS,
-            observations: rows.len(),
+            observations,
         },
         view,
     ))
+}
+
+/// The policy's pool view — folded once, refreshed by delta.
+///
+/// ⚠️ The observations tier is the most expensive read in this API (40 MB on
+/// the widest archive here), and `/price` and `/live` each re-read and re-folded
+/// all of it to answer a question whose answer is a handful of pools. The view
+/// is order-independent — [`policy_archive::view::PolicyView::apply`] keeps the
+/// newest sighting and tracks its ceiling — so a refresh applies only what has
+/// arrived since the last one.
+fn view_of(
+    hub: &PolicyHub,
+    policy: &str,
+) -> anyhow::Result<(Arc<policy_archive::view::PolicyView>, usize)> {
+    let dir = hub.policy_dir(policy);
+    let manifest = archive::load_manifest(&dir)?;
+    let immutable = manifest
+        .as_ref()
+        .map(crate::archive::immutable_to)
+        .unwrap_or(0);
+    let held = hub.views.lock().expect("views cache").get(policy).cloned();
+
+    if let Some(cached) = held
+        && cached.immutable_to == immutable
+    {
+        let above = match &manifest {
+            Some(m) => crate::archive::read_observations_above(
+                &dir,
+                m,
+                cached.view.ceiling().unwrap_or(0),
+            )?,
+            None => Vec::new(),
+        };
+        if above.is_empty() {
+            return Ok((cached.view, cached.observations));
+        }
+        let mut view = (*cached.view).clone();
+        for o in &above {
+            view.apply(o);
+        }
+        let observations = cached.observations + above.len();
+        let view = Arc::new(view);
+        hub.views.lock().expect("views cache").insert(
+            policy.to_string(),
+            CachedView {
+                immutable_to: immutable,
+                view: Arc::clone(&view),
+                observations,
+            },
+        );
+        return Ok((view, observations));
+    }
+
+    // Cold, or the IMMUTABLE coverage moved — which can add rows BELOW the
+    // ceiling (a top-up walk reaches older slots), so a delta is not enough.
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m)?,
+        None => Vec::new(),
+    };
+    let view = Arc::new(policy_archive::view::PolicyView::from_observations(&rows));
+    let observations = rows.len();
+    hub.views.lock().expect("views cache").insert(
+        policy.to_string(),
+        CachedView {
+            immutable_to: immutable,
+            view: Arc::clone(&view),
+            observations,
+        },
+    );
+    Ok((view, observations))
+}
+
+/// One pool, as the archive last saw it.
+///
+/// The per-pool rows behind [`PolicyPriceResponse`], which only sums them. A
+/// caller that must SPEND a pool — a fast buy naming the exact pool UTxO —
+/// needs to know which pools exist, not how deep they are together.
+///
+/// ⚠️ Discovery, not a quote. The reserves are the last sighting, and a pool is
+/// only sighted when touched while holding the asset; a caller pricing a trade
+/// reads the pool from chain at the moment it trades.
+#[derive(Serialize)]
+pub struct PoolDto {
+    /// `splash`, `cswap`, `minswap`, … — as the decoder named it.
+    pub venue: String,
+    /// The pool script address, bech32. One address can host many pools, so
+    /// this alone is not an identity.
+    pub address: String,
+    /// The pool INSTANCE: the asset that identifies it among its neighbours —
+    /// Splash's pool NFT, CSwap's LP token. Hex.
+    pub key_policy: String,
+    pub key_name: String,
+    /// `priced`, `off-model`, `stale` or `unusable` — the same judgement the
+    /// price applies (`policy_archive::view::Bucket`). Only `priced` pools are
+    /// in its sum.
+    pub bucket: &'static str,
+    pub last_seen_slot: u64,
+    /// The hash of the transaction that produced the last sighting.
+    pub last_tx: String,
+    /// The watched policy's reserve, raw, as a string (see `PairDepthDto`).
+    pub base: String,
+    /// The far side's reserve, raw. Absent when the venue does not publish it —
+    /// which is not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+    /// What the asset is paired WITH, hex; empty policy and name mean ADA.
+    /// Absent when the pair is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_name: Option<String>,
+    pub ada_paired: bool,
+    /// ADA-paired with at least the depth floor on the ADA side: worth quoting
+    /// on its own.
+    pub above_floor: bool,
+    /// The pricing model the decoder claimed (`constant-product`, …).
+    pub pricing: String,
+}
+
+/// `GET /policy/{p}/pools` — every pool the archive has seen holding the asset.
+///
+/// # Reading an empty list
+///
+/// An empty `pools` is several different answers, and `status` says which —
+/// see [`WalkStatus`]. A read never starts a walk (see the module header), so
+/// `unwalked` is a caller's cue to ask for one, not a promise one is coming.
+#[derive(Serialize)]
+pub struct PolicyPoolsResponse {
+    pub policy: String,
+    /// An archive exists for this policy: some pass has landed.
+    pub cached: bool,
+    /// What `bucket` was judged AT: the top of the archive's coverage, or the
+    /// newest sighting when that is higher. Not the newest sighting alone —
+    /// a policy whose pools went quiet would then judge them against their
+    /// own last sighting and never call any of them stale.
+    pub at_slot: u64,
+    pub stale_after_slots: u64,
+    pub depth_floor_lovelace: i64,
+    /// Priceable first, deepest ADA side first; then off-model, stale and
+    /// unusable.
+    pub pools: Vec<PoolDto>,
+    /// Script outputs that held the asset and that no decoder recognised —
+    /// counted so an empty list is never mistaken for "there is nothing
+    /// here", and CLASSIFIED, because most of them are not a gap at all. See
+    /// [`UnrecognisedDto`]; the full list is `GET /policy/{p}/unrecognised`.
+    pub unrecognised: UnrecognisedDto,
+    /// Where the policy's walk stands, and so what the list can be trusted to
+    /// say.
+    pub status: WalkStatus,
+    /// The archive's coverage, from its manifest. Absent until a pass lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walked_from: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walked_to: Option<u64>,
+    /// `complete` | `partial` | `unrecorded`, as on `GET /policy/{p}`.
+    pub completeness: &'static str,
+    /// The running or last job, when this process has one for the policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<PolicyJob>,
+}
+
+/// Where a policy's walk stands, as a reader of what it found needs to know.
+///
+/// Not a `walking: bool`: "wanted but not started", "running", "failed" and
+/// "an archive exists and is being topped up" are four different things to a
+/// caller deciding whether to wait, retry or trust the answer, and a boolean
+/// folds them together. The job's own progress, or its error, is beside this
+/// in `job`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalkStatus {
+    /// No archive, and no walk wanted: nothing is known until a refresh.
+    Unwalked,
+    /// No archive yet; a walk is wanted and waiting for a slot.
+    Queued,
+    /// No archive yet; the first walk is running.
+    Walking,
+    /// No archive, and the last walk failed. Its error is in `job`.
+    Failed,
+    /// An archive, and nothing running: the answer as of `walked_to`.
+    Walked,
+    /// An archive, with a top-up wanted or running: the answer as of
+    /// `walked_to`, about to move.
+    Refreshing,
+}
+
+/// The status, from the three things that decide it: is there an archive,
+/// does the scheduler want a walk, and what did this process's last job say.
+fn walk_status(cached: bool, wanted: bool, job: Option<&PolicyJob>) -> WalkStatus {
+    match (cached, wanted, job) {
+        (true, true, _) => WalkStatus::Refreshing,
+        (true, false, _) => WalkStatus::Walked,
+        (false, true, Some(PolicyJob::Running { .. })) => WalkStatus::Walking,
+        (false, true, _) => WalkStatus::Queued,
+        (false, false, Some(PolicyJob::Failed { .. })) => WalkStatus::Failed,
+        (false, false, _) => WalkStatus::Unwalked,
+    }
+}
+
+/// How many scripts `/pools` names in `unrecognised.top`. The full list is
+/// `GET /policy/{p}/unrecognised`.
+pub const UNRECOGNISED_TOP: usize = 10;
+
+/// What an unrecognised script output is, judged against everything this
+/// workspace can name: the DEX venue registry (`mitos_dex_decode::venue`),
+/// the launchpad (`mitos_launchpad_decode`), the lock platforms
+/// (`mitos_vesting_decode`) and the burn sinks (through `mitos_cohort`).
+///
+/// Declared in PRIORITY order — the order a list sorts by — because the kinds
+/// are not equally interesting. The first two are gaps: a pool missing from
+/// the table, and a script nobody has registered. The rest are KNOWN and
+/// expected to hold the asset without being a pool: an order waiting for its
+/// batcher, tokens locked on a lock platform, and tokens burned.
+///
+/// Measured on $ALIENS: classified against the DEX registry alone, a snek.fun
+/// order contract (66 users, 144 outputs), the CrowdLock and snek.fun lock
+/// platforms and the registered burn sink all read as unknown scripts — 202
+/// "unknown" outputs, of which only 46 were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnrecognisedKind {
+    /// A REGISTERED pool contract whose output no decoder claimed: a datum
+    /// shape the decoder does not read. A real gap — a pool not in the table.
+    UndecodedPool,
+    /// A script in no registry: perhaps a venue nobody has registered.
+    UnknownScript,
+    /// A registered ORDER contract — a DEX's or the launchpad's: an escrow
+    /// between placement and fill. Expected; not a gap.
+    Order,
+    /// A lock platform (CrowdLock — the cnft.tools lock — or snek.fun's):
+    /// tokens locked by their holder. Expected; not a gap.
+    Lock,
+    /// A registered burn sink: provably unspendable. Expected; not a gap.
+    Burn,
+    /// A registered airdropper (`address-registry`'s `Airdropper`): a
+    /// token-drop vault handing tokens out to claimants. Its payouts are
+    /// distributions the story already reads. Expected; not a gap.
+    Airdrop,
+}
+
+impl UnrecognisedKind {
+    /// The kind of an output at `address`, and who runs the contract when
+    /// that is known: a venue, the launchpad, or a lock platform.
+    ///
+    /// Burn first, as `mitos_cohort::classify` orders it: provably gone
+    /// outranks every claim about what a script is FOR.
+    fn of(address: &str, cred: Option<&[u8; 28]>) -> (Self, Option<&'static str>) {
+        use mitos_dex_decode::venue::{SNEK_FUN, SiteRole, site_of};
+        if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Burn {
+            return (UnrecognisedKind::Burn, None);
+        }
+        let stake = mitos_cohort::stake_cred(address);
+        if let Some(site) = site_of(address, cred, stake.as_ref()) {
+            return match site.role {
+                SiteRole::Pool => (UnrecognisedKind::UndecodedPool, Some(site.venue)),
+                // An order book's resting orders and its escrows hold
+                // traders' assets, as an order contract does: not a gap.
+                SiteRole::Order | SiteRole::Book | SiteRole::Escrow => {
+                    (UnrecognisedKind::Order, Some(site.venue))
+                }
+            };
+        }
+        let Some(cred) = cred else {
+            return (UnrecognisedKind::UnknownScript, None);
+        };
+        if mitos_launchpad_decode::is_snek_fun_curve(cred) {
+            // The bonding curve IS decoded as a pool; one that was not is the
+            // same gap as any other undecoded pool.
+            (UnrecognisedKind::UndecodedPool, Some(SNEK_FUN))
+        } else if mitos_launchpad_decode::is_snek_fun_order(cred) {
+            (UnrecognisedKind::Order, Some(SNEK_FUN))
+        } else if mitos_vesting_decode::crowd_lock::is_crowd_lock(cred) {
+            (UnrecognisedKind::Lock, Some("crowdlock"))
+        } else if mitos_vesting_decode::snek_fun::is_snek_fun(cred) {
+            (UnrecognisedKind::Lock, Some(SNEK_FUN))
+        } else if let Some(label) = airdropper(cred) {
+            // "Unknown" is the registry saying nobody is named: no operator.
+            (
+                UnrecognisedKind::Airdrop,
+                (label != "Unknown").then_some(label),
+            )
+        } else {
+            (UnrecognisedKind::UnknownScript, None)
+        }
+    }
+}
+
+/// The operator label of a script the address registry calls an airdropper.
+pub(crate) fn airdropper(cred: &[u8; 28]) -> Option<&'static str> {
+    use address_registry::{AddressCategory, ScriptCategory};
+    match address_registry::registry::lookup_payment_credential(&hex::encode(cred))?.category {
+        AddressCategory::Script(ScriptCategory::Airdropper { label }) => Some(label),
+        _ => None,
+    }
+}
+
+/// Unrecognised outputs, by what they are — `PolicyPoolsResponse::unrecognised`.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UnrecognisedDto {
+    /// Every unrecognised output, once per transaction per output.
+    pub outputs: usize,
+    /// The same outputs by kind; they sum to `outputs`.
+    pub by_kind: UnrecognisedKinds,
+    /// The first [`UNRECOGNISED_TOP`] scripts, priority first: undecoded
+    /// pools, unknown scripts, then orders; busiest first within a kind.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top: Vec<UnrecognisedScriptDto>,
+}
+
+/// Unrecognised outputs per kind.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UnrecognisedKinds {
+    pub undecoded_pool: usize,
+    pub unknown_script: usize,
+    pub order: usize,
+    pub lock: usize,
+    pub burn: usize,
+    pub airdrop: usize,
+}
+
+/// Unrecognised outputs at one script.
+///
+/// One entry per PAYMENT CREDENTIAL, not per address. An order script pairs
+/// its credential with each user's stake key, so the same script appears
+/// under one address per user — grouped by address, Splash's order script
+/// alone filled eight of ten slots on $ALIENS. The credential is the script;
+/// the address is only somewhere it was seen.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct UnrecognisedScriptDto {
+    pub kind: UnrecognisedKind,
+    /// Who runs the contract, when that is known: a DEX venue or the
+    /// launchpad for a pool or order, the platform for a lock (`crowdlock`,
+    /// `snek.fun`). Absent for a burn sink and an unknown script.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venue: Option<&'static str>,
+    /// The payment credential, hex. Absent for an address that has none (not
+    /// Shelley), which is then its own entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    /// The address of the newest output, for a reader to look up.
+    pub address: String,
+    /// Distinct addresses the outputs sat at: the stake variants of one
+    /// script.
+    pub addresses: usize,
+    /// Outputs seen holding the asset, one per transaction per output.
+    pub outputs: usize,
+    pub last_seen_slot: u64,
+}
+
+/// Every unrecognised output grouped by script and classified, in priority
+/// order: kind, then most outputs, then credential and address, so the order
+/// is stable.
+fn unrecognised_scripts(rows: &[policy_archive::Observation]) -> Vec<UnrecognisedScriptDto> {
+    struct Seen<'a> {
+        kind: UnrecognisedKind,
+        venue: Option<&'static str>,
+        credential: Option<String>,
+        outputs: usize,
+        newest: (u64, &'a str),
+        addresses: HashSet<&'a str>,
+    }
+    let mut by: HashMap<String, Seen> = HashMap::new();
+    for o in rows.iter().filter(|o| o.decoded.is_none()) {
+        let cred = mitos_cohort::payment_cred(&o.address);
+        let credential = cred.map(hex::encode);
+        // Keyed by credential; an address with none keys on itself.
+        let key = credential.clone().unwrap_or_else(|| o.address.clone());
+        let seen = by.entry(key).or_insert_with(|| {
+            let (kind, venue) = UnrecognisedKind::of(&o.address, cred.as_ref());
+            Seen {
+                kind,
+                venue,
+                credential,
+                outputs: 0,
+                newest: (0, ""),
+                addresses: HashSet::new(),
+            }
+        });
+        seen.outputs += 1;
+        seen.addresses.insert(o.address.as_str());
+        if (o.slot, o.address.as_str()) > seen.newest {
+            seen.newest = (o.slot, o.address.as_str());
+        }
+    }
+    let mut out: Vec<UnrecognisedScriptDto> = by
+        .into_values()
+        .map(|s| UnrecognisedScriptDto {
+            kind: s.kind,
+            venue: s.venue,
+            credential: s.credential,
+            address: s.newest.1.to_string(),
+            addresses: s.addresses.len(),
+            outputs: s.outputs,
+            last_seen_slot: s.newest.0,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(b.outputs.cmp(&a.outputs))
+            .then_with(|| a.credential.cmp(&b.credential))
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    out
+}
+
+/// Every script's outputs, in all and per kind.
+fn unrecognised_totals(scripts: &[UnrecognisedScriptDto]) -> (usize, UnrecognisedKinds) {
+    let mut by_kind = UnrecognisedKinds::default();
+    for s in scripts {
+        *match s.kind {
+            UnrecognisedKind::UndecodedPool => &mut by_kind.undecoded_pool,
+            UnrecognisedKind::UnknownScript => &mut by_kind.unknown_script,
+            UnrecognisedKind::Order => &mut by_kind.order,
+            UnrecognisedKind::Lock => &mut by_kind.lock,
+            UnrecognisedKind::Burn => &mut by_kind.burn,
+            UnrecognisedKind::Airdrop => &mut by_kind.airdrop,
+        } += s.outputs;
+    }
+    (scripts.iter().map(|s| s.outputs).sum(), by_kind)
+}
+
+/// The summary `/pools` carries: totals by kind and the first scripts.
+fn unrecognised_summary(mut scripts: Vec<UnrecognisedScriptDto>) -> UnrecognisedDto {
+    let (outputs, by_kind) = unrecognised_totals(&scripts);
+    scripts.truncate(UNRECOGNISED_TOP);
+    UnrecognisedDto {
+        outputs,
+        by_kind,
+        top: scripts,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UnrecognisedQuery {
+    /// Only this kind's scripts. The totals are always over every kind.
+    pub kind: Option<UnrecognisedKind>,
+}
+
+/// `GET /policy/{p}/unrecognised?kind=` — EVERY unrecognised script, the
+/// list `/pools` summarises in its first ten.
+#[derive(Serialize)]
+pub struct PolicyUnrecognisedResponse {
+    pub policy: String,
+    pub cached: bool,
+    pub status: WalkStatus,
+    /// Every unrecognised output, whatever `kind` filtered.
+    pub outputs: usize,
+    pub by_kind: UnrecognisedKinds,
+    /// Priority order, as `/pools`'s `top`; only `kind`'s when one was asked
+    /// for.
+    pub scripts: Vec<UnrecognisedScriptDto>,
+}
+
+pub async fn unrecognised(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+    Query(q): Query<UnrecognisedQuery>,
+) -> Result<Json<PolicyUnrecognisedResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let mut scripts = unrecognised_scripts(&rows);
+    let (outputs, by_kind) = unrecognised_totals(&scripts);
+    if let Some(kind) = q.kind {
+        scripts.retain(|s| s.kind == kind);
+    }
+    let job = hub.get(&policy);
+    Ok(Json(PolicyUnrecognisedResponse {
+        status: walk_status(manifest.is_some(), hub.walking(&policy), job.as_ref()),
+        cached: manifest.is_some(),
+        policy,
+        outputs,
+        by_kind,
+        scripts,
+    }))
+}
+
+/// The slot a pool's staleness is judged at: the top of what the archive has
+/// READ, not the newest thing it SAW.
+///
+/// The difference is the whole point. A policy whose pools are all quiet has
+/// a newest sighting that IS each pool's own last sighting, so judged there
+/// none of them is ever stale, however long ago that was — while the tip
+/// follower has read every block since and seen nothing. The sighting still
+/// wins when it is higher, which only an archive whose coverage lags a
+/// running pass's rows can produce.
+fn judged_at(walked_to: Option<u64>, rows: &[policy_archive::Observation]) -> u64 {
+    judged_to(walked_to, rows.iter().map(|o| o.slot).max().unwrap_or(0))
+}
+
+/// The slot a document describes: the walk's ceiling, or the newest row when
+/// that is higher.
+fn judged_to(walked_to: Option<u64>, newest: u64) -> u64 {
+    walked_to.map_or(newest, |w| w.max(newest))
+}
+
+pub async fn pools(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+) -> Result<Json<PolicyPoolsResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let rows = match &manifest {
+        Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let view = policy_archive::view::PolicyView::from_observations(&rows);
+    let walked_to = manifest.as_ref().and_then(|m| m.walk_to());
+    let at = judged_at(walked_to, &rows);
+    let mut table = pools_of(policy.clone(), manifest.is_some(), &view, at);
+    table.unrecognised = unrecognised_summary(unrecognised_scripts(&rows));
+    let job = hub.get(&policy);
+    table.status = walk_status(manifest.is_some(), hub.walking(&policy), job.as_ref());
+    table.walked_from = manifest.as_ref().and_then(|m| m.walk_from());
+    table.walked_to = walked_to;
+    table.completeness = manifest
+        .as_ref()
+        .map_or(policy_archive::Completeness::Unrecorded, |m| {
+            m.completeness()
+        })
+        .as_wire();
+    table.job = job;
+    Ok(Json(table))
+}
+
+/// The pool table, projected off the same fold the price reads.
+fn pools_of(
+    policy: String,
+    cached: bool,
+    view: &policy_archive::view::PolicyView,
+    at: u64,
+) -> PolicyPoolsResponse {
+    use policy_archive::view::{Bucket, Projection};
+    let projection = Projection::default();
+    let floor = policy_archive::price::DEFAULT_FLOOR_LOVELACE;
+    let mut rows: Vec<(Bucket, i64, PoolDto)> = view
+        .pools()
+        .map(|(key, pool)| {
+            let bucket = pool.bucket(at, &projection);
+            let ada_paired = pool.quote_unit.as_ref().is_some_and(|u| u.is_ada());
+            let ada_side = if ada_paired {
+                pool.quote.unwrap_or(0)
+            } else {
+                0
+            };
+            let dto = PoolDto {
+                venue: pool.venue.clone(),
+                address: key.address.clone(),
+                key_policy: hex::encode(&key.key_policy),
+                key_name: hex::encode(&key.key_name),
+                bucket: bucket.label(),
+                last_seen_slot: pool.slot,
+                last_tx: hex::encode(&pool.tx_hash),
+                base: pool.base.to_string(),
+                quote: pool.quote.map(|q| q.to_string()),
+                quote_policy: pool.quote_unit.as_ref().map(|u| hex::encode(&u.policy)),
+                quote_name: pool.quote_unit.as_ref().map(|u| hex::encode(&u.name)),
+                ada_paired,
+                above_floor: ada_paired && ada_side >= floor,
+                pricing: pool.pricing.clone(),
+            };
+            (bucket, ada_side, dto)
+        })
+        .collect();
+    // Bucket order is the enum's: priced, off-model, stale, unusable. Within a
+    // bucket the deepest ADA side first, then the key, so the order is stable
+    // whatever order the fold's map yields.
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(b.1.cmp(&a.1))
+            .then_with(|| a.2.address.cmp(&b.2.address))
+            .then_with(|| a.2.key_policy.cmp(&b.2.key_policy))
+            .then_with(|| a.2.key_name.cmp(&b.2.key_name))
+    });
+    PolicyPoolsResponse {
+        policy,
+        cached,
+        at_slot: at,
+        stale_after_slots: projection.stale_after,
+        depth_floor_lovelace: floor,
+        pools: rows.into_iter().map(|(_, _, dto)| dto).collect(),
+        // The count is the fold's; classifying it needs the rows, which the
+        // handler has. As are the walk and coverage fields: this is the
+        // table, projected off the fold, and knows nothing of jobs or
+        // manifests.
+        unrecognised: UnrecognisedDto {
+            outputs: view.candidates(),
+            ..UnrecognisedDto::default()
+        },
+        status: walk_status(cached, false, None),
+        walked_from: None,
+        walked_to: None,
+        completeness: policy_archive::Completeness::Unrecorded.as_wire(),
+        job: None,
+    }
 }
 
 /// `GET /policy/{p}/trades` — the fold, over the newest page of movements.
@@ -1189,7 +1892,15 @@ pub async fn trades(
     };
     let limit = q.limit.unwrap_or(2_000).clamp(1, 5_000);
     let rows = a.feed_rows(limit, None).map_err(internal)?;
-    let folded = policy_archive::trade::fold(&rows, &crate::archive::venue_roles());
+    // The per-launch LumpFun curves come from the observation tier — see
+    // `venue_roles_for` for why a static table cannot carry them.
+    let dir = hub.policy_dir(&policy);
+    let observations = match archive::load_manifest(&dir).map_err(internal)? {
+        Some(m) => crate::archive::read_observations(&dir, &m).map_err(internal)?,
+        None => Vec::new(),
+    };
+    let folded =
+        policy_archive::trade::fold(&rows, &crate::archive::venue_roles_for(&observations));
 
     let mut r = PolicyTradesResponse {
         policy,
@@ -1218,7 +1929,7 @@ pub async fn trades(
             Event::Placement { .. } => r.placements += 1,
             Event::Cancellation { .. } => r.cancellations += 1,
             Event::BatchedFill { .. } => r.batched_fills += 1,
-            Event::Transfer => r.transfers += 1,
+            Event::Transfer | Event::Moved { .. } => r.transfers += 1,
         }
     }
     r.venue_events = r.over_movements - r.transfers;
@@ -1257,6 +1968,16 @@ pub struct PolicySupplyResponse {
     pub class: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub units_seen: Option<u64>,
+    /// Where `minted`/`moved` came from, and therefore whether the total is
+    /// final.
+    ///
+    /// ⚠️ Omitted for the normal case: a reader MUST treat an absent field as
+    /// `snapshot`. `tail` means rows above the last complete Mithril chunk
+    /// were counted — a token launched since the last snapshot has its ENTIRE
+    /// history there, so the immutable-only answer would be `minted: 0` and
+    /// the site would draw a zero market cap until the next weekly refresh.
+    #[serde(skip_serializing_if = "crate::archive::SupplyBasis::is_snapshot")]
+    pub basis: crate::archive::SupplyBasis,
 }
 
 pub async fn supply(
@@ -1287,11 +2008,13 @@ fn supply_of(hub: &PolicyHub, policy: String) -> anyhow::Result<PolicySupplyResp
             because: None,
             class: None,
             units_seen: None,
+            basis: crate::archive::SupplyBasis::Snapshot,
         });
     };
     let completeness = a.manifest.completeness();
     let profile = a.manifest.profile.clone();
-    let r = a.reconcile(policy_archive::Diagnose::Totals)?;
+    let current = a.reconcile_current(policy_archive::Diagnose::Totals)?;
+    let r = current.reconciler;
     let balances = r.balances();
     let (verdict, gap, gap_units, because) = match r.verdict(completeness) {
         Verdict::Balanced => ("balanced", 0, 0, None),
@@ -1315,6 +2038,7 @@ fn supply_of(hub: &PolicyHub, policy: String) -> anyhow::Result<PolicySupplyResp
         because,
         class: profile.as_ref().map(|p| p.class().as_str()),
         units_seen: profile.as_ref().map(|p| p.units_seen),
+        basis: current.basis,
     })
 }
 
@@ -1503,38 +2227,28 @@ pub async fn live(
         }
         None => BucketTally::default(),
     };
-    // ⚠️ CACHED — see `PolicyHub::holders`. This document is rebuilt by every
-    // policy DO every 150 s and the fold pages every movement row, so it is
-    // memoised against the archive's `updated_unix` and recomputed only when
-    // the archive has actually moved.
+    // ⚠️ CACHED, and now built from ONE decode — see `live_folds`. This
+    // document is rebuilt by every policy DO every 150 s and both of these are
+    // whole-history folds, so they are memoised against the archive's
+    // `updated_unix` and recomputed only when the archive has actually moved.
     //
     // Fail-soft: a burn total we could not compute is 0 and `circulating`
     // falls back to `minted`, which is the figure we published before this
     // existed — never a failed document.
-    let burned = match holders_of(&hub, &policy) {
-        Ok(fold) => burn_split(&fold).0,
+    let (burned, stats) = match live_folds(&hub, &policy) {
+        Ok((fold, series)) => (
+            burn_split(&fold).0,
+            Some(StatsDto::from(series.stats(crate::reverse::now_unix()))),
+        ),
         Err(e) => {
-            tracing::warn!("policy {policy} live: burn total unreadable: {e:#}");
-            unreadable.push(format!("burned: {e:#}"));
-            0
+            tracing::warn!("policy {policy} live: history folds unreadable: {e:#}");
+            unreadable.push(format!("burned, stats: {e:#}"));
+            (0, None)
         }
     };
     let circulating = supply
         .as_ref()
         .map(|s| (s.minted - burned).max(0).to_string());
-
-    // ⚠️ Evaluated at the WALL CLOCK, not at the archive's tip. "24-hour
-    // volume" means the last 24 hours of the world; measuring from the tip
-    // would silently widen the window by however far behind the archive is and
-    // report a day of volume as if it were today's.
-    let stats = match series_of(&hub, &policy) {
-        Ok(s) => Some(StatsDto::from(s.stats(crate::reverse::now_unix()))),
-        Err(e) => {
-            tracing::warn!("policy {policy} live: series unreadable: {e:#}");
-            unreadable.push(format!("stats: {e:#}"));
-            None
-        }
-    };
 
     let price = priced.map(|(p, _)| p);
     Ok(Json(PolicyLiveResponse {
@@ -1571,6 +2285,20 @@ pub struct HolderDto {
     pub label: Option<String>,
     /// A registered burn sink: units that exist on chain and can never move.
     pub burn_sink: bool,
+    /// Units of an ADA pool's reserve this party's LP share accounts for.
+    ///
+    /// ⚠️ **ADDITIVE** to [`HolderDto::amount`], not a part of it: the pool's
+    /// reserve sits in the pool's own row, so a provider's balance has never
+    /// included this. Non-zero only where the pool's LP policy has its own
+    /// walked archive — see the summary's `segmentation.lp.status`.
+    pub lp_amount: String,
+    /// Units locked on this party's behalf by a vesting address.
+    ///
+    /// ⚠️ A **SUBSET** of [`HolderDto::amount`], not a separate pile: a
+    /// CrowdLock address delegates to its owner's stake credential, so the
+    /// holder fold already counts the locked units in the row. `free = amount −
+    /// vested`.
+    pub vested: String,
 }
 
 /// `GET /policy/{p}/holders` — who holds it.
@@ -1605,12 +2333,24 @@ pub struct PolicyHoldersResponse {
     /// Distinct parties with a positive balance — the honest holder count,
     /// before any `limit` is applied to the list.
     pub parties: usize,
+    /// True when more parties cleared `min` than the returned page carries.
+    ///
+    /// A caller that asked for a floor must not read a full page as complete:
+    /// a truncated threshold list under-counts the role it is driving, and the
+    /// difference is invisible in the rows themselves.
+    pub truncated: bool,
     /// Movement rows folded.
     pub rows: u64,
     /// Parties whose balance came out NEGATIVE — impossible on chain, so a
     /// count of inbound movements the archive is missing rather than a
     /// rounding curiosity.
     pub negative: usize,
+    /// The archive's IMMUTABLE coverage ceiling this table was folded at.
+    /// Compare like-for-like with `/summary`'s `immutable_to`: a difference is
+    /// a different archive, not a different arithmetic.
+    pub immutable_to: u64,
+    /// When the archive was last written. Display only; the slot is the key.
+    pub updated_unix: u64,
 }
 
 /// The holder table, memoised against the archive's own `updated_unix`.
@@ -1642,23 +2382,217 @@ fn holders_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<policy_archive::h
     Ok(fold)
 }
 
-/// The price + volume series, memoised against the archive's `updated_unix`.
-fn series_of(hub: &PolicyHub, policy: &str) -> anyhow::Result<Arc<policy_archive::series::Series>> {
+/// Whether the archive's coverage reaches continuously down to `settled_to`.
+///
+/// ⚠️ This guard is the difference between "the tail continues where the
+/// artefact stopped" and "there is a stretch the artefact never saw and no
+/// pass holds". The second fails SILENTLY: folding above the boundary returns
+/// a shorter series with no error, and every volume figure reads low.
+///
+/// ⚠️ EVERY pass is considered, not just the volatile ones. Rows above the
+/// boundary can arrive in an immutable pass too — a walk lands them, and the
+/// artefact is only rewritten once that walk completes.
+fn tail_is_continuous(manifest: &archive::Manifest, settled_to: u64) -> bool {
+    manifest
+        .passes
+        .iter()
+        .filter(|p| p.ceiling > settled_to)
+        .map(|p| p.floor)
+        .min()
+        // Nothing reaches above the boundary: there is no tail to fold, so any
+        // boundary is continuous with it.
+        .is_none_or(|floor| floor <= settled_to + 1)
+}
+
+/// The holder table and the price series — from ONE decode of the archive.
+///
+/// ⚠️ One, not two. Both are whole-history folds and both are cached against
+/// the archive's `updated_unix`, so they go stale TOGETHER; each used to open
+/// the archive and decode every movement on its own, which on the widest
+/// archive here was two passes over 38 MB of parquet for a single `/live`.
+/// [`crate::archive::PolicyArchive::all_movements`] is what makes the sharing
+/// real, and it is why `holders_from`/`series_from` exist beside the
+/// `build_*` pair the other routes still use.
+fn live_folds(
+    hub: &PolicyHub,
+    policy: &str,
+) -> anyhow::Result<(
+    policy_archive::holders::Fold,
+    Arc<policy_archive::series::Series>,
+)> {
     let dir = hub.policy_dir(policy);
-    let version = archive::load_manifest(&dir)?
-        .map(|m| m.updated_unix)
+    let manifest = archive::load_manifest(&dir)?;
+    // Two different keys, and they answer different questions.
+    //
+    // `version` (`updated_unix`) invalidates the IN-MEMORY folds: a balance
+    // moves whenever the tail moves, so the holder table really is stale every
+    // 300 s. `immutable` invalidates the WRITTEN series, which knows about the
+    // tail only through `settled_to` and is continued on read — keying that on
+    // `updated_unix` made it stale every five minutes for no reason.
+    let version = manifest.as_ref().map(|m| m.updated_unix).unwrap_or(0);
+    let immutable = manifest
+        .as_ref()
+        .map(crate::archive::immutable_to)
         .unwrap_or(0);
-    if let Some((at, s)) = hub.series.lock().expect("series cache").get(policy)
-        && *at == version
-    {
-        return Ok(Arc::clone(s));
+
+    let held = hub
+        .holders
+        .lock()
+        .expect("holders cache")
+        .get(policy)
+        .filter(|(at, _)| *at == version)
+        .map(|(_, fold)| fold.clone());
+    let series = hub
+        .series
+        .lock()
+        .expect("series cache")
+        .get(policy)
+        .filter(|(at, _)| *at == version)
+        .map(|(_, s)| Arc::clone(s));
+    if let (Some(held), Some(series)) = (held, series) {
+        return Ok((held, series));
     }
-    let built = Arc::new(crate::archive::build_series(&dir)?.unwrap_or_default());
+
+    let written = match crate::archive::read_series(&dir, immutable) {
+        Ok(carry) => carry,
+        Err(e) => {
+            tracing::warn!(
+                policy,
+                error = %format!("{e:#}"),
+                "policy: series artifact unreadable, folding instead"
+            );
+            None
+        }
+    };
+    let written_holders = match crate::archive::read_holders(&dir, immutable) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::warn!(
+                policy,
+                error = %format!("{e:#}"),
+                "policy: holders artifact unreadable, folding instead"
+            );
+            None
+        }
+    };
+
+    let (held, series) = match crate::archive::History::open(&dir)? {
+        Some(mut h) => {
+            // ⚠️ The WRITTEN artifacts carry the IMMUTABLE archive only, and
+            // `read_series`/`read_holders` refuse one whose boundary is anywhere
+            // else. The volatile tail is folded HERE, from the live files,
+            // because it is replaced whole on every refresh: a carry that
+            // included it is a snapshot of rows the next refresh may not have.
+            // See `archive::write_derived`.
+            //
+            // A GAP would be silent — see `tail_series`. If the archive's
+            // coverage does not reach from the boundary to the tail, folding
+            // above the boundary drops every row in between, so the whole
+            // archive is folded and nothing is written: there is no boundary a
+            // later tail fold could resume from.
+            let continuous = manifest
+                .as_ref()
+                .is_some_and(|m| tail_is_continuous(m, immutable));
+
+            let series = match (&manifest, written.filter(|_| continuous)) {
+                (Some(m), Some(carry)) => crate::archive::tail_series(&mut h, &dir, m, &carry)?,
+                (Some(m), None) if continuous => {
+                    let observations = crate::archive::read_observations_upto(&dir, m, immutable)?;
+                    let carry =
+                        crate::archive::immutable_carry_from(&mut h, &observations, immutable)?;
+                    // ⚠️ Record the fold that just happened. The publisher
+                    // rewrites this when a walk lands; writing it here is what
+                    // covers a box that has just restarted and a reader on a
+                    // policy nothing else is publishing. A failure is the next
+                    // reader's fold, not this one's error.
+                    if let Err(e) = crate::archive::store_series(&dir, immutable, &carry) {
+                        tracing::warn!(
+                            policy,
+                            error = %format!("{e:#}"),
+                            "policy: series artifact not written"
+                        );
+                    }
+                    // ⚠️ The carry is the IMMUTABLE half; the answer is the
+                    // whole archive. Continue it through the tail — the same
+                    // fold the artifact path takes above.
+                    crate::archive::tail_series(&mut h, &dir, m, &carry)?
+                }
+                (Some(m), _) => {
+                    let observations = crate::archive::read_observations(&dir, m)?;
+                    crate::archive::carry_from(&mut h, &observations)?.series
+                }
+                (None, _) => policy_archive::series::Series::default(),
+            };
+
+            let held = match (&manifest, written_holders.filter(|_| continuous)) {
+                // The published table, continued through the same tail.
+                (Some(_), Some(file)) => {
+                    crate::archive::holders_tail(&mut h, &file.carry, file.settled_to)?
+                }
+                (Some(_), None) if continuous => {
+                    let carry = crate::archive::immutable_holders_carry_from(&mut h)?;
+                    if let Err(e) =
+                        crate::archive::store_holders(&dir, immutable, immutable, &carry)
+                    {
+                        tracing::warn!(
+                            policy,
+                            error = %format!("{e:#}"),
+                            "policy: holders artifact not written"
+                        );
+                    }
+                    // ⚠️ The carry is the IMMUTABLE half; the answer is the
+                    // whole archive. Continue it through the tail — the same
+                    // fold the artifact path takes above.
+                    crate::archive::holders_tail(&mut h, &carry, immutable)?
+                }
+                // No boundary can be trusted: fold the whole archive and write
+                // nothing. `holders_of` reaches the same answer the same way.
+                _ => crate::archive::holders_from(&mut h)?,
+            };
+            (held, Arc::new(series))
+        }
+        None => (
+            policy_archive::holders::Fold {
+                holders: Vec::new(),
+                held: 0,
+                rows: 0,
+                negative: 0,
+            },
+            Arc::new(policy_archive::series::Series::default()),
+        ),
+    };
+
+    hub.holders
+        .lock()
+        .expect("holders cache")
+        .insert(policy.to_string(), (version, held.clone()));
     hub.series
         .lock()
         .expect("series cache")
-        .insert(policy.to_string(), (version, Arc::clone(&built)));
-    Ok(built)
+        .insert(policy.to_string(), (version, Arc::clone(&series)));
+    Ok((held, series))
+}
+
+/// Warm the per-policy folds a reader would otherwise pay for.
+///
+/// Called by the tip after it writes a tail — the one place that already knows
+/// "this policy's archive moved". The caches are keyed on `updated_unix`, so
+/// this rebuilds exactly the entries the change invalidated, and the artefacts
+/// turn each rebuild into a boundary plus the tail rather than a whole-archive
+/// fold.
+///
+/// ⚠️ This must stay O(new rows). The tip writes a tail for most policies every
+/// cycle, so anything proportional to the archive here would put the whole
+/// archive's fold back into the 300 s window — which is what took the cycle
+/// from 155 s to 236 s once already.
+pub(crate) fn warm(hub: &PolicyHub, policy: &str) {
+    // An optimisation: a failure here is the next reader's cost, not an error.
+    if let Err(e) = live_folds(hub, policy) {
+        tracing::debug!(policy, error = %format!("{e:#}"), "tip: fold warm failed");
+    }
+    if let Err(e) = view_of(hub, policy) {
+        tracing::debug!(policy, error = %format!("{e:#}"), "tip: view warm failed");
+    }
 }
 
 /// Σ held at registered burn sinks, and what that leaves circulating.
@@ -1678,6 +2612,14 @@ fn burn_split(fold: &policy_archive::holders::Fold) -> (i64, i64) {
     (burned, fold.held - burned)
 }
 
+/// Unix seconds, for the read timestamps [`PolicyHub::touch`] records.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Is this address a registered burn sink?
 fn is_burn_sink(address: &str) -> bool {
     let Some((pay, _)) = policy_archive::trade::address_parts(address) else {
         return false;
@@ -1698,20 +2640,86 @@ pub async fn holders(
 ) -> Result<Json<PolicyHoldersResponse>, ApiError> {
     gate(&hub, &headers)?;
     let policy = parse_policy(&policy)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = crate::archive::load_manifest(&dir).map_err(internal)?;
+    let immutable_to = manifest
+        .as_ref()
+        .map(crate::archive::immutable_to)
+        .unwrap_or(0);
+    let updated_unix = manifest.as_ref().map(|m| m.updated_unix).unwrap_or(0);
     let fold = holders_of(&hub, &policy).map_err(internal)?;
     // ⚠️ `parties` is taken BEFORE the limit. A truncated list that also
     // reported a truncated count would make a policy look concentrated
     // precisely because the caller asked for a short list.
     let parties = fold.holders.len();
     let limit = q.limit.unwrap_or(50).clamp(1, 2_000);
+    // A floor, not a page size. Parsed rather than defaulted: a typo in `min`
+    // silently returning every holder would look like a token whose whole
+    // supply is above the threshold.
+    let min = match q.min.as_deref() {
+        Some(raw) => raw.trim().parse::<i128>().map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("min must be an integer amount in raw units, got {raw:?}"),
+            )
+        })?,
+        None => 0,
+    };
 
     // ⚠️ Totalled over EVERY holder, then the list is truncated — never the
     // other way round. A sink ranked below the limit would otherwise drop out
     // and `circulating` would depend on the page size, which is not a number.
     let (burned, circulating) = burn_split(&fold);
 
-    let out: Vec<HolderDto> = fold
+    // The tip decomposition is the summary's, not a second fold of the archive:
+    // `/summary` serves the same facts, and a provider or a lock read here must
+    // not disagree with the one read there. A summary folded before the
+    // decomposition existed simply has none, and every row reports zero.
+    let segmentation = crate::archive::read_summary(&dir)
+        .ok()
+        .flatten()
+        .map(|s| s.segmentation)
+        .unwrap_or_default();
+    let lp_by_key: HashMap<&str, u64> = segmentation
+        .lp
+        .as_ref()
+        .map(|lp| {
+            lp.providers
+                .iter()
+                .map(|p| (p.key.as_str(), p.amount))
+                .collect()
+        })
+        .unwrap_or_default();
+    let vested_by_key: HashMap<&str, u64> = segmentation
+        .vests
+        .iter()
+        .map(|v| (v.key.as_str(), v.amount))
+        .collect();
+    // A lock script that does NOT delegate is keyed by its own ADDRESS in the
+    // holder fold while the vest scan names the owner's credential. The same
+    // fallback `Summary::apply_segmentation` uses: this endpoint folds its own
+    // table (it can hold more parties than `Summary.top`), so it cannot take
+    // the joined rows wholesale.
+    let vested_by_lock: HashMap<&str, u64> = segmentation
+        .vests
+        .iter()
+        .flat_map(|v| v.locks.iter())
+        .fold(HashMap::new(), |mut out, lock| {
+            *out.entry(lock.lock_address.as_str()).or_default() += lock.amount;
+            out
+        });
+
+    let matching: Vec<_> = fold
         .holders
+        .into_iter()
+        .filter(|h| i128::from(h.amount.max(0)) >= min)
+        .collect();
+    // Computed from the FLOOR's matches, not from `parties`: the question is
+    // "did this list carry every holder at or above the floor", and only the
+    // filtered rows can answer it.
+    let truncated = matching.len() > limit;
+
+    let out: Vec<HolderDto> = matching
         .into_iter()
         .take(limit)
         .map(|h| {
@@ -1728,8 +2736,22 @@ pub async fn holders(
                 )
                 .map(|(cat, _)| cat.to_string())
             });
+            // Clamped to the row, so `free = amount − vested` cannot wrap on a
+            // lock observation that outlived its units.
+            let vested = vested_by_key
+                .get(h.key.as_str())
+                .copied()
+                .or_else(|| vested_by_lock.get(h.address.as_str()).copied())
+                .unwrap_or(0)
+                .min(u64::try_from(h.amount).unwrap_or(0));
             HolderDto {
                 burn_sink: is_burn_sink(&h.address),
+                lp_amount: lp_by_key
+                    .get(h.key.as_str())
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+                vested: vested.to_string(),
                 key: h.key,
                 address: h.address,
                 amount: h.amount.to_string(),
@@ -1747,14 +2769,23 @@ pub async fn holders(
         burned: burned.to_string(),
         circulating: circulating.to_string(),
         parties,
+        truncated,
         rows: fold.rows,
         negative: fold.negative,
+        immutable_to,
+        updated_unix,
     }))
 }
 
 #[derive(Deserialize)]
 pub struct HoldersQuery {
     pub limit: Option<usize>,
+    /// A FLOOR, in raw units: only parties at or above it are returned.
+    ///
+    /// Distinct from `limit`, which is a page. A caller asking "everyone at or
+    /// above 1M" needs to know whether the list it got is all of them, which is
+    /// what `truncated` answers.
+    pub min: Option<String>,
 }
 
 /// One sighting of the bonding curve — a point on the launch timeline.
@@ -1873,15 +2904,16 @@ pub async fn launch(
         None => Vec::new(),
     };
 
-    // Curve sightings, oldest first. The observer tags them `BONDING_CURVE`
-    // rather than by venue name, because "not constant-product" is the
-    // property that matters and a second launchpad would share it.
+    // Curve sightings, oldest first. The observer tags them by PRICING MODEL
+    // rather than by venue name — `is_curve` covers both the unpriceable
+    // (snek.fun) and the priceable (LumpFun v5) sorts — so a third launchpad
+    // lands here without this filter learning its name.
     let mut curve: Vec<&policy_archive::Observation> = rows
         .iter()
         .filter(|o| {
             o.decoded
                 .as_ref()
-                .is_some_and(|d| d.pricing == policy_archive::observation::pricing::BONDING_CURVE)
+                .is_some_and(|d| policy_archive::observation::pricing::is_curve(&d.pricing))
         })
         .collect();
     // ⚠️ SLOT, then CURVE POSITION — and the second key is not a tiebreak for
@@ -1920,7 +2952,7 @@ pub async fn launch(
         .iter()
         .filter(|o| last_curve_slot.is_some_and(|s| o.slot > s))
         .filter_map(|o| o.decoded.as_ref())
-        .filter(|d| d.pricing != policy_archive::observation::pricing::BONDING_CURVE)
+        .filter(|d| !policy_archive::observation::pricing::is_curve(&d.pricing))
         .map(|d| d.venue.clone())
         .collect();
     venues_after.sort();
@@ -2053,6 +3085,12 @@ pub async fn story(
         Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
         None => Vec::new(),
     };
+    // ⚠️ Built from the observations BEFORE the clip below, and that is not
+    // bookkeeping: a LumpFun curve's credential is per-launch, so the only
+    // complete set of them is the one the observation tier found. Building the
+    // roles from a clipped window would leave fills outside it classified as
+    // transfers.
+    let roles = crate::archive::venue_roles_for(&observations);
 
     let jobs = hub.sched.inflight_for(&policy);
     let View { archive, .. } = view(&hub, &policy, &jobs).map_err(internal)?;
@@ -2104,8 +3142,31 @@ pub async fn story(
         .filter(|o| o.slot >= floor && o.slot <= ceiling)
         .collect();
 
-    let built = policy_archive::story::build(&rows, &obs, &crate::archive::venue_roles())
-        .with_markers(marks);
+    let mut built = policy_archive::story::build(&rows, &obs, &roles).with_markers(marks);
+    // A sell on a shared order address (CSwap) names nobody in its own
+    // movement; the chain says who placed the order it spent. Without the
+    // index, or for a fill in the volatile tip, it stays anonymous and a
+    // reader pairs it with its placement itself. See `shared_fills`.
+    if let Some(index) = &hub.index {
+        let index = index.get();
+        let started = std::time::Instant::now();
+        let n = crate::shared_fills::name_shared_fills(
+            &mut built.events,
+            &policy,
+            &roles,
+            &mut crate::shared_fills::IndexChain::new(&index),
+            crate::shared_fills::MAX_FILLS,
+        );
+        if n.named + n.unnamed > 0 {
+            tracing::info!(
+                policy,
+                named = n.named,
+                unnamed = n.unnamed,
+                ms = started.elapsed().as_millis() as u64,
+                "story: shared-order fills named from the chain"
+            );
+        }
+    }
     let lo = built.events.first().map(|e| e.slot).unwrap_or(from);
     let hi = built.events.last().map(|e| e.slot).unwrap_or(from);
     let complete = manifest
@@ -2154,7 +3215,9 @@ pub async fn row_at(
             )
         })?;
     let jobs = hub.sched.inflight_for(&policy);
-    let View { mut archive, lives } = view(&hub, &policy, &jobs).map_err(internal)?;
+    let View {
+        mut archive, lives, ..
+    } = view(&hub, &policy, &jobs).map_err(internal)?;
     let mut rows = match archive.as_mut() {
         Some(a) => a.movements_of(&raw).map_err(internal)?,
         None => Vec::new(),
@@ -2192,12 +3255,30 @@ pub async fn refresh(
     {
         return Ok(Json(state));
     }
-    hub.set(&policy, PolicyJob::Queued);
-    // The CALLER's `?to_slot=` first — it is an assertion by whoever asked and
-    // may be better informed than the snapshot. The index only answers when
-    // nothing said, which used to mean walking to genesis.
     let first_mint = q.to_slot.or_else(|| hub.first_mint_from_index(&policy));
-    hub.sched.want_walk(&policy, first_mint);
+    // ⚠️ NO FLOOR IS REFUSED, not defaulted to genesis.
+    //
+    // A walk asked for without a floor reads every chunk back to slot 0. MEASURED
+    // on $BUNNY, whose first mint sits at slot 201,229,506 of 201.3M: 235 passes,
+    // 229.5 s of walk-worker time, **234 of them empty**, ~9,320 chunk files read
+    // to find 53 rows. The index was 3 hours behind that mint — the snapshot
+    // cannot cover a policy minted since the last immutable chunk, which is
+    // exactly the policy somebody wants to ingest.
+    //
+    // So say which source of truth is missing instead of paying for the guess.
+    // `?to_slot=0` still reads from genesis when that is what the caller means.
+    let Some(first_mint) = first_mint else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "no floor for {policy}: the policy index has not reached it (it covers \
+                 complete chunks only), and no ?to_slot= was given. Pass the first mint slot, \
+                 or ?to_slot=0 to read from genesis deliberately."
+            ),
+        ));
+    };
+    hub.set(&policy, PolicyJob::Queued);
+    hub.sched.want_walk(&policy, Some(first_mint));
     Ok(Json(PolicyJob::Queued))
 }
 
@@ -2268,6 +3349,10 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         // The interpretive tiers — what the movements MEAN. Present in the
         // archive since 2026-09-08 and unreachable over HTTP until now.
         .route("/policy/{policy}/price", get(price))
+        // The pools behind the price, one row each: which pools EXIST, for a
+        // caller that has to spend one rather than read their sum.
+        .route("/policy/{policy}/pools", get(pools))
+        .route("/policy/{policy}/unrecognised", get(unrecognised))
         .route("/policy/{policy}/live", get(live))
         .route("/policy/{policy}/holders", get(holders))
         .route("/policy/{policy}/trades", get(trades))
@@ -2279,7 +3364,415 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         .route("/policy/{policy}/refresh", post(refresh))
         .route("/policy/{policy}/seek", post(seek))
         .route("/policy/{policy}/events", get(events))
+        // Every route above is a demand signal for the tip's warm pass — see
+        // [`PolicyHub::touch`]. `route_layer`, so only a MATCHED policy route
+        // is recorded and a 404 costs nothing.
+        .route_layer(middleware::from_fn_with_state(hub.clone(), touch_read))
         .with_state(hub)
+}
+
+/// Note which policy a request is about, for the tip's demand-based warm.
+///
+/// ⚠️ Ahead of the handler and ahead of `gate`, deliberately: whether an
+/// unauthenticated probe counts as demand is a judgement, and the answer here
+/// is yes — a 401 still means something asked for that policy.
+async fn touch_read(
+    State(hub): State<Arc<PolicyHub>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if let Some(policy) = policy_in_path(req.uri().path()) {
+        hub.touch(&policy);
+    }
+    next.run(req).await
+}
+
+/// `/policy/<56 hex>/...` → `<56 hex>`, validated.
+///
+/// ⚠️ Validated rather than trimmed: the map this feeds is bounded by count,
+/// not by length, and a caller-supplied string is exactly what not to key a
+/// cache on without looking at it.
+fn policy_in_path(path: &str) -> Option<String> {
+    let policy = path.strip_prefix("/policy/")?.split('/').next()?;
+    let ok = policy.len() == 56 && policy.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then(|| policy.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod pools_tests {
+    use super::*;
+    use policy_archive::observation::{Decoded, Observation, pricing};
+    use policy_archive::view::PolicyView;
+
+    const DAY: u64 = 86_400;
+
+    /// One pool sighting. `quote` is lovelace when `ada`, else a token.
+    fn seen(
+        slot: u64,
+        addr: &str,
+        nft: &[u8],
+        base: i64,
+        quote: Option<i64>,
+        ada: bool,
+    ) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![(slot % 251) as u8; 32],
+            address: addr.into(),
+            lovelace: 2_000_000,
+            unit_name: b"PERP COIN".to_vec(),
+            unit_amount: base,
+            datum: None,
+            decoded: Some(Decoded {
+                venue: "splash".into(),
+                key_policy: vec![0xab; 28],
+                key_name: nft.to_vec(),
+                key_basis: "datum".into(),
+                base_reserve: base,
+                quote_policy: Some(if ada { Vec::new() } else { vec![7; 28] }),
+                quote_name: Some(if ada { Vec::new() } else { b"USD".to_vec() }),
+                quote_reserve: quote,
+                fee_bps: None,
+                total_lp: None,
+                reserve_source: "value".into(),
+                pricing: pricing::CONSTANT_PRODUCT.into(),
+            }),
+        }
+    }
+
+    fn table(rows: &[Observation]) -> PolicyPoolsResponse {
+        let at = rows.iter().map(|o| o.slot).max().unwrap_or(0);
+        pools_of("p".into(), true, &PolicyView::from_observations(rows), at)
+    }
+
+    /// A policy whose only pool went quiet: judged at its own last sighting
+    /// the pool looks current forever. Judged at what the archive has READ —
+    /// forty days past it, every block of them seen and empty — it is stale.
+    #[test]
+    fn a_quiet_pool_is_judged_at_the_coverage_not_its_own_sighting() {
+        let seen_at = 100 * DAY;
+        let rows = vec![seen(
+            seen_at,
+            "addr1pool",
+            b"quiet",
+            1_000,
+            Some(5_000_000_000),
+            true,
+        )];
+        assert_eq!(
+            judged_at(None, &rows),
+            seen_at,
+            "nothing read: the sighting"
+        );
+        let read_to = seen_at + 40 * DAY;
+        let at = judged_at(Some(read_to), &rows);
+        assert_eq!(at, read_to);
+        let t = pools_of("p".into(), true, &PolicyView::from_observations(&rows), at);
+        assert_eq!(t.pools[0].bucket, "stale");
+        assert_eq!(
+            judged_at(Some(seen_at - DAY), &rows),
+            seen_at,
+            "a sighting above the coverage still counts"
+        );
+    }
+
+    /// Every combination of archive, wanted walk and last job lands on the
+    /// status a caller would act on.
+    #[test]
+    fn the_walk_status_names_what_a_caller_should_do() {
+        let running = PolicyJob::Running {
+            fraction: 0.5,
+            floor: 1,
+            date: "2026-10-23".into(),
+            chunks_done: 1,
+            chunks_total: 2,
+            written: 3,
+            updated: Vec::new(),
+            unresolved: 0,
+        };
+        let failed = PolicyJob::Failed {
+            error: "koios".into(),
+        };
+        let done = PolicyJob::Done {
+            written: 1,
+            backfilled: 0,
+            unresolved: 0,
+            secs: 1.0,
+        };
+        use WalkStatus::*;
+        let cases = [
+            ((false, false, None), Unwalked),
+            ((false, true, None), Queued),
+            ((false, true, Some(&PolicyJob::Queued)), Queued),
+            ((false, true, Some(&running)), Walking),
+            ((false, false, Some(&failed)), Failed),
+            // A retry wanted after a failure is queued again, not failed.
+            ((false, true, Some(&failed)), Queued),
+            ((true, false, None), Walked),
+            ((true, false, Some(&failed)), Walked),
+            ((true, false, Some(&done)), Walked),
+            ((true, true, Some(&running)), Refreshing),
+        ];
+        for ((cached, wanted, job), want) in cases {
+            assert_eq!(
+                walk_status(cached, wanted, job),
+                want,
+                "cached {cached}, wanted {wanted}, job {job:?}"
+            );
+        }
+    }
+
+    /// A mainnet address: script payment credential `script`, staked to
+    /// `stake` — how an order script appears once per user.
+    fn script_at(script: [u8; 28], stake: u8) -> String {
+        use pallas_addresses::{
+            Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+        };
+        ShelleyAddress::new(
+            Network::Mainnet,
+            ShelleyPaymentPart::Script(script.into()),
+            ShelleyDelegationPart::Key([stake; 28].into()),
+        )
+        .to_bech32()
+        .expect("bech32")
+    }
+
+    fn unread(slot: u64, addr: &str) -> Observation {
+        Observation {
+            decoded: None,
+            ..seen(slot, addr, b"x", 1, None, true)
+        }
+    }
+
+    /// Unrecognised outputs are named by SCRIPT and classified against the
+    /// venue registry, in priority order: a registered pool nothing decoded,
+    /// then unknown scripts, then order escrows — busiest first within each.
+    ///
+    /// One order script under three users' stake keys is ONE entry: the
+    /// $ALIENS table had Splash's order script in eight of its ten slots when
+    /// this grouped by address. And it sorts LAST however busy it is, because
+    /// an order waiting for its batcher is expected, not a gap.
+    #[test]
+    fn unrecognised_outputs_are_grouped_by_script_and_classified() {
+        use mitos_dex_decode::{cswap, splash};
+        let order = splash::ORDER_CRED;
+        let (alice, bob, carol) = (
+            script_at(order, 0xa1),
+            script_at(order, 0xb2),
+            script_at(order, 0xc3),
+        );
+        let unknown = script_at([2; 28], 0xa1);
+        let rows = vec![
+            unread(10, &alice),
+            unread(30, &bob),
+            unread(20, &carol),
+            unread(25, &alice),
+            unread(12, &unknown),
+            unread(15, "not-a-shelley-address"),
+            unread(5, cswap::POOL_SCRIPT_ADDR),
+            seen(40, "addr1pool", b"deep", 900, Some(26_000_000_000), true),
+        ];
+        assert_eq!(
+            unrecognised_scripts(&rows),
+            vec![
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::UndecodedPool,
+                    venue: Some("cswap"),
+                    credential: mitos_cohort::payment_cred(cswap::POOL_SCRIPT_ADDR)
+                        .map(hex::encode),
+                    address: cswap::POOL_SCRIPT_ADDR.into(),
+                    addresses: 1,
+                    outputs: 1,
+                    last_seen_slot: 5,
+                },
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::UnknownScript,
+                    venue: None,
+                    credential: None,
+                    address: "not-a-shelley-address".into(),
+                    addresses: 1,
+                    outputs: 1,
+                    last_seen_slot: 15,
+                },
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::UnknownScript,
+                    venue: None,
+                    credential: Some(hex::encode([2u8; 28])),
+                    address: unknown.clone(),
+                    addresses: 1,
+                    outputs: 1,
+                    last_seen_slot: 12,
+                },
+                UnrecognisedScriptDto {
+                    kind: UnrecognisedKind::Order,
+                    venue: Some("splash"),
+                    credential: Some(hex::encode(order)),
+                    address: bob.clone(),
+                    addresses: 3,
+                    outputs: 4,
+                    last_seen_slot: 30,
+                },
+            ]
+        );
+    }
+
+    /// The $ALIENS scripts that read as unknown against the DEX registry
+    /// alone, each by its REAL address: snek.fun's order contract, the
+    /// CrowdLock (cnft.tools) and snek.fun lock platforms, and the registered
+    /// burn sink. All four are known to this workspace; none is a gap.
+    #[test]
+    fn launchpad_orders_locks_and_burns_are_known_not_unknown() {
+        let cases = [
+            (
+                // snek.fun's order contract, one of its per-user addresses.
+                "addr1z8v3gwkxx3emz73pt5dhfpxlk6kxkjsqqkltpcn2djsze9s6xsg7kr5gjfvugzp3vjwhdnnm270eqgely8fq5v4k5eksgs9scy",
+                UnrecognisedKind::Order,
+                Some("snek.fun"),
+            ),
+            (
+                // CrowdLock, one locker's address.
+                "addr1zyupekdkyr8f6lrnm4zulcs8juwv080hjfgsqvgkp98kkdhym9auk0rgpz3lurkryvhl55046ak6ex4tlyj6mxxj735syr937w",
+                UnrecognisedKind::Lock,
+                Some("crowdlock"),
+            ),
+            (
+                "addr1w8wma0rzvdexhnqrty6t8dcur7c5ffu2rjau2ayec3d3azg5qp35x",
+                UnrecognisedKind::Lock,
+                Some("snek.fun"),
+            ),
+            (
+                "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4",
+                UnrecognisedKind::Burn,
+                None,
+            ),
+            (
+                // A token-drop vault on $NikePig, registered as an airdropper
+                // with no operator named.
+                "addr1wysrmj9a67x6gntfrw2f7ky4zh4wd6sd0d4jftws4gpp86gw3kf46",
+                UnrecognisedKind::Airdrop,
+                None,
+            ),
+            (
+                // Shaped like the sink, registered nowhere: still unknown.
+                "addr1w8n8kq3j96v03a3znqqy9f54prt8uf6s4lyj7nuf2cvg2ucnwhs68",
+                UnrecognisedKind::UnknownScript,
+                None,
+            ),
+        ];
+        for (address, kind, by) in cases {
+            let cred = mitos_cohort::payment_cred(address);
+            assert_eq!(
+                UnrecognisedKind::of(address, cred.as_ref()),
+                (kind, by),
+                "{address}"
+            );
+        }
+    }
+
+    /// `/pools` carries the totals by kind over EVERY script and only the
+    /// first [`UNRECOGNISED_TOP`]; the totals add up to the whole.
+    #[test]
+    fn the_summary_totals_every_script_and_names_the_first_ten() {
+        let mut rows: Vec<Observation> = (0..15u8)
+            .map(|i| unread(u64::from(i), &script_at([i + 10; 28], 0xa1)))
+            .collect();
+        let order = mitos_dex_decode::splash::ORDER_CRED;
+        rows.push(unread(99, &script_at(order, 0xa1)));
+        rows.push(unread(98, &script_at(order, 0xb2)));
+        let summary = unrecognised_summary(unrecognised_scripts(&rows));
+        assert_eq!(summary.outputs, 17);
+        assert_eq!(
+            summary.by_kind,
+            UnrecognisedKinds {
+                undecoded_pool: 0,
+                unknown_script: 15,
+                order: 2,
+                lock: 0,
+                burn: 0,
+                airdrop: 0,
+            }
+        );
+        assert_eq!(summary.top.len(), UNRECOGNISED_TOP);
+        assert!(
+            summary
+                .top
+                .iter()
+                .all(|s| s.kind == UnrecognisedKind::UnknownScript),
+            "fifteen unknown scripts outrank the order however busy it is"
+        );
+    }
+
+    /// Each pool once, at its newest sighting, deepest priceable pool first,
+    /// and a pool untouched past the horizon judged stale rather than summed.
+    #[test]
+    fn pools_are_listed_once_deepest_first_with_stale_last() {
+        let now = 100 * DAY;
+        let rows = vec![
+            // The same pool seen twice: only the newer state is listed.
+            seen(
+                now - 10,
+                "addr1pool",
+                b"deep",
+                1_000,
+                Some(10_000_000_000),
+                true,
+            ),
+            seen(now, "addr1pool", b"deep", 900, Some(26_000_000_000), true),
+            seen(
+                now - 5,
+                "addr1pool",
+                b"shallow",
+                50,
+                Some(500_000_000),
+                true,
+            ),
+            // Withdrawn long ago: its last state is real but no longer counts.
+            seen(
+                now - 60 * DAY,
+                "addr1pool",
+                b"gone",
+                5_000,
+                Some(90_000_000_000),
+                true,
+            ),
+            // Paired with a token, so it cannot be quoted in ADA on its own.
+            seen(now - 1, "addr1other", b"tok", 70, Some(9_000), false),
+        ];
+        let t = table(&rows);
+        let got: Vec<(String, &str)> = t
+            .pools
+            .iter()
+            .map(|p| (p.key_name.clone(), p.bucket))
+            .collect();
+        let want: Vec<(String, &str)> = [
+            ("deep", "priced"),
+            ("shallow", "priced"),
+            ("tok", "priced"),
+            ("gone", "stale"),
+        ]
+        .into_iter()
+        .map(|(name, bucket)| (hex::encode(name), bucket))
+        .collect();
+        assert_eq!(got, want);
+        let deep = &t.pools[0];
+        assert_eq!(
+            deep.quote.as_deref(),
+            Some("26000000000"),
+            "the newest state"
+        );
+        assert!(deep.ada_paired && deep.above_floor);
+        assert_eq!(deep.quote_policy.as_deref(), Some(""), "empty means ADA");
+        assert!(!t.pools[2].ada_paired && !t.pools[2].above_floor);
+    }
+
+    /// An archive with nothing in it says so, rather than erroring.
+    #[test]
+    fn no_rows_is_an_empty_table() {
+        let t = table(&[]);
+        assert!(t.pools.is_empty());
+        assert_eq!(t.unrecognised.outputs, 0);
+    }
 }
 
 #[cfg(test)]
@@ -2420,6 +3913,7 @@ mod tests {
             address: addr.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
     }
 

@@ -95,12 +95,17 @@ struct ReplicateState {
 /// resolves directly to the indexer it serves; no name lookup at
 /// runtime.
 ///
-/// `auth` gates every upgrade request via the standard axum
-/// middleware (Bearer token in `Authorization` header).
+/// `auth` gates every upgrade request.
+///
+/// Operator-full only — `mitos_lifecycle::access::Attempt::TailIndexer`. The
+/// token census found one consumer of this surface, `mitos-tail`, an operator
+/// tool; it is a `GET`, but deliberately NOT `Admin(Read)`, which would hand a
+/// long-lived socket carrying every indexer change to the read-only token a
+/// deployed worker holds.
 pub fn replicate_router(
     handles: &[Arc<dyn IndexerHandle>],
     domain: DomainAdapter,
-    auth: crate::auth::AuthToken,
+    auth: Arc<crate::auth::Authenticator>,
 ) -> Router {
     let mut router = Router::new();
     for handle in handles {
@@ -113,10 +118,15 @@ pub fn replicate_router(
         router = router.route(&endpoint, get(handle_upgrade).with_state(state));
         debug!(indexer = %name, endpoint = %endpoint, "replicate route mounted");
     }
-    router.layer(axum::middleware::from_fn_with_state(
-        auth,
-        crate::auth::require_auth,
-    ))
+    router
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            mitos_platform::auth::require_tail_indexer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::authenticate,
+        ))
 }
 
 async fn handle_upgrade(

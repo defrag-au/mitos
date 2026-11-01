@@ -191,14 +191,23 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.peer.clone(),
         args.magic,
     )?;
-    // Batch refresh: when the chunk store advances (Mithril refresh landed),
-    // queue every cached wallet — the worker drains them into ONE sweep of
-    // the new chunks, advancing every cursor together.
+    // Batch refresh: when coverage advances (a Mithril refresh landed, or the
+    // spool is riding the tip), keep the wallets somebody is actually reading
+    // current. The worker drains them into ONE sweep of the new chunks.
+    //
+    // Wallets nobody has asked for recently are deliberately NOT swept. Their
+    // cursor is where they stopped, so the first request for one reads the
+    // whole gap in a single pass (`run_batch_jobs` starts at
+    // `scanned_to_slot + 1`) — lazy catch-up, at the moment somebody wants the
+    // answer rather than every batch forever. "Recently" is the same window
+    // the cache janitor refuses to evict: a wallet in active use is the one
+    // worth both protecting and keeping warm.
     {
         let registry = registry.clone();
         let db_path = args.db.clone();
         let tail_db = args.tail_db.clone();
         let immutable = args.immutable.clone();
+        let active_hours = args.cache_protect_hours;
         std::thread::Builder::new()
             .name("refresh-watcher".into())
             .spawn(move || {
@@ -227,12 +236,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
                         None => last_cover = Some(cover),
                         Some(prev) if cover >= prev + MIN_ADVANCE_SLOTS => {
                             last_cover = Some(cover);
-                            let wallets = db::open_ro(&db_path)
+                            let cutoff = cache::now_unix().saturating_sub(active_hours * 3600);
+                            let all = db::open_ro(&db_path)
                                 .and_then(|c| db::list_wallets(&c))
                                 .unwrap_or_default();
+                            let (wallets, dormant) = batch_roster(all, cutoff);
                             tracing::info!(
                                 cover,
                                 wallets = wallets.len(),
+                                dormant,
                                 "coverage advanced — queueing batch refresh"
                             );
                             for (canonical, display) in wallets {
@@ -285,4 +297,52 @@ pub fn run(args: ServeArgs) -> Result<()> {
             .await
             .context("server error")
     })
+}
+
+/// The wallets a coverage-advance batch should keep current, and how many it
+/// leaves alone.
+///
+/// A dormant wallet is not dropped from the cache — it is caught up lazily,
+/// because its cursor is where it stopped and the next read scans from there
+/// to the tip in one pass. Sweeping it here instead rewrites rows nobody is
+/// waiting for, every batch.
+fn batch_roster(
+    wallets: Vec<(String, String, Option<u64>)>,
+    cutoff: u64,
+) -> (Vec<(String, String)>, usize) {
+    let total = wallets.len();
+    let active: Vec<(String, String)> = wallets
+        .into_iter()
+        .filter(|(_, _, seen)| seen.is_some_and(|s| s >= cutoff))
+        .map(|(canonical, display, _)| (canonical, display))
+        .collect();
+    let dormant = total - active.len();
+    (active, dormant)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batch_roster;
+
+    fn wallet(id: &str, seen: Option<u64>) -> (String, String, Option<u64>) {
+        (id.to_string(), format!("stake-{id}"), seen)
+    }
+
+    #[test]
+    fn only_recently_requested_wallets_stay_in_the_batch() {
+        let wallets = vec![
+            wallet("active", Some(1_000)),
+            wallet("stale", Some(999)),
+            wallet("never", None),
+        ];
+        let (active, dormant) = batch_roster(wallets, 1_000);
+        assert_eq!(
+            active,
+            vec![("active".to_string(), "stake-active".to_string())]
+        );
+        assert_eq!(
+            dormant, 2,
+            "stale and never-read are left to catch up lazily"
+        );
+    }
 }

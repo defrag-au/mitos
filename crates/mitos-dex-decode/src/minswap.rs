@@ -69,6 +69,21 @@ pub fn is_minswap_v2_order(payment_cred: &[u8; 28]) -> bool {
     payment_cred == &V2_ORDER_CRED
 }
 
+/// Minswap V1's ORDER (batch) contract: `addr1zxn9efv2f6w82hag…pq6s3z70`,
+/// which `shared-crates/address-registry` names "Minswap exchange".
+///
+/// ⚠️ SHARED, unlike V2's. MEASURED on $NikePig: the canonical address
+/// carries Minswap's own script stake (`52563c54…`) for every customer, while
+/// other orders on the same credential carry the customer's stake. A fill
+/// from it cannot name the trader by its address, so it is declared shared:
+/// the placement names the wallet the tokens came from, and the box names the
+/// fill from the chain. Unregistered, it was 27,168 "unclaimed" outputs on
+/// $NikePig and every aggregator-split sell through it read as a transfer.
+pub const V1_ORDER_CRED: [u8; 28] = [
+    0xa6, 0x5c, 0xa5, 0x8a, 0x4e, 0x9c, 0x75, 0x5f, 0xa8, 0x30, 0x17, 0x3d, 0x2a, 0x5c, 0xae, 0xd4,
+    0x58, 0xac, 0x0c, 0x73, 0xf9, 0x7d, 0xb7, 0xfa, 0xae, 0x2e, 0x7e, 0x3b,
+];
+
 pub const V2_AUTHEN_POLICY: [u8; 28] = [
     0xf5, 0x80, 0x8c, 0x2c, 0x99, 0x0d, 0x86, 0xda, 0x54, 0xbf, 0xc9, 0x7d, 0x89, 0xce, 0xe6, 0xef,
     0xa2, 0x0c, 0xd8, 0x46, 0x16, 0x16, 0x35, 0x94, 0x78, 0xd9, 0x6b, 0x4c,

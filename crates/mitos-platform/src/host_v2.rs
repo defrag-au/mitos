@@ -24,6 +24,8 @@ use std::time::Duration;
 
 use dolos_core::TipSubscription;
 use mitos_data_plane::{ChainDataPlane, ChainPoint};
+use mitos_lifecycle::ids::InstanceKey;
+use mitos_lifecycle::routing;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +34,7 @@ use crate::bootstrap_v2::{interest_from_manifest, run_bootstrap};
 use crate::follower_v2::run_chain_follower_v2;
 use crate::host_fns::{DataPlaneFacade, emit, state_kv};
 use crate::registry_v2::{ModuleRegistryV2, ResourceBudget};
+use crate::rows::{RowCache, instance_dir_of};
 use crate::storage::ModuleStorage;
 use crate::{PlatformError, PlatformResult};
 
@@ -45,12 +48,42 @@ use crate::{PlatformError, PlatformResult};
 /// `ChainDataPlane` types; the admin router doesn't care about that
 /// — it just needs "start a module" / "stop a module" / "what's
 /// running." The trait keeps the generics out of route signatures.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ModuleHostHandle: Send + Sync {
     async fn replace(&self, id: &str) -> PlatformResult<()>;
     async fn stop(&self, id: &str) -> PlatformResult<()>;
     async fn stop_all(&self);
     async fn list_running(&self) -> Vec<String>;
+
+    /// Which instances of `module` have a live slot. `list_running` answers
+    /// the same question module-at-a-time and cannot distinguish two
+    /// instances of one module; this is what the instances admin route reads.
+    /// Cheap and side-effect free.
+    async fn running_instances(&self, module: &str) -> Vec<InstanceKey>;
+
+    /// Start ONE instance.
+    ///
+    /// The three calls below are what the `LifecycleManager` uses, and it
+    /// uses NOTHING else: it always knows the key it means, and a manager
+    /// that mixed the two addressings is how `facade_slots` came to exist.
+    /// `replace` / `stop` / `evict_module` remain for the `&str` operator
+    /// tools, which mean "the module's current instance".
+    async fn start_instance(&self, key: &InstanceKey) -> PlatformResult<()>;
+
+    async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()>;
+
+    /// Retire ONE instance: stop it, release the dialer's hold on its
+    /// emissions store, close its handles and remove its directory. When it
+    /// was the module's LAST instance this also does what `evict_module`
+    /// does at the module level, so reaping a module's only instance is
+    /// exactly today's evict.
+    ///
+    /// Returns the companion keys whose dial loops were cancelled — empty
+    /// unless the module went with it.
+    async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>>;
 
     /// Drive a coordinated state-rebuild for `id`. The protocol
     /// is in `docs/design/RECAPTURE.md`. v1 always targets every
@@ -190,6 +223,9 @@ fn v1_interest_to_predicate(
 /// instance's exports (the wasmtime Store isn't safely shareable
 /// across tasks), so the dialer can't invoke `update-interest`
 /// directly — it pushes through this trait and the follower drains.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait InterestRouter: Send + Sync {
     async fn route_interest(
@@ -217,7 +253,12 @@ pub type SubscriptionFactory<S> = Arc<dyn Fn(Option<ChainPoint>) -> S + Send + S
 
 /// Factory for fresh in-memory or redb-backed KVs. Called per
 /// module on start/replace.
-pub type KvFactory = Arc<dyn Fn(&str) -> state_kv::ModuleKv + Send + Sync>;
+/// Builds the state KV an instance runs against.
+///
+/// Takes an `InstanceKey`, not a module id: two instances of one module have
+/// two KVs, and handing both the same one is exactly the overwrite this order
+/// exists to make impossible.
+pub type KvFactory = Arc<dyn Fn(&InstanceKey) -> state_kv::ModuleKv + Send + Sync>;
 
 /// Factory for fresh `EventSink` pairs. Each follower gets one;
 /// the host wires the receiving end into the emissions store /
@@ -287,15 +328,25 @@ where
     kv_factory: KvFactory,
     emitter_factory: EmitterFactory,
     budget: ResourceBudget,
-    slots: Arc<Mutex<HashMap<String, RunningSlotV2>>>,
-    /// Per-running-module dynamic-interest channel senders. The
-    /// matching receiver lives inside each module's follower task
+    /// A slot is an INSTANCE, not a module. Two instances of one module run
+    /// side by side with separate followers, cursors and KVs.
+    slots: Arc<Mutex<HashMap<InstanceKey, RunningSlotV2>>>,
+    /// Which instance the `&str` API last STARTED for each module id.
+    ///
+    /// Not derivable from `current.toml`: `replace(id)` runs AFTER
+    /// `activate` has renamed K1 → K2, so "stop the current instance" would
+    /// look for K2 and find nothing running while K1's follower carried on.
+    /// The facade records what it started, and that is what it stops.
+    facade_slots: Arc<Mutex<HashMap<String, InstanceKey>>>,
+    /// Per-running-INSTANCE dynamic-interest channel senders. The
+    /// matching receiver lives inside each instance's follower task
     /// where it's multiplexed with tip events. Held in a
     /// `std::sync::Mutex` (not `tokio::sync`) because every
     /// access is a quick map insert/remove/get — no `.await` ever
     /// held across the guard.
-    interest_senders:
-        Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>>,
+    interest_senders: Arc<
+        std::sync::Mutex<HashMap<InstanceKey, tokio::sync::mpsc::UnboundedSender<InterestUpdate>>>,
+    >,
     /// Where `start` resolves the chain-data fallback provider from.
     fallback_source: FallbackSource,
     /// Set of module ids with an in-flight recapture. Mutual
@@ -361,6 +412,7 @@ where
             emitter_factory,
             budget,
             slots: Arc::new(Mutex::new(HashMap::new())),
+            facade_slots: Arc::new(Mutex::new(HashMap::new())),
             interest_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recapture_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
             bootstrap_in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -423,11 +475,53 @@ where
     /// the module is self-bootstrapping) — the recapture flow
     /// surfaces it as `events_emitted`.
     pub async fn start(&self, id: &str, rebootstrap: bool) -> PlatformResult<u64> {
+        // Stop whatever the facade last started for this module id. After an
+        // upload that is K1, while `current.toml` already says K2 — see
+        // `facade_slots`.
         self.stop(id).await?;
+        let key = self
+            .storage
+            .current_instance(id)?
+            .ok_or_else(|| PlatformError::Decode(format!("no manifest for {id}")))?;
+        let started = self.start_instance(&key, rebootstrap).await?;
+        self.facade_slots.lock().await.insert(id.to_owned(), key);
+        Ok(started)
+    }
+
+    /// Refuse a whole-module operation on a module that has more than one
+    /// instance directory.
+    ///
+    /// `recapture_module` and `evict_module` were both written when a module
+    /// WAS an instance: one wipes bootstrap flags and restarts, the other
+    /// removes the module directory. Neither has a defined meaning across
+    /// two instances, and guessing would either restart the wrong follower
+    /// or delete state nobody asked about.
+    fn refuse_if_forked(&self, id: &str) -> PlatformResult<()> {
+        let module = mitos_lifecycle::ids::ModuleId::parse(id)
+            .map_err(|e| PlatformError::Decode(e.to_string()))?;
+        let found = self.storage.list_instances(&module)?.len();
+        if found > 1 {
+            return Err(PlatformError::MultipleInstances {
+                module: id.to_owned(),
+                found,
+            });
+        }
+        Ok(())
+    }
+
+    /// Start ONE instance. The `&str` API is a thin resolver over this.
+    pub async fn start_instance(
+        &self,
+        key: &InstanceKey,
+        rebootstrap: bool,
+    ) -> PlatformResult<u64> {
+        let id: &str = key.module.as_str();
+        self.stop_instance(key).await?;
 
         // Mark the module as bootstrapping for the duration of `start`
         // (bootstrap + optional rebootstrap pass). Drop-guard clears it
         // on any exit. Backs `bootstrap_in_progress` in the admin API.
+        // Keyed by module id, like `/_admin/status` itself.
         {
             let mut bf = self
                 .bootstrap_in_flight
@@ -440,9 +534,12 @@ where
             id: id.to_owned(),
         };
 
+        // From the CAS, by the instance's OWN digests — not through the
+        // module's current pointer, which may already name another
+        // instance.
         let manifest = self
             .storage
-            .read_manifest(id)?
+            .read_artifact_manifest(&key.wasm)?
             .ok_or_else(|| PlatformError::Decode(format!("no manifest for {id}")))?;
 
         // Refuse to START a module whose manifest doesn't satisfy this
@@ -463,10 +560,13 @@ where
             "mitos:platform-v2/mitos-module-v2",
         )])?;
 
-        let wasm_path = self
-            .storage
-            .current_wasm_path(id)?
-            .ok_or_else(|| PlatformError::Decode(format!("no current.wasm for {id}")))?;
+        let wasm_path = self.storage.artifact_path(&key.wasm);
+        if !wasm_path.exists() {
+            return Err(PlatformError::Decode(format!(
+                "no artifact in the content store for {id} ({})",
+                key.wasm
+            )));
+        }
 
         let registry = Arc::new(ModuleRegistryV2::load_from_path(
             self.engine.clone(),
@@ -512,7 +612,15 @@ where
                 local_index_opt,
                 fallback_opt.clone(),
             ));
-        let config = self.storage.read_config(id)?.unwrap_or_default();
+        // The config is already in the CAS under the instance's own digest —
+        // it is half of what identifies this instance, so it is read from the
+        // key rather than from the module's current pointer. `None` means the
+        // instance runs with no config, which `init(&[])` distinguishes from
+        // an empty one.
+        let config = match &key.config {
+            Some(sha) => self.storage.read_config_bytes(sha)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
 
         // The backfill plane (`COLD_START_TRAP_ISOLATION.md`): a factory
         // that builds fresh, *disposable* instances for unbounded
@@ -523,7 +631,7 @@ where
         // instance's output reaches companions and the live instance
         // sees the refilled state.
         let backfill = crate::backfill_v2::BackfillFactory {
-            module_id: id.to_owned(),
+            instance: key.clone(),
             registry: registry.clone(),
             caching_plane: caching_plane.clone(),
             config: config.clone(),
@@ -546,7 +654,7 @@ where
         // and the follower's fallback plane (reader: scope the Maestro
         // prior-output fallback). One `Arc` per module, persisted to
         // `watched.redb`. See `docs/design/WATCHED_UTXO_INDEX.md`.
-        let watched_index = self.storage.watched_index(id);
+        let watched_index = self.storage.watched_index_at(key);
         driver.set_watched(Some(watched_index.clone()));
 
         // Bootstrap: hydrate state at watched addresses
@@ -576,7 +684,7 @@ where
             // Synthetic events flow through the driver with
             // refuel-per-batch so per-call fuel stays
             // bounded.
-            let mut bootstrap_kv = (self.kv_factory)(id);
+            let mut bootstrap_kv = (self.kv_factory)(key);
             let bootstrap_chain = self.chain_plane.clone();
             match run_bootstrap(
                 &mut driver,
@@ -664,7 +772,7 @@ where
         // Spawn the v2 follower.
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
-        let persisted_cursor = self.storage.read_cursor(id)?;
+        let persisted_cursor = self.storage.read_cursor_at(key)?;
         let subscription = (self.subscription_factory)(persisted_cursor);
         // Wrap the chain plane so prior-output lookups for inputs
         // older than the dolos archive horizon fall back to
@@ -683,7 +791,9 @@ where
                 crate::maestro_fallback_plane::GateMode::from_env(),
             ));
         let follower_storage = self.storage.clone();
-        let follower_module_id = id.to_owned();
+        // The follower carries the INSTANCE it runs as, so its cursor writes
+        // and its KV opens address that instance and not "the module".
+        let follower_key = key.clone();
         let id_for_log = id.to_owned();
 
         // Dynamic-interest channel — sender owned by
@@ -697,7 +807,7 @@ where
                 .interest_senders
                 .lock()
                 .expect("interest_senders mutex");
-            senders.insert(id.to_owned(), interest_tx);
+            senders.insert(key.clone(), interest_tx);
         }
 
         let follower_kv_factory = self.kv_factory.clone();
@@ -718,7 +828,7 @@ where
                 cancel_for_task,
                 chain_plane,
                 follower_storage,
-                follower_module_id,
+                follower_key,
                 follower_kv_factory,
                 follower_trap_logger,
                 follower_event_ring,
@@ -760,15 +870,15 @@ where
         // the events channel and forwards to the EmissionsStore
         // for each registered companion.
         let drain_storage = self.storage.clone();
-        let drain_module_id = id.to_owned();
+        let drain_key = key.clone();
         let drain_cancel = cancel.clone();
         let drain_task = tokio::spawn(async move {
-            run_emit_drain(drain_storage, drain_module_id, events_rx, drain_cancel).await;
+            run_emit_drain(drain_storage, drain_key, events_rx, drain_cancel).await;
         });
 
         let mut slots = self.slots.lock().await;
         slots.insert(
-            id.to_owned(),
+            key.clone(),
             RunningSlotV2 {
                 sha: manifest.module.sha256,
                 task,
@@ -776,7 +886,7 @@ where
                 drain_task,
             },
         );
-        tracing::info!(module = %id, "v2 follower started");
+        tracing::info!(module = %id, instance = %key.dir_name(), "v2 follower started");
         Ok(rebootstrap_count)
     }
 
@@ -784,7 +894,21 @@ where
         self.start(id, false).await.map(|_| ())
     }
 
+    /// Stop whatever the `&str` API last started for this module id.
+    ///
+    /// NOT "the current instance": after an upload's rename the current
+    /// instance is K2 while the running follower is still K1, and looking up
+    /// K2 would leave K1 running for ever. See `facade_slots`.
     pub async fn stop(&self, id: &str) -> PlatformResult<()> {
+        let key = self.facade_slots.lock().await.remove(id);
+        match key {
+            Some(key) => self.stop_instance(&key).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Stop ONE instance, leaving every other instance of the module running.
+    pub async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
         // Drop the interest sender first so the follower's
         // `tokio::select!` sees a `None` on `interest_rx.recv()`
         // alongside cancellation. Mirrors v1's stop semantics —
@@ -795,34 +919,60 @@ where
                 .interest_senders
                 .lock()
                 .expect("interest_senders mutex");
-            senders.remove(id);
+            senders.remove(key);
         }
         let slot = {
             let mut slots = self.slots.lock().await;
-            slots.remove(id)
+            slots.remove(key)
         };
-        let Some(slot) = slot else {
+        if let Some(slot) = &slot {
+            slot.cancel.cancel();
+        }
+        let sha = match slot {
+            Some(slot) => {
+                let _ = slot.task.await;
+                let _ = slot.drain_task.await;
+                Some(slot.sha)
+            }
+            None => None,
+        };
+        // Evict THIS instance's cached handles so a future start re-opens
+        // redb cleanly — and only this instance's, or stopping one would
+        // close the other's files underneath it.
+        //
+        // WITH OR WITHOUT a slot, and the second case is the common one:
+        // after an upload the running follower is K1, but `repoint_locked`
+        // has already re-keyed its handles to K2. `stop(id)` stops K1 and
+        // closes K1's entries — there are none — and then `start_instance(K2)`
+        // arrives here with no K2 slot. Returning early would hand the new
+        // follower the old follower's handles on every deploy, where v2
+        // re-opened them. Nothing else can be holding them: the only follower
+        // that did has just been awaited above, by whichever call stopped it.
+        self.storage.close_cursor_at(key);
+        self.storage.close_kv_at(key);
+        self.storage.close_watched_at(key);
+        let Some(sha) = sha else {
             return Ok(());
         };
-        slot.cancel.cancel();
-        let _ = slot.task.await;
-        let _ = slot.drain_task.await;
-        // Mirror v1's storage-cache eviction so a future start()
-        // re-opens redb cleanly. The `close_*` set is per-module
-        // and matches what v1 does — kept identical for behaviour
-        // parity during the v1+v2 coexistence window.
-        self.storage.close_cursor(id);
-        self.storage.close_kv(id);
-        self.storage.close_watched(id);
         tracing::info!(
-            module = %id,
-            sha = %slot.sha,
+            module = %key.module,
+            instance = %key.dir_name(),
+            sha = %sha,
             "v2 module stopped",
         );
         Ok(())
     }
 
     pub async fn list(&self) -> Vec<String> {
+        let slots = self.slots.lock().await;
+        let mut ids: Vec<String> = slots.keys().map(|k| k.module.to_string()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Every instance with a slot, running or not.
+    pub async fn list_instances(&self) -> Vec<InstanceKey> {
         let slots = self.slots.lock().await;
         slots.keys().cloned().collect()
     }
@@ -835,21 +985,39 @@ where
     /// watchdog, and `mitos_module_running` are built on.
     pub async fn list_running(&self) -> Vec<String> {
         let slots = self.slots.lock().await;
-        slots
+        // Module ids, deduplicated: every `&str` consumer — the watchdog,
+        // `/_admin/status`, `mitos_module_running` — asks "is this module
+        // running", and two instances of it are still one module running.
+        let mut ids: Vec<String> = slots
             .iter()
             .filter(|(_, slot)| !slot.task.is_finished())
-            .map(|(id, _)| id.clone())
+            .map(|(key, _)| key.module.to_string())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// Running instances of one module, truthfully (a follower that exited
+    /// is excluded, as in `list_running`).
+    pub async fn running_instances_of(&self, module: &str) -> Vec<InstanceKey> {
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .filter(|(key, slot)| key.module.as_str() == module && !slot.task.is_finished())
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
     pub async fn stop_all(&self) {
-        let ids: Vec<String> = {
+        let keys: Vec<InstanceKey> = {
             let slots = self.slots.lock().await;
             slots.keys().cloned().collect()
         };
-        for id in ids {
-            let _ = self.stop(&id).await;
+        for key in keys {
+            let _ = self.stop_instance(&key).await;
         }
+        self.facade_slots.lock().await.clear();
     }
 
     /// Resume any modules whose manifests already sit on disk.
@@ -946,6 +1114,17 @@ where
         reason: Option<String>,
         companion_timeout: Duration,
     ) -> PlatformResult<RecaptureOutcome> {
+        // Recapture is a WHOLE-MODULE operation written for one instance: it
+        // wipes the bootstrap flags and restarts, which with two instances
+        // would mean wiping one's flags and restarting the other. Refuse
+        // rather than guess; making it instance-aware is the control plane's.
+        // With one instance — every module in production — nothing changes.
+        //
+        // Asked BEFORE the dialer: "this module is forked" is the true reason
+        // the call is refused, and it must not be masked by whether an
+        // unrelated subsystem happens to be wired.
+        self.refuse_if_forked(id)?;
+
         let dialer = self.dialer.get().ok_or_else(|| {
             PlatformError::RecaptureCoordination(
                 "dialer not wired (host.set_dialer never called); recapture unavailable".to_owned(),
@@ -1027,7 +1206,12 @@ where
 
         // 3. Clear bootstrap-done flags.
         {
-            let mut kv = (self.kv_factory)(id);
+            // One instance, guaranteed by `refuse_if_forked` above.
+            let key = self
+                .storage
+                .current_instance(id)?
+                .ok_or_else(|| PlatformError::Decode(format!("no manifest for {id}")))?;
+            let mut kv = (self.kv_factory)(&key);
             match crate::bootstrap_v2::clear_bootstrap_flags(&mut kv, id) {
                 Ok(n) => tracing::info!(
                     module = %id,
@@ -1136,6 +1320,11 @@ where
     /// currently running — idempotent for re-tries against a
     /// half-retired module.
     pub async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
+        // Whole-module, like recapture: it removes the module directory,
+        // which is every instance's state at once. Refuse a forked module
+        // rather than destroy an instance nobody asked about.
+        self.refuse_if_forked(id)?;
+
         // 1. Stop the running slot. Safe to call against a
         //    not-running id (no-op).
         self.stop(id).await?;
@@ -1166,6 +1355,150 @@ where
             "module evicted (slot stopped, dialer state cleared, DB handles closed)"
         );
         Ok(cancelled)
+    }
+
+    /// Retire ONE instance, leaving its siblings — and the module — alone.
+    ///
+    /// Unlike `evict_module`, this removes the directory itself: the
+    /// instance-scoped teardown has no equivalent of the admin handler that
+    /// used to do it, and splitting it would mean a caller that could forget.
+    pub async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>> {
+        let id: &str = key.module.as_str();
+        let before = self.storage.list_instances(&key.module)?;
+        if before.len() > 1 && self.storage.current_instance(id)?.as_ref() == Some(key) {
+            return Err(PlatformError::CurrentInstanceHasSiblings {
+                module: id.to_owned(),
+                instance: key.dir_name(),
+                siblings: before.len() - 1,
+            });
+        }
+
+        // 1. Stop the follower, and stop calling this the facade's slot if
+        //    that is what it was — otherwise a later `stop(id)` would try to
+        //    stop a key whose directory has gone.
+        self.stop_instance(key).await?;
+        {
+            let mut facade = self.facade_slots.lock().await;
+            if facade.get(id) == Some(key) {
+                facade.remove(id);
+            }
+        }
+
+        // 2. The dialer's drain holds this instance's emissions store for the
+        //    life of the process, through a status writer that owns a clone.
+        //    A live redb handle is exactly what makes `remove_dir_all` fail,
+        //    so ask it to let go and wait — `release_instance` drains the
+        //    writer's queue before it replies. The wait is BOUNDED (this runs
+        //    under the module's lifecycle lock): a drain stuck behind a
+        //    hanging companion fails this reap into its retry instead. Every
+        //    step above is a no-op the second time, and by then the queued
+        //    release has been honoured.
+        if let Some(dialer) = self.dialer.get() {
+            match dialer.release_instance(key).await {
+                crate::dialer::Released::Done => {}
+                crate::dialer::Released::StillBusy => {
+                    return Err(PlatformError::DrainBusy {
+                        module: id.to_owned(),
+                        instance: key.dir_name(),
+                    });
+                }
+            }
+        }
+
+        // 3. Whatever this instance still owed its companions dies with the
+        //    directory. Until WO-09 owns "what a departing instance still
+        //    owes", this line is the only trace that it did.
+        self.report_undelivered(key);
+
+        // 4. Close the cached handles and remove the directory. Handles
+        //    first: unlinking files under an open redb handle leaves a
+        //    writer addressing an inode nothing can reach.
+        self.storage.close_kv_at(key);
+        self.storage.close_emissions_at(key);
+        self.storage.close_cursor_at(key);
+        self.storage.close_watched_at(key);
+        self.storage.remove_instance_dir(key)?;
+
+        // 5. If that was the module's last instance, the module goes too —
+        //    the same teardown `evict_module` does, so reaping a module's
+        //    only instance is byte-for-byte today's evict.
+        if !self.storage.list_instances(&key.module)?.is_empty() {
+            tracing::info!(
+                module = %id,
+                instance = %key.dir_name(),
+                "instance evicted; the module and its siblings stand",
+            );
+            return Ok(Vec::new());
+        }
+        let cancelled = match self.dialer.get() {
+            Some(dialer) => dialer.unregister_module(id).await,
+            None => Vec::new(),
+        };
+        self.storage.close_kv(id);
+        self.storage.close_emissions(id);
+        self.storage.close_cursor(id);
+        self.storage.close_watched(id);
+        self.storage.remove_module_dir(id)?;
+        tracing::info!(
+            module = %id,
+            instance = %key.dir_name(),
+            cancelled_companions = cancelled.len(),
+            "module's last instance evicted; the module went with it",
+        );
+        Ok(cancelled)
+    }
+
+    /// Count what is still `Queued` in an instance's emissions store and say
+    /// so, loudly, before it is deleted. Best-effort: a store that will not
+    /// open is reported as unknown rather than failing the reap, because the
+    /// alternative is an instance that can never be retired.
+    fn report_undelivered(&self, key: &InstanceKey) {
+        let id: &str = key.module.as_str();
+        // Do not OPEN a store that was never written — `EmissionsStore::open`
+        // creates the file, and creating one to count zero rows in it,
+        // moments before deleting the directory, is silly.
+        if !self
+            .storage
+            .instance_dir(key)
+            .join("emissions.redb")
+            .exists()
+        {
+            return;
+        }
+        let queued = self
+            .storage
+            .emissions_store_at(key)
+            .and_then(|store| {
+                store
+                    .list_filtered(|r| matches!(r.status, crate::emissions::EmissionStatus::Queued))
+            })
+            .map(|rows| rows.len());
+        match queued {
+            Ok(0) => {}
+            Ok(queued) => {
+                tracing::warn!(
+                    module = %id,
+                    instance = %key.dir_name(),
+                    queued,
+                    "reaping an instance with undelivered emissions; they are being DELETED",
+                );
+                if let Some(ring) = self.event_ring.get() {
+                    ring.record(
+                        id,
+                        crate::events::EventKind::InstanceReapedWithQueuedRows {
+                            instance: key.dir_name(),
+                            queued,
+                        },
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                module = %id,
+                instance = %key.dir_name(),
+                error = %e,
+                "reaping an instance whose emissions store could not be counted",
+            ),
+        }
     }
 }
 
@@ -1215,6 +1548,452 @@ pub struct RecaptureOutcome {
     pub events_emitted: u64,
 }
 
+/// A recording [`ModuleHostHandle`] for tests that exercise the lifecycle
+/// without a wasmtime engine or a data plane.
+///
+/// ONE fake, shared by every test module that needs one. `ModuleHostV2` is the
+/// trait's only real implementor and it needs an engine and a chain, so
+/// before this the watchdog and the admin evict path had no test coverage at
+/// all. Three copies of a fake is three chances for one of them to quietly
+/// stop matching the trait.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// One recorded call. The lifecycle's whole job is deciding WHICH of
+    /// these happen and when, so the assertions are almost always "was this
+    /// module's follower touched, and how".
+    ///
+    /// The `&str` trio is the operator surface (`POST …/restart`, the CLI).
+    /// The instance trio is what the `LifecycleManager` uses, and after WO-07
+    /// it uses nothing else — `an_upload_never_uses_the_str_host_api` is the
+    /// test that holds that.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum HostCall {
+        Replace(String),
+        Stop(String),
+        Evict(String),
+        StartInstance(InstanceKey),
+        StopInstance(InstanceKey),
+        EvictInstance(InstanceKey),
+    }
+
+    impl HostCall {
+        /// Which module this touched. Every `FakeHost` helper is
+        /// module-scoped — "was this module's follower started", not "which
+        /// of its instances" — so the ~26 assertions written against them
+        /// stand unchanged now that the manager addresses instances.
+        pub(crate) fn module(&self) -> &str {
+            match self {
+                HostCall::Replace(id) | HostCall::Stop(id) | HostCall::Evict(id) => id,
+                HostCall::StartInstance(key)
+                | HostCall::StopInstance(key)
+                | HostCall::EvictInstance(key) => key.module.as_str(),
+            }
+        }
+    }
+
+    /// An [`InterestRouter`] that records which modules had their
+    /// scan-interest re-asserted.
+    ///
+    /// A REBUILT instance starts with an empty KV, and the module's
+    /// scan-interest lives in that KV — so "starting one re-asserts it" is
+    /// load-bearing, and needs something that can say whether it happened.
+    #[derive(Default)]
+    pub(crate) struct RecordingRouter(StdMutex<Vec<String>>);
+
+    impl RecordingRouter {
+        pub(crate) fn routed(&self) -> Vec<String> {
+            self.0.lock().expect("recording router mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InterestRouter for RecordingRouter {
+        async fn route_interest(
+            &self,
+            module_id: &str,
+            _op: mitos_protocol::InterestOp,
+            _items: Vec<mitos_protocol::Interest>,
+        ) -> Result<(), InterestRouteError> {
+            self.0
+                .lock()
+                .expect("recording router mutex")
+                .push(module_id.to_owned());
+            Ok(())
+        }
+    }
+
+    /// What the fake believes is running.
+    ///
+    /// The `&str` API cannot name an instance — the fake resolves nothing —
+    /// so a module-addressed start records a module-addressed slot, and
+    /// `list_running` flattens both, which is all any `&str` caller asks.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    enum Slot {
+        Module(String),
+        Instance(InstanceKey),
+    }
+
+    impl Slot {
+        fn module(&self) -> &str {
+            match self {
+                Slot::Module(id) => id,
+                Slot::Instance(key) => key.module.as_str(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Inner {
+        calls: Vec<HostCall>,
+        running: HashSet<Slot>,
+        /// Modules whose `replace` fails — an effect that fails must not roll
+        /// the lifecycle record back.
+        fail_replace: HashSet<String>,
+        /// Modules whose `evict_module` fails — a `Reap` whose host-side
+        /// teardown failed must leave the directory alone and be retried.
+        fail_evict: HashSet<String>,
+        /// Instances whose `stop_instance` fails and leaves the follower
+        /// RUNNING — so anything that needed it stopped must not proceed.
+        fail_stop: HashSet<InstanceKey>,
+        /// Runs inside `stop`, so a test can record what the WORLD looked
+        /// like at the moment a follower was stopped — an ordering against
+        /// something that is not a host call.
+        on_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct FakeHost {
+        inner: Arc<StdMutex<Inner>>,
+        /// `evict_instance` REMOVES the instance directory on the real host —
+        /// that is why a reap whose teardown failed must leave it alone. A
+        /// fake that only recorded the call would make
+        /// `a_reap_that_could_not_finish_is_retried_on_the_next_tick` and
+        /// `an_abandoned_dev_only_instance_drains_stops_and_is_reaped` assert
+        /// nothing, so the fake does the storage half for real.
+        storage: ModuleStorage,
+    }
+
+    impl FakeHost {
+        pub(crate) fn new(storage: ModuleStorage) -> Self {
+            Self {
+                inner: Arc::new(StdMutex::new(Inner::default())),
+                storage,
+            }
+        }
+
+        pub(crate) fn calls(&self) -> Vec<HostCall> {
+            self.inner.lock().expect("fake host mutex").calls.clone()
+        }
+
+        /// True when this module's follower was started, however addressed.
+        pub(crate) fn started(&self, module: &str) -> bool {
+            self.saw(module, |c| {
+                matches!(c, HostCall::Replace(_) | HostCall::StartInstance(_))
+            })
+        }
+
+        pub(crate) fn stopped(&self, module: &str) -> bool {
+            self.saw(module, |c| {
+                matches!(c, HostCall::Stop(_) | HostCall::StopInstance(_))
+            })
+        }
+
+        pub(crate) fn evicted(&self, module: &str) -> bool {
+            self.saw(module, |c| {
+                matches!(c, HostCall::Evict(_) | HostCall::EvictInstance(_))
+            })
+        }
+
+        fn saw(&self, module: &str, which: impl Fn(&HostCall) -> bool) -> bool {
+            self.calls()
+                .iter()
+                .any(|call| call.module() == module && which(call))
+        }
+
+        pub(crate) fn clear(&self) {
+            self.inner.lock().expect("fake host mutex").calls.clear();
+        }
+
+        /// Make starting this module's follower fail, as a crash-looping one
+        /// does. Module-scoped, so it covers both addressings.
+        pub(crate) fn fail_replace(&self, module: &str) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_replace
+                .insert(module.to_owned());
+        }
+
+        /// Make evicting this module — or any instance of it — fail, as a
+        /// teardown that could not close its redb handles does.
+        pub(crate) fn fail_evict(&self, module: &str) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_evict
+                .insert(module.to_owned());
+        }
+
+        /// Make `stop_instance` fail for `key`, leaving its follower running.
+        pub(crate) fn fail_stop_instance(&self, key: &InstanceKey) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_stop
+                .insert(key.clone());
+        }
+
+        pub(crate) fn on_stop(&self, observe: impl Fn() + Send + Sync + 'static) {
+            self.inner.lock().expect("fake host mutex").on_stop = Some(Arc::new(observe));
+        }
+
+        /// The teardown that was failing now works.
+        pub(crate) fn heal_evict(&self, module: &str) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_evict
+                .remove(module);
+        }
+
+        /// The follower task exited on its own — no `stop` call, it is just
+        /// gone. This is the class the watchdog exists to close: a dispatch
+        /// error killing the task, or a cancelled `start` inside a recapture
+        /// leaving the slot empty (the 2026-06 holder-distribution outage).
+        ///
+        /// Every instance of the module, because the callers that predate
+        /// instances mean "this module's follower died".
+        pub(crate) fn follower_died(&self, module: &str) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .retain(|slot| slot.module() != module);
+        }
+
+        /// One instance's follower exited on its own, leaving its siblings
+        /// running.
+        pub(crate) fn instance_died(&self, key: &InstanceKey) {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .remove(&Slot::Instance(key.clone()));
+        }
+
+        fn record(&self, call: HostCall) {
+            self.inner.lock().expect("fake host mutex").calls.push(call);
+        }
+
+        /// `fail_*` sets are keyed by module: a test says "this module's
+        /// follower will not start", not "this digest's".
+        fn refuses(&self, which: impl Fn(&Inner) -> &HashSet<String>, module: &str) -> bool {
+            which(&self.inner.lock().expect("fake host mutex")).contains(module)
+        }
+
+        /// Drop the slots a stop covers, then run the `on_stop` observer —
+        /// OUTSIDE the mutex, because the observer reads the world (that is
+        /// what it is for) and one of its readers is this fake.
+        fn settle_stop(&self, covers: impl Fn(&Slot) -> bool) {
+            let observe = {
+                let mut inner = self.inner.lock().expect("fake host mutex");
+                inner.running.retain(|slot| !covers(slot));
+                inner.on_stop.clone()
+            };
+            if let Some(observe) = observe {
+                observe();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModuleHostHandle for FakeHost {
+        async fn replace(&self, id: &str) -> PlatformResult<()> {
+            self.record(HostCall::Replace(id.to_owned()));
+            if self.refuses(|i| &i.fail_replace, id) {
+                return Err(PlatformError::Decode(format!("fake replace failure: {id}")));
+            }
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .insert(Slot::Module(id.to_owned()));
+            Ok(())
+        }
+
+        async fn stop(&self, id: &str) -> PlatformResult<()> {
+            self.record(HostCall::Stop(id.to_owned()));
+            self.settle_stop(|slot| slot.module() == id);
+            Ok(())
+        }
+
+        async fn stop_all(&self) {}
+
+        async fn list_running(&self) -> Vec<String> {
+            let mut ids: Vec<String> = self
+                .inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .iter()
+                .map(|slot| slot.module().to_owned())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        }
+
+        async fn running_instances(&self, module: &str) -> Vec<InstanceKey> {
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .iter()
+                .filter_map(|slot| match slot {
+                    Slot::Instance(key) if key.module.as_str() == module => Some(key.clone()),
+                    // A `&str`-started slot names no instance, so it cannot
+                    // appear here. Nothing in the manager starts one after
+                    // WO-07; the operator routes still can.
+                    Slot::Instance(_) | Slot::Module(_) => None,
+                })
+                .collect()
+        }
+
+        async fn start_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+            self.record(HostCall::StartInstance(key.clone()));
+            let id = key.module.as_str();
+            if self.refuses(|i| &i.fail_replace, id) {
+                return Err(PlatformError::Decode(format!("fake replace failure: {id}")));
+            }
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .insert(Slot::Instance(key.clone()));
+            Ok(())
+        }
+
+        async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+            self.record(HostCall::StopInstance(key.clone()));
+            if self
+                .inner
+                .lock()
+                .expect("fake host mutex")
+                .fail_stop
+                .contains(key)
+            {
+                return Err(PlatformError::Decode(format!(
+                    "fake stop failure: {}",
+                    key.dir_name()
+                )));
+            }
+            self.settle_stop(|slot| slot == &Slot::Instance(key.clone()));
+            // The storage half, as the real `stop_instance` does it: a
+            // follower that has stopped has let go of its redb handles.
+            // WITHOUT this, a test that copies a stopped parent's state would
+            // be copying a file whose writer is still open — which is exactly
+            // the thing `state_prep`'s rule 1 exists to prevent, and a fake
+            // that did not model it could not fail on it.
+            self.storage.close_kv_at(key);
+            self.storage.close_cursor_at(key);
+            self.storage.close_watched_at(key);
+            Ok(())
+        }
+
+        async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>> {
+            self.record(HostCall::EvictInstance(key.clone()));
+            let id = key.module.as_str();
+            // Both refusals BEFORE anything is touched — a reap that says no
+            // must leave the world exactly as it found it, which is the whole
+            // point of `CurrentInstanceHasSiblings`.
+            if self.refuses(|i| &i.fail_evict, id) {
+                return Err(PlatformError::Decode(format!("fake evict failure: {id}")));
+            }
+            let before = self.storage.list_instances(&key.module)?;
+            if before.len() > 1 && self.storage.current_instance(id)?.as_ref() == Some(key) {
+                return Err(PlatformError::CurrentInstanceHasSiblings {
+                    module: id.to_owned(),
+                    instance: key.dir_name(),
+                    siblings: before.len() - 1,
+                });
+            }
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .remove(&Slot::Instance(key.clone()));
+            // The storage half, for real — see the field comment.
+            self.storage.close_kv_at(key);
+            self.storage.close_emissions_at(key);
+            self.storage.close_cursor_at(key);
+            self.storage.close_watched_at(key);
+            self.storage.remove_instance_dir(key)?;
+            if self.storage.list_instances(&key.module)?.is_empty() {
+                self.storage.remove_module_dir(id)?;
+            }
+            Ok(Vec::new())
+        }
+
+        async fn recapture_module(
+            &self,
+            id: &str,
+            _reason: Option<String>,
+            _companion_timeout: Duration,
+        ) -> PlatformResult<RecaptureOutcome> {
+            Ok(RecaptureOutcome {
+                module: id.to_owned(),
+                companion_count: 0,
+                events_emitted: 0,
+            })
+        }
+
+        async fn route_interest(
+            &self,
+            _module_id: &str,
+            _op: mitos_protocol::InterestOp,
+            _items: Vec<mitos_protocol::Interest>,
+        ) -> Result<(), InterestRouteError> {
+            Ok(())
+        }
+
+        async fn evict_module(&self, id: &str) -> PlatformResult<Vec<String>> {
+            self.record(HostCall::Evict(id.to_owned()));
+            if self.refuses(|i| &i.fail_evict, id) {
+                return Err(PlatformError::Decode(format!("fake evict failure: {id}")));
+            }
+            self.inner
+                .lock()
+                .expect("fake host mutex")
+                .running
+                .retain(|slot| slot.module() != id);
+            Ok(Vec::new())
+        }
+
+        async fn cancel_companion_task(
+            &self,
+            _module_id: &str,
+            _client_id: &str,
+            _companion_key: &str,
+        ) {
+        }
+
+        async fn recapture_in_flight(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn bootstrap_in_flight(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn last_results(&self) -> Vec<(String, LastResult)> {
+            Vec::new()
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<S, P> ModuleHostHandle for ModuleHostV2<S, P>
 where
@@ -1232,6 +2011,20 @@ where
     }
     async fn list_running(&self) -> Vec<String> {
         ModuleHostV2::list_running(self).await
+    }
+    async fn running_instances(&self, module: &str) -> Vec<InstanceKey> {
+        ModuleHostV2::running_instances_of(self, module).await
+    }
+    async fn start_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+        ModuleHostV2::start_instance(self, key, false)
+            .await
+            .map(drop)
+    }
+    async fn stop_instance(&self, key: &InstanceKey) -> PlatformResult<()> {
+        ModuleHostV2::stop_instance(self, key).await
+    }
+    async fn evict_instance(&self, key: &InstanceKey) -> PlatformResult<Vec<String>> {
+        ModuleHostV2::evict_instance(self, key).await
     }
     async fn route_interest(
         &self,
@@ -1275,17 +2068,19 @@ where
 /// `stop()`. (Moved here from the retired v1 `host.rs`.)
 pub(crate) async fn run_emit_drain(
     storage: ModuleStorage,
-    module_id: String,
+    instance: InstanceKey,
     mut events_rx: tokio::sync::mpsc::UnboundedReceiver<emit::EmittedEvent>,
     cancel: CancellationToken,
 ) {
-    let store = match storage.emissions_store(&module_id) {
+    let module_id = instance.module.to_string();
+    let store = match storage.emissions_store_at(&instance) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
                 module = %module_id,
+                instance = %instance.dir_name(),
                 error = %e,
-                "open EmissionsStore for drain failed; emit interception disabled for this module"
+                "open EmissionsStore for drain failed; emit interception disabled for this instance"
             );
             return;
         }
@@ -1296,19 +2091,163 @@ pub(crate) async fn run_emit_drain(
     // emission. Refreshed per-file on mtime change (re-subscribe
     // rewrites the file). See `InterestCache`.
     let mut interest_cache = InterestCache::default();
+    // …and the same shape for client rows, which the fan-out now consults
+    // per emitted event.
+    let mut row_cache = RowCache::default();
+    // The hand-off watermarks, OWNED by this task for as long as it runs.
+    //
+    // Its only other writer is the lifecycle manager at a commit, and only
+    // with this follower stopped — `stop_instance` awaits this very task, so
+    // the two can never overlap. Loading it once and keeping it is therefore
+    // not a cache that can go stale: while this task lives, nothing else
+    // touches the file.
+    //
+    // A file that will not parse is reported and treated as NO watermarks.
+    // That can deliver a block twice, which a companion tolerates (applies
+    // are chain-point-idempotent); refusing to start the drain would lose
+    // every block instead.
+    let mut handoffs = match storage.read_handoffs_at(&instance) {
+        Ok(handoffs) => handoffs,
+        Err(e) => {
+            tracing::error!(
+                module = %module_id,
+                instance = %instance.dir_name(),
+                error = %e,
+                "hand-off watermarks unreadable; this instance will withhold nothing, so a \
+                 client it took over may be re-sent blocks its predecessor already delivered",
+            );
+            mitos_lifecycle::handoff::Handoffs::default()
+        }
+    };
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
             event = events_rx.recv() => {
                 let Some(event) = event else { return };
-                if event.is_undo {
-                    // Chain rollback: broadcast an undo emission to every
-                    // subscribed companion (no interest filter — a reorg is
-                    // unconditional; each companion reverts its own state).
-                    fan_out_undo(&storage, &store, &module_id, event);
-                } else {
-                    drain_one(&storage, &store, &module_id, event, &mut interest_cache);
-                }
+                drain_event(
+                    &storage,
+                    &store,
+                    &instance,
+                    event,
+                    &mut interest_cache,
+                    &mut row_cache,
+                    &mut handoffs,
+                );
+            }
+        }
+    }
+}
+
+/// One emission, all the way through: watermarks, fan-out, watermarks again.
+///
+/// Its own function, and not the body of the `select!` arm, because the ORDER
+/// of the three steps is the whole of the watermark's correctness and it is
+/// the only part of the drain a test can reach without a chain.
+fn drain_event(
+    storage: &ModuleStorage,
+    store: &crate::emissions::EmissionsStore,
+    instance: &InstanceKey,
+    event: emit::EmittedEvent,
+    interest_cache: &mut InterestCache,
+    row_cache: &mut RowCache,
+    handoffs: &mut mitos_lifecycle::handoff::Handoffs,
+) {
+    let module_id = instance.module.as_str();
+    let at = slot_of(&event.chain_point);
+    // Resolved per EVENT, not once per task: an upload moves the module's
+    // current instance under a running drain, and a row naming a renamed-away
+    // instance follows whatever it is NOW.
+    //
+    // An ERROR here is not "unactivated" — this task is running an instance,
+    // so the module plainly is. It fails OPEN, as the interest filter does:
+    // with one instance that is exactly v2, and with two it is a duplicate
+    // rather than silence. But it says so, per event, for as long as the
+    // pointer is broken.
+    let module_current = match storage.current_instance(module_id) {
+        Ok(current) => current,
+        Err(e) => {
+            tracing::warn!(
+                module = %module_id,
+                instance = %instance.dir_name(),
+                error = %e,
+                "cannot resolve the module's current instance; delivering to every \
+                 companion from this instance",
+            );
+            None
+        }
+    };
+    if event.is_undo {
+        // BEFORE the fan-out. A reorg below a watermark voids what the
+        // client's PREVIOUS instance delivered on the abandoned fork, so the
+        // blocks that replace `(to, watermark]` are new blocks nobody has
+        // delivered — the watermark drops to the rollback point, and
+        // everything above it must be admitted from here on.
+        let changed = handoffs.rolled_back(at);
+        persist_handoffs(storage, instance, handoffs, changed);
+        // Chain rollback: broadcast an undo emission to every subscribed
+        // companion (no interest filter — a reorg is unconditional; each
+        // companion reverts its own state). An undo is NEVER withheld: it is
+        // about state the companion already applied, whoever delivered it.
+        fan_out_undo(
+            storage,
+            store,
+            instance,
+            module_current.as_ref(),
+            event,
+            row_cache,
+        );
+    } else {
+        drain_one(
+            storage,
+            store,
+            instance,
+            module_current.as_ref(),
+            event,
+            interest_cache,
+            row_cache,
+            handoffs,
+        );
+    }
+    // A watermark the chain has moved a whole stability window past can never
+    // be lowered and never withholds anything again — it is only a line in a
+    // file.
+    let changed = handoffs.settle(at);
+    persist_handoffs(storage, instance, handoffs, changed);
+}
+
+/// An emission's slot, as a hand-off watermark measures it.
+///
+/// `ChainPoint::Origin` is slot 0 — before every block — which is what both
+/// callers want: a forward emission at Origin is one the client's previous
+/// instance necessarily delivered, and a rollback to Origin voids everything.
+fn slot_of(point: &mitos_protocol::ChainPoint) -> mitos_lifecycle::ids::Slot {
+    mitos_lifecycle::ids::Slot(point.slot().unwrap_or(0))
+}
+
+/// Write the watermarks back when — and only when — they changed.
+///
+/// A failure is reported and carried past: the in-memory copy is what this
+/// task will go on using, and it is correct. What is lost is durability
+/// across a restart, which costs at most a re-delivery.
+fn persist_handoffs(
+    storage: &ModuleStorage,
+    instance: &InstanceKey,
+    handoffs: &mitos_lifecycle::handoff::Handoffs,
+    changed: mitos_lifecycle::handoff::Changed,
+) {
+    // `match`, never `== Yes`: a third answer would arrive as a compile
+    // error here rather than as a silent skip.
+    match changed {
+        mitos_lifecycle::handoff::Changed::No => {}
+        mitos_lifecycle::handoff::Changed::Yes => {
+            if let Err(e) = storage.write_handoffs_at(instance, handoffs) {
+                tracing::error!(
+                    module = %instance.module,
+                    instance = %instance.dir_name(),
+                    error = %e,
+                    "persisting hand-off watermarks failed; a restart may re-deliver blocks \
+                     this instance has already withheld",
+                );
             }
         }
     }
@@ -1390,14 +2329,20 @@ fn load_watched_policies(path: &std::path::Path) -> Option<HashSet<String>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_one(
     storage: &ModuleStorage,
     store: &crate::emissions::EmissionsStore,
-    module_id: &str,
+    instance: &InstanceKey,
+    module_current: Option<&InstanceKey>,
     event: emit::EmittedEvent,
     interest_cache: &mut InterestCache,
+    row_cache: &mut RowCache,
+    handoffs: &mitos_lifecycle::handoff::Handoffs,
 ) {
     use crate::emissions::{EmissionStatus, UNSUBSCRIBED_COMPANION_ID};
+    use mitos_lifecycle::handoff::Admit;
+    let module_id: &str = instance.module.as_str();
     let companions_dir = storage.module_dir_for_companions(module_id);
     let now = format!(
         "unix:{}",
@@ -1464,6 +2409,41 @@ fn drain_one(
                     if client_id.starts_with('.') {
                         continue;
                     }
+                    // Does THIS instance serve this client? With one
+                    // instance — every module in production — the answer is
+                    // always `Deliver` and the walk is what it always was.
+                    //
+                    // A `Skip` is NOT "no subscriber". The client IS
+                    // subscribed; another instance is writing its row. So the
+                    // walk continues far enough to set `saw_companion`, and
+                    // only the `append` is withheld — skipping the whole
+                    // client dir would leave `saw_companion` false and this
+                    // instance would sentinel an event that was in fact
+                    // delivered, which a later unrelated subscriber could
+                    // then reclaim.
+                    let serves = match module_current {
+                        Some(current) => routing::fan_out(
+                            row_cache.get(storage, module_id, client_id),
+                            instance,
+                            current,
+                            |other| instance_dir_of(storage, other),
+                        ),
+                        // Nothing to compare against (an unactivated module):
+                        // behave as v2 did and deliver.
+                        None => routing::FanOut::Deliver,
+                    };
+                    // …and has this instance ALREADY had this block delivered
+                    // to this client, by the instance it took the client
+                    // over from? Asked per client, like `serves`, because a
+                    // watermark is per client.
+                    //
+                    // A client id that will not parse has no watermark it
+                    // could be under — `RowCache::get` reads the same name
+                    // the same way.
+                    let admits = match mitos_lifecycle::ids::ClientId::parse(client_id) {
+                        Ok(client) => handoffs.admits(&client, slot_of(&event.chain_point)),
+                        Err(_) => Admit::Deliver,
+                    };
                     let client_dir = entry.path();
                     let client_files = match std::fs::read_dir(&client_dir) {
                         Ok(r) => r,
@@ -1487,6 +2467,33 @@ fn drain_one(
                             None => continue,
                         };
                         saw_companion = true;
+                        // `match`, never `== Deliver`: a `Hold` variant is
+                        // coming for the staging diff, and it must arrive as
+                        // a compile error here rather than as a silent skip.
+                        match serves {
+                            routing::FanOut::Deliver => {}
+                            routing::FanOut::Skip => continue,
+                        }
+                        // Withheld for the same reason a `Skip` is: somebody
+                        // else has this client's copy of this block — there,
+                        // the instance it moved to; here, the instance it
+                        // moved FROM, before the switch. And for the same
+                        // reason it is checked AFTER `saw_companion`: the
+                        // companion is subscribed, so sentineling this event
+                        // would keep one that was in fact delivered (WO-06).
+                        match admits {
+                            Admit::Deliver => {}
+                            Admit::Withheld => {
+                                tracing::trace!(
+                                    module = %module_id,
+                                    instance = %instance.dir_name(),
+                                    client_id = %client_id,
+                                    slot = event.chain_point.slot(),
+                                    "withheld: the client's previous instance delivered this block",
+                                );
+                                continue;
+                            }
+                        }
                         // Per-companion interest filter: skip companions
                         // whose declared interest doesn't cover this
                         // event's policy. Unbounded / no-interest /
@@ -1540,7 +2547,18 @@ fn drain_one(
     // companions exist but the interest filter dropped this event
     // for all of them, it's genuinely unwanted — don't sentinel
     // (a later unrelated subscribe must not reclaim it).
-    if !saw_companion && !wrote_per_companion {
+    //
+    // And only on the CURRENT instance. Every instance sees the same events,
+    // so without this each would keep its own copy of the same unclaimed row
+    // — and the first subscriber, placed on the current instance, could only
+    // ever reclaim one. The rest would sit in stores nothing reads.
+    let keep_unclaimed = match module_current {
+        Some(current) => routing::unclaimed(instance, current) == routing::Unclaimed::Keep,
+        // No pointer to compare against (an unactivated module): behave as
+        // v2 did, which is to keep it.
+        None => true,
+    };
+    if keep_unclaimed && !saw_companion && !wrote_per_companion {
         if let Err(e) = store.append(
             UNSUBSCRIBED_COMPANION_ID,
             "",
@@ -1581,9 +2599,12 @@ fn drain_one(
 fn fan_out_undo(
     storage: &ModuleStorage,
     store: &crate::emissions::EmissionsStore,
-    module_id: &str,
+    instance: &InstanceKey,
+    module_current: Option<&InstanceKey>,
     event: emit::EmittedEvent,
+    row_cache: &mut RowCache,
 ) {
+    let module_id: &str = instance.module.as_str();
     let companions_dir = storage.module_dir_for_companions(module_id);
     let now = format!(
         "unix:{}",
@@ -1613,6 +2634,18 @@ fn fan_out_undo(
         };
         if client_id.starts_with('.') {
             continue; // metadata dirs (`.unreachable/` etc.)
+        }
+        // An undo follows the SAME rule as a forward emission: it is for the
+        // client, and the client is served by one instance. Delivering a
+        // reorg from both would make a companion revert twice.
+        if let Some(current) = module_current {
+            let row = row_cache.get(storage, module_id, client_id);
+            match routing::fan_out(row, instance, current, |other| {
+                instance_dir_of(storage, other)
+            }) {
+                routing::FanOut::Deliver => {}
+                routing::FanOut::Skip => continue,
+            }
         }
         let Ok(client_files) = std::fs::read_dir(entry.path()) else {
             continue;
@@ -1714,21 +2747,43 @@ where
             return Ok(());
         }
 
-        let sender = {
+        // EVERY running instance of the module.
+        //
+        // Interest belongs to a companion, at module level — an instance
+        // that is not serving that companion watching a few extra refs costs
+        // a little and breaks nothing, while one that IS serving it and
+        // missed the update is silent loss (the companion subscribes, the
+        // module never widens its scan, and nothing ever captures).
+        let senders: Vec<_> = {
             let senders = self
                 .interest_senders
                 .lock()
                 .expect("interest_senders mutex");
-            senders.get(module_id).cloned()
+            senders
+                .iter()
+                .filter(|(key, _)| key.module.as_str() == module_id)
+                .map(|(_, tx)| tx.clone())
+                .collect()
         };
-        let sender = sender.ok_or_else(|| InterestRouteError::NotRunning(module_id.to_owned()))?;
-        sender
-            .send(InterestUpdate {
-                op,
-                predicates,
-                items_cbor,
-            })
-            .map_err(|_| InterestRouteError::ChannelClosed(module_id.to_owned()))?;
+        if senders.is_empty() {
+            return Err(InterestRouteError::NotRunning(module_id.to_owned()));
+        }
+        let mut delivered = 0usize;
+        for sender in &senders {
+            if sender
+                .send(InterestUpdate {
+                    op,
+                    predicates: predicates.clone(),
+                    items_cbor: items_cbor.clone(),
+                })
+                .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+        if delivered == 0 {
+            return Err(InterestRouteError::ChannelClosed(module_id.to_owned()));
+        }
         Ok(())
     }
 }
@@ -1766,6 +2821,7 @@ mod interest_filter_tests {
                 auth_header: None,
                 auth_value: None,
             }),
+            announced: Vec::new(),
         };
         let path = dir.join("companion.cbor");
         std::fs::write(&path, req.encode().expect("encode")).expect("write");
@@ -1872,5 +2928,577 @@ mod interest_filter_tests {
         );
         assert!(cache.companion_wants(&path, Some(POLICY_A)));
         assert!(!cache.companion_wants(&path, Some(POLICY_B)));
+    }
+}
+
+/// The emission fan-out — `drain_one` and `fan_out_undo`.
+///
+/// Neither had a test before this order. Both are plain synchronous
+/// functions over a `ModuleStorage` and an `EmissionsStore`, so they need no
+/// host, no engine and no chain.
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use crate::emissions::UNSUBSCRIBED_COMPANION_ID;
+    use cardano_assets::PolicyId;
+    use mitos_lifecycle::handoff::Handoffs;
+    use mitos_lifecycle::ids::{ClientId, Slot};
+    use mitos_protocol::{AssetSelector, Interest, SubscribeRequest, SubscribeTarget};
+
+    const MODULE: &str = "ownership-indexer";
+    // 56 lowercase hex each. NOTE: `interest_filter_tests`'s `POLICY_B` is
+    // 57 characters — a typo that never surfaced there because that module
+    // only ever passes it as a raw `&str`, never through `PolicyId::new`.
+    const POLICY_A: &str = "43a056aabbccddeeff00112233445566778899aabbccddeeff001122";
+    const POLICY_B: &str = "de7925aabbccddeeff00112233445566778899aabbccddeeff001122";
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        storage: ModuleStorage,
+        /// The module's one instance — and, in the one-instance case, also
+        /// what `current.toml` resolves to.
+        instance: InstanceKey,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let wasm = b"fan-out test wasm";
+        storage
+            .activate(
+                &crate::companions::testing::manifest_for(MODULE, wasm),
+                wasm,
+            )
+            .unwrap();
+        let instance = storage.current_instance(MODULE).unwrap().unwrap();
+        Fixture {
+            _tmp: tmp,
+            storage,
+            instance,
+        }
+    }
+
+    /// A second instance, built the only way one can be outside `activate`.
+    fn second_instance(storage: &ModuleStorage, wasm: &[u8]) -> InstanceKey {
+        let manifest = crate::companions::testing::manifest_for(MODULE, wasm);
+        storage.put_artifact(&manifest, wasm).unwrap();
+        let key = InstanceKey {
+            module: mitos_lifecycle::ids::ModuleId::parse(MODULE).unwrap(),
+            wasm: mitos_lifecycle::ids::Sha256Hex::parse(&crate::manifest::sha256_hex(wasm))
+                .unwrap(),
+            config: None,
+        };
+        storage.write_instance_marker(&key).unwrap();
+        key
+    }
+
+    /// One registration. `interests` empty ⇒ unbounded, which the filter
+    /// always passes.
+    fn register(storage: &ModuleStorage, client: &str, key: &str, policies: &[&str]) {
+        let dir = storage.module_dir_for_companions(MODULE).join(client);
+        std::fs::create_dir_all(&dir).unwrap();
+        let interests: Vec<Interest> = policies
+            .iter()
+            .map(|p| Interest {
+                asset: AssetSelector::Policy(PolicyId::new(*p).unwrap()),
+                ..Interest::any()
+            })
+            .collect();
+        let req = SubscribeRequest {
+            targets: vec![SubscribeTarget::Module {
+                name: MODULE.into(),
+            }],
+            companion_key: key.into(),
+            client_id: client.into(),
+            resume_from: None,
+            interests,
+            dial_back: None,
+            announced: Vec::new(),
+        };
+        std::fs::write(dir.join(format!("{key}.cbor")), req.encode().unwrap()).unwrap();
+    }
+
+    fn event(policy: Option<&str>) -> emit::EmittedEvent {
+        emit::EmittedEvent {
+            module_id: MODULE.to_owned(),
+            channel: 1,
+            payload: b"payload".to_vec(),
+            chain_point: mitos_protocol::ChainPoint::Slot(42),
+            partition_key: policy.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
+            is_undo: false,
+        }
+    }
+
+    /// Every row in a store, as `(client_id, companion_key)`.
+    fn rows(store: &crate::emissions::EmissionsStore) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = store
+            .list_filtered(|_| true)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.client_id, r.companion_id))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// **Pins today's behaviour, written and run BEFORE the instance
+    /// addressing went in.** Two clients, three companions, one bounded
+    /// interest that filters one of them out, plus the no-companion
+    /// sentinel case.
+    #[test]
+    fn with_one_instance_and_no_rows_the_fan_out_is_unchanged() {
+        let f = fixture();
+        let store = f.storage.emissions_store(MODULE).unwrap();
+
+        // No companions at all ⇒ the sentinel keeps the event so the first
+        // subscriber can reclaim it.
+        drain_one(
+            &f.storage,
+            &store,
+            &f.instance,
+            Some(&f.instance),
+            event(Some(POLICY_A)),
+            &mut InterestCache::default(),
+            &mut RowCache::default(),
+            &Handoffs::default(),
+        );
+        assert_eq!(
+            rows(&store),
+            vec![(String::new(), UNSUBSCRIBED_COMPANION_ID.to_owned())],
+        );
+
+        // Two clients, three companions. `jpgsm`'s is bounded to POLICY_B,
+        // so an event for POLICY_A must reach the other two only.
+        let f = fixture();
+        let store = f.storage.emissions_store(MODULE).unwrap();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        register(&f.storage, "ownership.cnft.dev", "policy_b", &[]);
+        register(&f.storage, "jpgsm.cnft.dev", "policy_a", &[POLICY_B]);
+
+        drain_one(
+            &f.storage,
+            &store,
+            &f.instance,
+            Some(&f.instance),
+            event(Some(POLICY_A)),
+            &mut InterestCache::default(),
+            &mut RowCache::default(),
+            &Handoffs::default(),
+        );
+        assert_eq!(
+            rows(&store),
+            vec![
+                ("ownership.cnft.dev".to_owned(), "policy_a".to_owned()),
+                ("ownership.cnft.dev".to_owned(), "policy_b".to_owned()),
+            ],
+            "the bounded companion must be filtered out, and no sentinel written",
+        );
+
+        // An undo is unconditional: no interest filter, no sentinel.
+        let f = fixture();
+        let store = f.storage.emissions_store(MODULE).unwrap();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        register(&f.storage, "jpgsm.cnft.dev", "policy_a", &[POLICY_B]);
+        fan_out_undo(
+            &f.storage,
+            &store,
+            &f.instance,
+            Some(&f.instance),
+            event(Some(POLICY_A)),
+            &mut RowCache::default(),
+        );
+        assert_eq!(
+            rows(&store),
+            vec![
+                ("jpgsm.cnft.dev".to_owned(), "policy_a".to_owned()),
+                ("ownership.cnft.dev".to_owned(), "policy_a".to_owned()),
+            ],
+            "an undo reaches every subscriber regardless of interest",
+        );
+    }
+
+    /// Write a client row placing `client` on `instance`.
+    fn place(storage: &ModuleStorage, client: &str, instance: &InstanceKey) {
+        use mitos_lifecycle::client_move::{ClientRow, Placement};
+        use mitos_lifecycle::ids::{ClientId, ClientKey, Namespace, Revision};
+
+        let row = ClientRow::adopt(
+            ClientKey {
+                namespace: Namespace::parse("prod").unwrap(),
+                client: ClientId::parse(client).unwrap(),
+            },
+            mitos_lifecycle::ids::ModuleId::parse(MODULE).unwrap(),
+            Placement {
+                instance: instance.clone(),
+                revision: Revision(0),
+            },
+        );
+        storage.write_row(MODULE, &row).unwrap();
+    }
+
+    fn drain(f: &Fixture, store: &crate::emissions::EmissionsStore, from: &InstanceKey) {
+        drain_at(f, store, from, &Handoffs::default(), event(Some(POLICY_A)));
+    }
+
+    /// As `drain`, with watermarks and an event of the caller's choosing.
+    fn drain_at(
+        f: &Fixture,
+        store: &crate::emissions::EmissionsStore,
+        from: &InstanceKey,
+        handoffs: &Handoffs,
+        event: emit::EmittedEvent,
+    ) {
+        let current = f.storage.current_instance(MODULE).unwrap();
+        drain_one(
+            &f.storage,
+            store,
+            from,
+            current.as_ref(),
+            event,
+            &mut InterestCache::default(),
+            &mut RowCache::default(),
+            handoffs,
+        );
+    }
+
+    /// A second instance serves nobody until a row says so — and must not
+    /// keep its own copy of the unclaimed event either, or the first
+    /// subscriber (placed on the current instance) could never reclaim it.
+    #[test]
+    fn a_second_instance_writes_no_rows_and_no_sentinel() {
+        let f = fixture();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        let second = second_instance(&f.storage, b"second instance wasm");
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+
+        drain(&f, &second_store, &second);
+        assert!(
+            rows(&second_store).is_empty(),
+            "a second instance nobody is placed on must write nothing",
+        );
+
+        // …and with NO companions at all, still nothing: `unclaimed` drops
+        // it on a non-current instance.
+        let f = fixture();
+        let second = second_instance(&f.storage, b"second instance wasm");
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+        drain(&f, &second_store, &second);
+        assert!(
+            rows(&second_store).is_empty(),
+            "only the current instance keeps an unclaimed event",
+        );
+    }
+
+    /// One emitted event through BOTH drains ⇒ exactly one row, in the
+    /// instance the client's row names.
+    #[test]
+    fn a_client_whose_row_names_the_second_instance_is_served_by_it_alone() {
+        let f = fixture();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        let second = second_instance(&f.storage, b"second instance wasm");
+        place(&f.storage, "ownership.cnft.dev", &second);
+
+        // Preconditions — both are what makes the assertions below mean
+        // anything. A row that did not round-trip, or a second instance with
+        // no directory, would make the first instance deliver and this test
+        // pass for the wrong reason (see the `Gone` arm of `fan_out`).
+        assert!(f.storage.instance_dir(&second).is_dir());
+        let parsed = f
+            .storage
+            .read_row(MODULE, &ClientId::parse("ownership.cnft.dev").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.current.unwrap().instance, second);
+
+        let first_store = f.storage.emissions_store_at(&f.instance).unwrap();
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+        drain(&f, &first_store, &f.instance);
+        drain(&f, &second_store, &second);
+
+        assert!(
+            rows(&first_store).is_empty(),
+            "the instance the client left must not deliver; that is the duplicate",
+        );
+        assert_eq!(
+            rows(&second_store),
+            vec![("ownership.cnft.dev".to_owned(), "policy_a".to_owned())],
+        );
+    }
+
+    /// THE trap this is shaped around. An upload RENAMES the live instance,
+    /// so a row written while the module was K1 still says K1 after the
+    /// module has become K2 — and K1 exists nowhere. That client has not
+    /// been moved by anything; it follows the module's current instance.
+    #[test]
+    fn a_row_naming_a_renamed_away_instance_is_still_delivered() {
+        let f = fixture();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        place(&f.storage, "ownership.cnft.dev", &f.instance);
+
+        // The upload: K1 → K2, and K1 is gone.
+        let wasm_b = b"an operator upload";
+        f.storage
+            .activate(
+                &crate::companions::testing::manifest_for(MODULE, wasm_b),
+                wasm_b,
+            )
+            .unwrap();
+        let k2 = f.storage.current_instance(MODULE).unwrap().unwrap();
+        assert_ne!(k2, f.instance);
+        assert!(!f.storage.instance_dir(&f.instance).is_dir());
+
+        let store = f.storage.emissions_store_at(&k2).unwrap();
+        drain(&f, &store, &k2);
+        assert_eq!(
+            rows(&store),
+            vec![("ownership.cnft.dev".to_owned(), "policy_a".to_owned())],
+            "every deploy does this; a stale row must not stop delivery",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_row_does_not_stop_delivery() {
+        let f = fixture();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        let dir = f.storage.module_dir_for_rows(MODULE);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ownership.cnft.dev.toml"), "this is not = = toml").unwrap();
+
+        let store = f.storage.emissions_store_at(&f.instance).unwrap();
+        drain(&f, &store, &f.instance);
+        assert_eq!(
+            rows(&store),
+            vec![("ownership.cnft.dev".to_owned(), "policy_a".to_owned())],
+            "a row that cannot be read must not stop delivery",
+        );
+    }
+
+    #[test]
+    fn an_undo_follows_the_same_rule() {
+        let f = fixture();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        let second = second_instance(&f.storage, b"second instance wasm");
+        place(&f.storage, "ownership.cnft.dev", &second);
+
+        let current = f.storage.current_instance(MODULE).unwrap();
+        let first_store = f.storage.emissions_store_at(&f.instance).unwrap();
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+        for (from, store) in [(&f.instance, &first_store), (&second, &second_store)] {
+            fan_out_undo(
+                &f.storage,
+                store,
+                from,
+                current.as_ref(),
+                event(Some(POLICY_A)),
+                &mut RowCache::default(),
+            );
+        }
+
+        assert!(
+            rows(&first_store).is_empty(),
+            "reverting twice is exactly as wrong as delivering twice",
+        );
+        assert_eq!(
+            rows(&second_store),
+            vec![("ownership.cnft.dev".to_owned(), "policy_a".to_owned())],
+        );
+    }
+
+    /// `module_current` is resolved per EVENT, not once per drain task: an
+    /// upload moves it under a task that is already running.
+    #[test]
+    fn an_upload_mid_task_moves_module_current() {
+        let f = fixture();
+        register(&f.storage, "ownership.cnft.dev", "policy_a", &[]);
+        let second = second_instance(&f.storage, b"second instance wasm");
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+
+        // While `second` is not current, it delivers nothing.
+        drain(&f, &second_store, &second);
+        assert!(rows(&second_store).is_empty());
+
+        // Point the module at it — what an upload's repoint does — and the
+        // very next event is delivered by it.
+        f.storage.set_current(&second).unwrap();
+        drain(&f, &second_store, &second);
+        assert_eq!(
+            rows(&second_store),
+            vec![("ownership.cnft.dev".to_owned(), "policy_a".to_owned())],
+            "the drain task must re-resolve current per event",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Hand-off watermarks
+    // -----------------------------------------------------------------
+
+    const CLIENT: &str = "ownership.cnft.dev";
+
+    fn client() -> ClientId {
+        ClientId::parse(CLIENT).unwrap()
+    }
+
+    /// A forward emission carrying a chosen slot.
+    fn at(slot: u64) -> emit::EmittedEvent {
+        emit::EmittedEvent {
+            chain_point: mitos_protocol::ChainPoint::Slot(slot),
+            ..event(Some(POLICY_A))
+        }
+    }
+
+    /// A rollback TO a chosen slot.
+    fn undo_to(slot: u64) -> emit::EmittedEvent {
+        emit::EmittedEvent {
+            is_undo: true,
+            ..at(slot)
+        }
+    }
+
+    /// The watermark's whole job. The instance taking a client over resumes
+    /// from its OWN cursor, which is at or below the one its predecessor had
+    /// reached, so it re-emits blocks the client has already been sent.
+    #[test]
+    fn blocks_at_or_before_the_watermark_are_withheld_and_later_ones_delivered() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        let second = second_instance(&f.storage, b"second instance wasm");
+        place(&f.storage, CLIENT, &second);
+        let second_store = f.storage.emissions_store_at(&second).unwrap();
+
+        let mut handoffs = Handoffs::default();
+        handoffs.begin(client(), Slot(100));
+
+        // AT the watermark, and below it.
+        drain_at(&f, &second_store, &second, &handoffs, at(100));
+        drain_at(&f, &second_store, &second, &handoffs, at(7));
+        assert!(
+            rows(&second_store).is_empty(),
+            "a block its predecessor delivered must not be delivered again",
+        );
+
+        // The first block PAST it.
+        drain_at(&f, &second_store, &second, &handoffs, at(101));
+        assert_eq!(
+            rows(&second_store),
+            vec![(CLIENT.to_owned(), "policy_a".to_owned())],
+        );
+    }
+
+    /// A withheld block is DELIVERED, by someone, and must not also be kept
+    /// for a future subscriber. The instance is the module's current one
+    /// here, which is the only case where `unclaimed` would keep anything —
+    /// so this is the case that can go wrong.
+    #[test]
+    fn a_withheld_block_is_not_kept_as_unclaimed() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        let store = f.storage.emissions_store(MODULE).unwrap();
+        assert_eq!(
+            f.storage.current_instance(MODULE).unwrap().as_ref(),
+            Some(&f.instance),
+            "precondition: only the CURRENT instance keeps an unclaimed event",
+        );
+
+        let mut handoffs = Handoffs::default();
+        handoffs.begin(client(), Slot(100));
+        drain_at(&f, &store, &f.instance, &handoffs, at(50));
+
+        assert!(
+            rows(&store).is_empty(),
+            "the only companion was withheld, not absent; a sentinel here would be \
+             handed to the next subscriber as a block nobody had had",
+        );
+    }
+
+    /// A reorg below a watermark voids what the PREVIOUS instance delivered
+    /// on the abandoned fork: the blocks that replace `(to, watermark]` are
+    /// new blocks nobody has sent. So the watermark drops — durably, because
+    /// the drain task does not survive a restart and the lowered watermark
+    /// must.
+    #[test]
+    fn a_rollback_below_the_watermark_lowers_it_and_is_itself_delivered() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        let store = f.storage.emissions_store(MODULE).unwrap();
+
+        let mut handoffs = Handoffs::default();
+        handoffs.begin(client(), Slot(100));
+        f.storage.write_handoffs_at(&f.instance, &handoffs).unwrap();
+
+        drain_event(
+            &f.storage,
+            &store,
+            &f.instance,
+            undo_to(50),
+            &mut InterestCache::default(),
+            &mut RowCache::default(),
+            &mut handoffs,
+        );
+
+        assert_eq!(handoffs.watermark(&client()), Some(Slot(50)));
+        assert_eq!(
+            f.storage
+                .read_handoffs_at(&f.instance)
+                .unwrap()
+                .watermark(&client()),
+            Some(Slot(50)),
+            "a lowered watermark that only lived in memory would re-withhold the \
+             replacement blocks after a restart",
+        );
+        assert_eq!(
+            rows(&store),
+            vec![(CLIENT.to_owned(), "policy_a".to_owned())],
+            "the rollback itself is never withheld",
+        );
+
+        // And the replacement blocks are now admitted.
+        drain_at(&f, &store, &f.instance, &handoffs, at(60));
+        assert_eq!(rows(&store).len(), 2);
+    }
+
+    /// The trade-off, pinned. A watermark file that will not parse is a
+    /// client that may be sent a block twice — which a companion tolerates,
+    /// because applies are chain-point-idempotent. Refusing to start the
+    /// drain would lose every block instead.
+    #[tokio::test]
+    async fn an_unreadable_watermark_file_delivers_rather_than_refusing_to_start() {
+        let f = fixture();
+        register(&f.storage, CLIENT, "policy_a", &[]);
+        // `storage::HANDOFFS` is private; this is the name it holds.
+        std::fs::write(
+            f.storage.instance_dir(&f.instance).join("handoffs.toml"),
+            b"after = 3\n",
+        )
+        .unwrap();
+        assert!(
+            f.storage.read_handoffs_at(&f.instance).is_err(),
+            "precondition: the file must be unparseable",
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let drain = tokio::spawn(run_emit_drain(
+            f.storage.clone(),
+            f.instance.clone(),
+            rx,
+            cancel.clone(),
+        ));
+        tx.send(at(101)).unwrap();
+
+        let store = f.storage.emissions_store_at(&f.instance).unwrap();
+        for _ in 0..100 {
+            if !rows(&store).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+        drain.await.unwrap();
+
+        assert_eq!(
+            rows(&store),
+            vec![(CLIENT.to_owned(), "policy_a".to_owned())],
+            "an unreadable watermark file must withhold nothing, not stop the drain",
+        );
     }
 }

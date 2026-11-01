@@ -14,6 +14,8 @@
             "quantity": 5
           }
         ],
+        "basis": "chain",
+        "cohort": "wallet",
         "id": {
           "stake": "0b5f5b3b6b48c35d8e92d2f31558f0d9c4b3ca3b2dd7e497fc614fef"
         },
@@ -23,6 +25,8 @@
       },
       {
         "assets": [],
+        "basis": "chain",
+        "cohort": "wallet",
         "id": {
           "stake": "fba681e69a8f8ed94511ef70744988afc5bc0dc2827ca1e8b53f7ed1"
         },

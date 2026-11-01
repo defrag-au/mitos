@@ -123,9 +123,14 @@ pub fn store_manifest(dir: &Path, m: &Manifest) -> Result<()> {
 }
 
 /// The manifest plus every file's footer, as one blob beside the manifest —
-/// what the push script puts in KV so a Worker opens the archive in ONE read
-/// instead of a manifest and two tails per file. Written AFTER the manifest,
-/// from the files it names, and replaced whole.
+/// what `publish` puts in KV so a Worker opens the archive in ONE read instead
+/// of a manifest and two tails per file.
+///
+/// ⚠️ **`publish` is the only automatic writer.** Every other manifest write —
+/// a landed walk, a rollup, a tail — leaves the bundle stale on purpose: it is
+/// derived, nothing local reads it, and rebuilding it there re-read a footer
+/// per file for a blob the next publish regenerates. A bundle on disk that a
+/// `published.json` has not yet caught up with is normal.
 pub fn store_bundle(dir: &Path, m: &Manifest) -> Result<PathBuf> {
     use policy_archive::reader::{FOOTER_HINT, footer_length, footer_request};
     let mut files = Vec::new();
@@ -174,8 +179,7 @@ pub fn store_bundle(dir: &Path, m: &Manifest) -> Result<PathBuf> {
 }
 
 /// `token-ledger bundle` — (re)write a policy's bundle from its manifest.
-/// The landing path writes one itself; this is for archives from before the
-/// bundle existed.
+/// `publish` writes one; this is for backfilling an archive and for looking.
 #[derive(clap::Args, Debug)]
 pub struct BundleArgs {
     /// Archive root (`<root>/<policy_hex>/manifest.json`).
@@ -384,10 +388,88 @@ pub struct Coverage {
     pub completeness: Completeness,
 }
 
+/// Where a supply reconciliation's rows came from — the axis that decides
+/// whether a total is final.
+///
+/// ⚠️ NOT the launch lifecycle. `/launch` already reports `bonding` vs
+/// `graduated`, and the two axes are independent: a token can be bonded and
+/// still carry `Tail` supply on the day it graduates, and a token still on its
+/// curve can be fully `Snapshot` once a Mithril snapshot covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupplyBasis {
+    /// Certified Mithril history. The default and the normal case.
+    #[default]
+    Snapshot,
+    /// Includes the chain-tail spool above the last complete chunk, and at
+    /// least one MINT or BURN came from it. A rollback can retract those rows
+    /// until the next snapshot certifies them, so the supply figure is not
+    /// final.
+    ///
+    /// Transfers from the tail are always counted into `moved`; they do not
+    /// change `minted` and therefore do not, on their own, make the supply
+    /// provisional.
+    Tail,
+}
+
+impl SupplyBasis {
+    /// The wire default: a standard token carries no `basis` field at all.
+    pub fn is_snapshot(&self) -> bool {
+        matches!(self, Self::Snapshot)
+    }
+}
+
+/// A supply reconciliation over the current view.
+pub struct Reconciliation {
+    pub reconciler: policy_archive::Reconciler,
+    pub basis: SupplyBasis,
+}
+
+/// Whether a unit is part of what a supply figure counts, as opposed to
+/// plumbing that shares the policy — a CIP-67 reference twin, a CIP-27 royalty
+/// token, or a launchpad pool's state NFT.
+///
+/// The same rule `segments` uses for the unit count, from the same crate: two
+/// definitions of "what is a unit" would let the header and the supply total
+/// disagree.
+pub(crate) fn is_user_unit(name: &[u8]) -> bool {
+    cardano_assets::AssetRole::of_bytes(name).standing() == cardano_assets::UnitStanding::Unit
+}
+
+/// The policy's user unit: the one most of its movements are in, HEX.
+///
+/// A policy can carry more than one user unit — a CIP-68 `(222)` fungible
+/// beside its `(333)` twin — and the summary names the one the archive is
+/// about. Dominance is counted rather than taken from the first row, because
+/// a metadata twin can be minted first and would then be the identity of a
+/// token nobody pictures. A tie is broken by the lower hex, so a re-fold on the
+/// same rows names the same unit and the picture does not flip.
+fn dominant_unit(movements: &[Movement]) -> Option<String> {
+    let mut counts: BTreeMap<&[u8], usize> = BTreeMap::new();
+    for m in movements {
+        *counts.entry(m.unit_name.as_slice()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| b.cmp(a)))
+        .map(|(name, _)| hex::encode(name))
+}
+
 /// One policy's archive, opened to its footers.
 pub struct PolicyArchive {
     pub manifest: Manifest,
     files: Vec<OpenFile>,
+}
+
+/// Which correction files a fold may read.
+///
+/// The stable and volatile halves answer different questions: a carry must see
+/// only what the next refresh cannot take away, while a document folded from
+/// the whole archive must see every resolution there is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CorrectionScope {
+    ImmutableOnly,
+    All,
 }
 
 impl PolicyArchive {
@@ -554,6 +636,16 @@ impl PolicyArchive {
     /// movements below `before_slot`, plus every correction to them. A
     /// caller with more rows of its own — the live view of a running pass —
     /// appends them and folds once.
+    ///
+    /// ⚠️ ONE row set, whichever mix of files holds it. A top-up walk into a
+    /// stretch the volatile tail also covers must write its own rows there, so
+    /// for a window the same transaction legitimately exists in BOTH an
+    /// immutable and a volatile file. Counting both double-counts its amounts,
+    /// which is the same fault [`PolicyArchive::reconcile`] documents for
+    /// supply — seen by every reader of this page rather than only by the
+    /// reconciler. Rows at or below the immutable ceiling therefore come from
+    /// the STABLE copy alone; the volatile file contributes only what is above
+    /// it.
     pub fn movements_page(
         &mut self,
         limit: u32,
@@ -561,6 +653,7 @@ impl PolicyArchive {
     ) -> Result<Vec<Movement>> {
         let limit = limit.clamp(1, 5_000) as usize;
         let before = before_slot.unwrap_or(u64::MAX);
+        let stable = immutable_to(&self.manifest);
 
         // Every movement group that could hold a row below `before`, newest
         // first by its top slot.
@@ -572,6 +665,9 @@ impl PolicyArchive {
             for g in 0..f.archive.num_groups() {
                 if let Some((lo, hi)) = f.archive.slot_range(g)
                     && lo < before
+                    // A volatile group wholly at or below the immutable ceiling
+                    // is a top-up duplicate of rows already in a stable file.
+                    && !(f.range == RangeKind::Volatile && hi <= stable)
                 {
                     candidates.push((i, g, hi));
                 }
@@ -585,20 +681,22 @@ impl PolicyArchive {
             if txs.len() >= limit {
                 break;
             }
+            let volatile = self.files[i].range == RangeKind::Volatile;
             let f = &mut self.files[i];
             f.fetch_group(g)?;
             for m in f.archive.read_group(&f.bytes, g)? {
-                if m.slot < before {
+                let duplicate = volatile && m.slot <= stable;
+                if m.slot < before && !duplicate {
                     txs.insert(m.tx_hash.clone());
                     rows.push(m);
                 }
             }
         }
-        self.attach_corrections(&mut rows, &txs)?;
+        self.attach_corrections(&mut rows, &txs, CorrectionScope::All)?;
         Ok(rows)
     }
 
-    /// The supply invariant over the WHOLE archive — see
+    /// The supply invariant over the IMMUTABLE archive — see
     /// [`policy_archive::supply`].
     ///
     /// Streams every group through the reconciler rather than collecting rows,
@@ -609,11 +707,114 @@ impl PolicyArchive {
     /// later pass records the source it finally resolved, so reconciling
     /// movements alone reports every one of those as still below the floor —
     /// a gap that shrinks to zero only if you read the files that closed it.
+    ///
+    /// ⚠️ IMMUTABLE FILES ONLY, and this is a correctness requirement rather
+    /// than a performance one. The volatile tail is a projection of the last
+    /// few hours that is REPLACED WHOLE on every refresh, and a top-up walk
+    /// that climbs into a stretch the tail also covers must write its own rows
+    /// anyway ("or the next refresh shrinks the tail out from under them" — see
+    /// `reverse.rs`). So for a window, the same transaction legitimately has
+    /// rows in both.
+    ///
+    /// A total across both then double-counts AMOUNTS while counting `net_mint`
+    /// once per `(tx, unit)` — which reads as `moved > minted`, i.e. a positive
+    /// gap, i.e. exactly the shape of a real fault. MEASURED 2026-09-09: this
+    /// produced RECONCILIATION FAILED on 7 of 23 live policies (`units=229
+    /// gap=1` and similar) whose archives were, on direct inspection, perfectly
+    /// balanced.
+    ///
+    /// 🔑 A check that cries wolf is worse than no check: it gets muted, and
+    /// then it is not there for the real one.
     pub fn reconcile(
         &mut self,
         diagnose: policy_archive::Diagnose,
     ) -> Result<policy_archive::Reconciler> {
+        self.reconcile_files(diagnose, false, true)
+            .map(|(reconciler, _)| reconciler)
+    }
+
+    /// The supply invariant over the CURRENT view, including the volatile tail
+    /// when it cannot double-count.
+    ///
+    /// [`Self::reconcile`] is the right answer for a landed pass: it grades the
+    /// immutable archive on its own. This is the right answer for a READER, and
+    /// the distinction is not cosmetic — a token launched after the last
+    /// Mithril snapshot has its ENTIRE history in the tail, so the immutable
+    /// reconcile reports `minted: 0` for it and the site shows a zero market
+    /// cap until the next weekly refresh.
+    ///
+    /// The tail is counted only when its floor is at or above every immutable
+    /// pass's ceiling: then the two stretches are disjoint and no transaction
+    /// can be in both. After a snapshot refresh a top-up writes immutable rows
+    /// into the stretch the tail still covers, the ranges overlap, and the tail
+    /// is skipped exactly as [`Self::reconcile`] always does.
+    ///
+    /// Only USER units are reconciled. CIP-67 reference twins and royalty
+    /// tokens are plumbing: they share the policy, they are not what the supply
+    /// is a count of, and a launchpad pool's state NFT under the token's own
+    /// policy would otherwise inflate a 1,000,000,000 mint to 1,000,000,002.
+    /// `segments` applies the same rule to the unit count, from the same crate.
+    pub fn reconcile_current(
+        &mut self,
+        diagnose: policy_archive::Diagnose,
+    ) -> Result<Reconciliation> {
+        let basis = match self.volatile_is_separate() {
+            true => SupplyBasis::Tail,
+            false => SupplyBasis::Snapshot,
+        };
+        let (reconciler, volatile_mint) =
+            self.reconcile_files(diagnose, basis == SupplyBasis::Tail, false)?;
+        Ok(Reconciliation {
+            reconciler,
+            // A tail with transfers only does not move supply. The ordinary
+            // case — a live token with recent trades but no new mint — stays
+            // `snapshot`, which is the default a reader should see.
+            basis: match volatile_mint {
+                true => SupplyBasis::Tail,
+                false => SupplyBasis::Snapshot,
+            },
+        })
+    }
+
+    /// Whether the volatile tail sits entirely ABOVE the immutable coverage.
+    ///
+    /// Conservative in the only direction that matters: a manifest with no pass
+    /// entries — a hand-built archive, or one written before coverage was
+    /// recorded — cannot prove separation, so the answer is `false`.
+    fn volatile_is_separate(&self) -> bool {
+        let Some(volatile_floor) = self
+            .manifest
+            .passes
+            .iter()
+            .filter(|p| p.kind == RangeKind::Volatile)
+            .map(|p| p.floor)
+            .min()
+        else {
+            return false;
+        };
+        let Some(max_immutable) = self
+            .manifest
+            .passes
+            .iter()
+            .filter(|p| p.kind == RangeKind::Immutable)
+            .map(|p| p.ceiling)
+            .max()
+        else {
+            // The tail is the only pass: every row is volatile, and there is
+            // no immutable row for it to double-count.
+            return true;
+        };
+        volatile_floor >= max_immutable
+    }
+
+    fn reconcile_files(
+        &mut self,
+        diagnose: policy_archive::Diagnose,
+        include_volatile: bool,
+        include_plumbing: bool,
+    ) -> Result<(policy_archive::Reconciler, bool)> {
         let mut r = policy_archive::Reconciler::new(diagnose);
+        let mut volatile_mint = false;
         for i in 0..self.files.len() {
             match self.files[i].kind {
                 FileKind::Movements | FileKind::Corrections => {}
@@ -621,37 +822,40 @@ impl PolicyArchive {
                 // exact mistake `kind_of` is ordered to prevent.
                 FileKind::Observations => continue,
             }
-            // ⚠️ IMMUTABLE FILES ONLY, and this is a correctness requirement
-            // rather than a performance one.
-            //
-            // The supply invariant is a claim about the IMMUTABLE archive. The
-            // volatile tail is a projection of the last few hours that is
-            // REPLACED WHOLE on every refresh, and a top-up walk that climbs
-            // into a stretch the tail also covers must write its own rows
-            // anyway ("or the next refresh shrinks the tail out from under
-            // them" — see `reverse.rs`). So for a window, the same transaction
-            // legitimately has rows in both.
-            //
-            // A total across both then double-counts AMOUNTS while counting
-            // `net_mint` once per `(tx, unit)` — which reads as `moved >
-            // minted`, i.e. a positive gap, i.e. exactly the shape of a real
-            // fault. MEASURED 2026-09-09: this produced RECONCILIATION FAILED
-            // on 7 of 23 live policies (`units=229 gap=1` and similar) whose
-            // archives were, on direct inspection, perfectly balanced.
-            //
-            // 🔑 A check that cries wolf is worse than no check: it gets muted,
-            // and then it is not there for the real one.
             match self.files[i].range {
                 RangeKind::Immutable => {}
+                RangeKind::Volatile if include_volatile => {}
                 RangeKind::Volatile => continue,
             }
-            for g in 0..self.files[i].archive.num_groups() {
-                let f = &mut self.files[i];
-                f.fetch_group(g)?;
-                r.observe_all(f.archive.read_group(&f.bytes, g)?.iter());
+            let volatile = self.files[i].range == RangeKind::Volatile;
+            // ⚠️ Fetch the file's groups ONCE and decode them through ONE
+            // reader. `read_group` builds a `SerializedFileReader` per call,
+            // which re-parses the parquet footer and EVERY row group's thrift
+            // metadata — per group, per pass. Measured as a real share of a
+            // `/live` on a 38 MB archive (2026-10-24), and this is the one fold
+            // that reads every group of both movements and corrections files.
+            let groups = self.files[i].archive.num_groups();
+            for g in 0..groups {
+                self.files[i].fetch_group(g)?;
+            }
+            let f = &self.files[i];
+            let reader = f.archive.reader(&f.bytes)?;
+            for g in 0..groups {
+                for m in Archive::read_group_with(&reader, g)?.iter() {
+                    if !(include_plumbing || is_user_unit(&m.unit_name)) {
+                        continue;
+                    }
+                    // \u26a0\ufe0f `net_mint`, not `amount`: a transfer in the tail
+                    // changes `moved` and not supply, so it must not mark the
+                    // supply provisional.
+                    if volatile && m.net_mint != 0 {
+                        volatile_mint = true;
+                    }
+                    r.observe(m);
+                }
             }
         }
-        Ok(r)
+        Ok((r, volatile_mint))
     }
 
     /// Every row of one transaction, unfolded — see [`Self::movements_page`].
@@ -674,10 +878,16 @@ impl PolicyArchive {
     }
 
     /// Pull in corrections for the transactions in hand.
+    ///
+    /// [`CorrectionScope::ImmutableOnly`] keeps the carried fold inside the
+    /// stable half: the volatile tail's corrections are written when the tail
+    /// resolves a source, and the tail is replaced whole — so a correction read
+    /// into a carry is a row the next refresh may not have.
     fn attach_corrections(
         &mut self,
         rows: &mut Vec<Movement>,
         txs: &HashSet<Vec<u8>>,
+        scope: CorrectionScope,
     ) -> Result<()> {
         let (Some(lo), Some(hi)) = (
             rows.iter().map(|m| m.slot).min(),
@@ -687,6 +897,13 @@ impl PolicyArchive {
         };
         for f in &mut self.files {
             if f.kind != FileKind::Corrections {
+                continue;
+            }
+            let wanted = match scope {
+                CorrectionScope::All => true,
+                CorrectionScope::ImmutableOnly => f.range == RangeKind::Immutable,
+            };
+            if !wanted {
                 continue;
             }
             for g in f.archive.groups_overlapping(lo, hi) {
@@ -1250,6 +1467,160 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
     }))
 }
 
+/// An open archive plus the WHOLE-HISTORY decode it can hand out once.
+///
+/// ⚠️ Why this exists at all. A holder balance and an all-time price series are
+/// both cumulative folds over every movement, so each opened the archive and
+/// decoded all of it separately — twice over 38 MB of movements parquet for a
+/// single `/live` on the widest archive here. The rows are the same rows; only
+/// the fold differs, so the decode is done once and lent to both.
+///
+/// The walk is [`PolicyArchive::movements_page`] driven to exhaustion, which is
+/// exactly what each fold did on its own, so nothing about the row set changes.
+pub struct History {
+    archive: PolicyArchive,
+    all: Option<Vec<Movement>>,
+    immutable: Option<Vec<Movement>>,
+}
+
+impl History {
+    /// `None` when no pass has ever run for this policy.
+    pub fn open(dir: &Path) -> Result<Option<Self>> {
+        Ok(PolicyArchive::open(dir)?.map(|archive| Self {
+            archive,
+            all: None,
+            immutable: None,
+        }))
+    }
+
+    /// Every movement in the archive, decoded ONCE.
+    ///
+    /// ⚠️ The WHOLE archive, not a window: a balance is cumulative over all
+    /// history, and a page of it is not a smaller version of the answer, it is
+    /// a different and wrong one — see [`build_holders`].
+    pub fn all_movements(&mut self) -> Result<&[Movement]> {
+        if self.all.is_none() {
+            let mut all: Vec<Movement> = Vec::new();
+            let mut before: Option<u64> = None;
+            const PAGE: u32 = 5_000;
+            loop {
+                let page = self.archive.movements_page(PAGE, before)?;
+                let Some(oldest) = page.iter().map(|m| m.slot).min() else {
+                    break;
+                };
+                all.extend(page);
+                let next = Some(oldest);
+                // A page that does not advance ends the walk — which also
+                // guards the pathological case of one slot holding more rows
+                // than a page.
+                if next == before {
+                    break;
+                }
+                before = next;
+            }
+            self.all = Some(all);
+        }
+        Ok(self.all.as_deref().unwrap_or(&[]))
+    }
+
+    /// Every movement in the archive's IMMUTABLE files, decoded ONCE.
+    ///
+    /// ⚠️ Immutable only, deliberately. A carried artifact is keyed on
+    /// [`immutable_to`], and the volatile tail is a projection that is
+    /// REPLACED WHOLE on every refresh: a carry built from it is a snapshot of
+    /// rows that may not exist on the next read, and continuing it above its
+    /// own boundary folds whatever is left a second time. MEASURED 2026-10-29
+    /// on $PERP: the cold fold was 6,000 units across 428 parties and the
+    /// carried one 6,156 across 429, from the same archive.
+    pub fn immutable_movements(&mut self) -> Result<&[Movement]> {
+        if self.immutable.is_none() {
+            let mut rows: Vec<Movement> = Vec::new();
+            let mut txs: HashSet<Vec<u8>> = HashSet::new();
+            for i in 0..self.archive.files.len() {
+                if self.archive.files[i].kind != FileKind::Movements
+                    || self.archive.files[i].range != RangeKind::Immutable
+                {
+                    continue;
+                }
+                let groups = self.archive.files[i].archive.num_groups();
+                for g in 0..groups {
+                    self.archive.files[i].fetch_group(g)?;
+                }
+                let f = &self.archive.files[i];
+                let reader = f.archive.reader(&f.bytes)?;
+                for g in 0..groups {
+                    for m in Archive::read_group_with(&reader, g)? {
+                        txs.insert(m.tx_hash.clone());
+                        rows.push(m);
+                    }
+                }
+            }
+            self.archive
+                .attach_corrections(&mut rows, &txs, CorrectionScope::ImmutableOnly)?;
+            self.immutable = Some(rows);
+        }
+        Ok(self.immutable.as_deref().unwrap_or(&[]))
+    }
+
+    /// Release the memoised IMMUTABLE decode.
+    ///
+    /// The publisher folds the immutable half for the carried artifacts and then
+    /// the whole archive for the summary; keeping both decodes resident doubles
+    /// the largest allocation here for no answer.
+    ///
+    /// ⚠️ The obvious next step — continue from the immutable decode with only
+    /// the tail above it, instead of decoding twice — was tried and did NOT make
+    /// a fold faster: the cost is allocation in the fold itself, not the read.
+    /// It also changes the row set, because a correction is attached per page
+    /// today and would be attached per archive.
+    pub fn forget_immutable(&mut self) {
+        self.immutable = None;
+    }
+
+    /// Every movement ABOVE `slot`, decoded — the tail half of a carried fold.
+    ///
+    /// ⚠️ Skips whole row groups by their recorded slot range, so the cost is
+    /// proportional to what is above `slot` rather than to the archive. That is
+    /// the entire point: the archive grows, and the tail does not.
+    ///
+    /// Corrections are attached exactly as [`PolicyArchive::movements_page`]
+    /// attaches them, because a correction is where a later pass records the
+    /// source it finally resolved — reading movements alone would report those
+    /// rows as unresolved again.
+    pub fn movements_above(&mut self, slot: u64) -> Result<Vec<Movement>> {
+        let mut candidates: Vec<(usize, usize, u64)> = Vec::new();
+        for (i, f) in self.archive.files.iter().enumerate() {
+            if f.kind != FileKind::Movements {
+                continue;
+            }
+            for g in 0..f.archive.num_groups() {
+                if let Some((_, hi)) = f.archive.slot_range(g)
+                    && hi > slot
+                {
+                    candidates.push((i, g, hi));
+                }
+            }
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
+
+        let mut rows: Vec<Movement> = Vec::new();
+        let mut txs: HashSet<Vec<u8>> = HashSet::new();
+        for (i, g, _) in candidates {
+            let f = &mut self.archive.files[i];
+            f.fetch_group(g)?;
+            for m in f.archive.read_group(&f.bytes, g)? {
+                if m.slot > slot {
+                    txs.insert(m.tx_hash.clone());
+                    rows.push(m);
+                }
+            }
+        }
+        self.archive
+            .attach_corrections(&mut rows, &txs, CorrectionScope::All)?;
+        Ok(rows)
+    }
+}
+
 /// Fold every movement in an archive into a holder table.
 ///
 /// ⚠️ Pages the WHOLE archive, newest-first, exactly as [`build_graph`] does —
@@ -1260,30 +1631,34 @@ pub fn build_graph(dir: &Path, policy: &str, by_stake: bool) -> Result<Option<Bu
 /// archive rather more. That is why the result is worth caching upstream and
 /// why the route below takes a `limit` on the OUTPUT rather than the input.
 pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>> {
-    let Some(mut a) = PolicyArchive::open(dir)? else {
+    let Some(mut h) = History::open(dir)? else {
         return Ok(None);
     };
-    let mut all: Vec<policy_archive::Movement> = Vec::new();
-    let mut before: Option<u64> = None;
-    const PAGE: u32 = 5_000;
-    loop {
-        let page = a.movements_page(PAGE, before)?;
-        let Some(oldest) = page.iter().map(|m| m.slot).min() else {
-            break;
-        };
-        all.extend(page);
-        let next = Some(oldest);
-        // A page that does not advance ends the walk — which also guards the
-        // pathological case of one slot holding more rows than a page.
-        if next == before {
-            break;
-        }
-        before = next;
-    }
-    Ok(Some(policy_archive::holders::fold(all.into_iter())))
+    Ok(Some(holders_from(&mut h)?))
 }
 
-/// Fold a policy's WHOLE archive into the price + volume series.
+/// [`build_holders`] against an ALREADY-OPEN [`History`].
+///
+/// Split out so a caller that also wants the series shares ONE decode of the
+/// history: `/live` asks for both, and each used to walk the archive alone.
+///
+/// ⚠️ USER units only. A CIP-68 reference twin, a CIP-27 royalty declaration
+/// and a CIP-68 fungible tranche share the policy and are held by scripts, but
+/// they are not members of the collection — the supply route already excludes
+/// them (`reconcile_current`), and a holder table that counted them would never
+/// reconcile against it. MEASURED 2026-10-29 on the Ada Handle policy: 46,167
+/// reference twins added 46,168 to `held` on top of the 266,985 the supply
+/// route reports.
+pub fn holders_from(h: &mut History) -> Result<policy_archive::holders::Fold> {
+    Ok(policy_archive::holders::fold(
+        h.all_movements()?
+            .iter()
+            .filter(|m| is_user_unit(&m.unit_name)),
+    ))
+}
+
+/// Fold a policy's WHOLE archive into the series, and keep what a later fold
+/// needs to continue it.
 ///
 /// ⚠️ The whole archive, not a window. An all-time high over the last 5,000
 /// movements is not an all-time high, and a 30-day change needs 30 days.
@@ -1291,36 +1666,601 @@ pub fn build_holders(dir: &Path) -> Result<Option<policy_archive::holders::Fold>
 /// Built from the STORY rather than from movements and observations
 /// separately, so the merge onto one slot spine — and the intra-slot ordering
 /// that values a trade at the PRE-swap price — has exactly one definition.
-pub fn build_series(dir: &Path) -> Result<Option<policy_archive::series::Series>> {
-    let Some(mut a) = PolicyArchive::open(dir)? else {
-        return Ok(None);
-    };
-    let Some(manifest) = load_manifest(dir)? else {
-        return Ok(None);
-    };
-    let observations = read_observations(dir, &manifest)?;
+///
+/// `settled_to` is the highest slot EITHER tier reached, because a tail fold
+/// resumes above it: taking the movements' tip when an observation sat higher
+/// would drop that observation from every read.
+pub fn carry_from(
+    h: &mut History,
+    observations: &[policy_archive::Observation],
+) -> Result<policy_archive::series::Carry> {
+    Ok(carry_of(h.all_movements()?, observations))
+}
 
-    let mut rows: Vec<policy_archive::FeedRow> = Vec::new();
-    let mut before: Option<u64> = None;
-    const PAGE: u32 = 5_000;
-    loop {
-        let page = a.feed_rows(PAGE, before)?;
-        let Some(oldest) = page.iter().map(|r| r.slot).min() else {
-            break;
-        };
-        rows.extend(page);
-        let next = Some(oldest);
-        if next == before {
-            break;
-        }
-        before = next;
-    }
+/// [`carry_from`] over the IMMUTABLE archive only, against the boundary a
+/// reader resumes from.
+///
+/// ⚠️ The artifacts exist to make the carried half STABLE. The volatile tail is
+/// replaced whole, so a carry that includes it is only true until the next
+/// refresh — see [`History::immutable_movements`]. `settled_to` is set to
+/// `immutable_to`, not to the last row, so the read side folds every row above
+/// the immutable coverage exactly once.
+pub fn immutable_carry_from(
+    h: &mut History,
+    observations: &[policy_archive::Observation],
+    immutable_to: u64,
+) -> Result<policy_archive::series::Carry> {
+    let movements = h.immutable_movements()?;
+    let observations: Vec<policy_archive::Observation> = observations
+        .iter()
+        .filter(|o| o.slot <= immutable_to)
+        .cloned()
+        .collect();
+    let mut carry = carry_of(movements, &observations);
+    carry.settled_to = immutable_to;
+    Ok(carry)
+}
 
-    let story = policy_archive::story::build(&rows, &observations, &venue_roles());
-    Ok(Some(policy_archive::series::fold(
+/// The fold itself: one story from the movements and observations, and the
+/// state a later tail continues from.
+fn carry_of(
+    movements: &[Movement],
+    observations: &[policy_archive::Observation],
+) -> policy_archive::series::Carry {
+    let settled_to = movements
+        .iter()
+        .map(|m| m.slot)
+        .chain(observations.iter().map(|o| o.slot))
+        .max()
+        .unwrap_or(0);
+    let roles = venue_roles_for(observations);
+    let story = policy_archive::story::build(
+        &policy_archive::feed::fold_rows_ref(movements),
+        observations,
+        &roles,
+    );
+    let (series, view) = policy_archive::series::fold_onto(
         &story,
         &policy_archive::view::Projection::default(),
-    )))
+        &policy_archive::series::Carry::default(),
+    );
+    policy_archive::series::Carry {
+        series,
+        view,
+        roles,
+        settled_to,
+    }
+}
+
+/// Continue a carried series through everything ABOVE its boundary.
+///
+/// This is the read that replaced folding the whole archive: the rows are the
+/// ones above `carry.settled_to`, which the archive keeps in its volatile
+/// files, and the group walk skips any row group whose recorded slot range
+/// ends below it. Cost is proportional to the tail, not to the history.
+///
+/// ⚠️ A GAP would be silent. If the archive's own coverage does not reach
+/// continuously from `settled_to` to the tail, a fold here would simply not
+/// see the rows in between, and the series would lose a stretch of trades
+/// without saying so. The caller checks that and folds the whole archive
+/// instead — see `policy_api::live_folds`.
+pub fn tail_series(
+    h: &mut History,
+    dir: &Path,
+    manifest: &Manifest,
+    carry: &policy_archive::series::Carry,
+) -> Result<policy_archive::series::Series> {
+    let observations = read_observations_above(dir, manifest, carry.settled_to)?;
+    let movements = h.movements_above(carry.settled_to)?;
+    // The tail's own observations can name a venue the settled half never saw
+    // (a launch that happened since). The carried table wins where they
+    // disagree — see `Roles::merge_missing`.
+    let mut roles = carry.roles.clone();
+    roles.merge_missing(&venue_roles_for(&observations));
+    let story = policy_archive::story::build(&fold_rows(movements), &observations, &roles);
+    Ok(policy_archive::series::fold_onto(
+        &story,
+        &policy_archive::view::Projection::default(),
+        carry,
+    )
+    .0)
+}
+
+/// Fold the WHOLE archive into the price + volume series and write it beside
+/// the graph, as [`policy_archive::SERIES`].
+///
+/// ⚠️ This exists to keep the fold OFF the request path. `/live` folded the
+/// whole archive on every cache miss — 6.6 s of a 10.3 s document on the widest
+/// archive here — and it misses every time the tail rebuild moves the archive,
+/// which is every 300 s. Writing it where the archive is already published
+/// moves that cost into the publisher, which does the same work for
+/// `graph.bin`.
+///
+/// Written through a RENAME: `/live` reads this while the scheduler writes it,
+/// and half a postcard stream decodes as corruption rather than as "not yet".
+///
+/// ⚠️ **`series.bin` and `holders.bin` carry the IMMUTABLE archive only**, and
+/// say so with `settled_to == immutable_to`. The volatile tail is replaced
+/// whole on every refresh, so a carry that includes it is a snapshot of rows
+/// the next refresh may not have; continuing it above its own boundary folds
+/// the replacement on top of the original. Readers fold the tail themselves,
+/// from the live files. This reads the archive twice — the immutable half, then
+/// the whole archive for the summary — and saves every reader the history.
+/// [`write_derived_at`] with no scale. The archive tests fold through here;
+/// the scheduler and the `summary` command state the registry's decimals
+/// instead, so this wrapper is not in the shipped binary.
+#[cfg(test)]
+pub fn write_derived(dir: &Path) -> Result<()> {
+    write_derived_at(dir, None)
+}
+
+/// The derived-artifact fold, stating what the token's display decimals are.
+///
+/// The scale is the registry's to know and this module's to carry: a summary
+/// that names it lets every reader draw a human number without owning a table
+/// of its own.
+pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
+    let Some(manifest) = load_manifest(dir)? else {
+        return Ok(());
+    };
+    let Some(mut history) = History::open(dir)? else {
+        return Ok(());
+    };
+    // ⚠️ The carried artifacts describe the IMMUTABLE archive, and say so with
+    // `settled_to == immutable_to`. The volatile tail below is a projection
+    // replaced WHOLE on every refresh, so folding it into a carry would make
+    // the artifact a snapshot of rows that may not exist when it is read — and
+    // a reader continuing it above its own boundary would fold the replacement
+    // on top of the original. Reads fold the tail themselves, from the live
+    // files. MEASURED 2026-10-29: $PERP's stale carry served 6,156 units held
+    // where the archive holds 6,000.
+    let key = immutable_to(&manifest);
+    let observations = read_observations_upto(dir, &manifest, key)?;
+    let series = immutable_carry_from(&mut history, &observations, key)?;
+    let held = immutable_holders_carry_from(&mut history)?;
+    store_series(dir, key, &series)?;
+    store_holders(dir, key, key, &held)?;
+    // The whole archive is folded next for the summary; the immutable decode
+    // is dead weight from here.
+    history.forget_immutable();
+    // THE SUMMARY is of the whole archive, tail included: it is a published
+    // document rather than a fold a reader resumes, so it takes the full
+    // series and every movement.
+    let observations = read_observations(dir, &manifest)?;
+    // ⚠️ ONE row set serves the series and the summary. `all_movements` is the
+    // definition of the archive's rows; continuing from the immutable decode
+    // instead is faster in theory and was measured to be neither faster nor
+    // the same rows — see `History::forget_immutable`.
+    let mut all = history.all_movements()?.to_vec();
+    let full = carry_of(&all, &observations);
+    let complete = manifest.completeness() == Completeness::Complete;
+    let policy = policy_of(dir);
+    // ⚠️ USER units only, the same rule as `holders_from` and the supply
+    // route. A CIP-68 reference twin or a CIP-27 royalty declaration shares
+    // the policy but is not a member of the collection; folding it here put
+    // plumbing units into `distribution.held` that `/holders` and `/supply`
+    // correctly exclude. MEASURED on $Aliens (2026-10-31): 2,928,030 units,
+    // the whole difference between the two folds. Filtered IN PLACE: this vec
+    // is the only copy of the archive's rows, and a second one is a second
+    // copy of the whole archive.
+    all.retain(|m| is_user_unit(&m.unit_name));
+    let movements = &all;
+    let (mut summary, checkpoints) =
+        policy_archive::summary::build(&policy_archive::summary::Inputs {
+            policy: &policy,
+            unit: dominant_unit(movements).as_deref(),
+            series: &full.series,
+            movements,
+            immutable_to: key,
+            complete,
+            decimals,
+            classify: &classify_holder,
+        });
+    // The tip decomposition is a re-read of the archive's own observations, so
+    // the summary and the holder table cannot disagree about what is locked or
+    // how much LP a provider owns.
+    let segmentation =
+        crate::segmentation::build(dir, summary.settled_to, &observations, movements);
+    summary.apply_segmentation(segmentation);
+    store_summary(dir, &summary, &checkpoints)?;
+    Ok(())
+}
+
+/// The policy a directory holds: its name, as [`policy_dir`] builds it.
+fn policy_of(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// What kind of holder an address is, by what the address registry can state
+/// about the ADDRESS: a burn sink, then the registry's script categories by
+/// payment credential and then by address. A script nobody named, with no
+/// stake part, is a contract. Everything else is a person.
+///
+/// WHAT, never WHO. A service run from an ordinary wallet (an exchange's hot
+/// wallet, a minting provider, a staking programme) is a claim about people,
+/// kept in the published stake-service table (`address_registry::published`)
+/// and applied by whoever DRAWS the summary, so a correction reaches every
+/// screen without rewriting a summary. This used to name such wallets from
+/// the compiled stake table and store them as venues, which put a person's
+/// wallet (listed once as Wayup) in summaries as a venue, and would have
+/// stored `$perpstaking` as one too.
+pub fn classify_holder(address: &str) -> (policy_archive::summary::Role, Option<String>) {
+    use address_registry::registry::{
+        AddressCategory as AC, RegistryNetwork, ScriptCategory as SC, lookup_address_match,
+        lookup_payment_credential,
+    };
+    use policy_archive::summary::Role;
+
+    let parts = policy_archive::trade::address_parts(address);
+    let by_credential = parts
+        .as_ref()
+        .and_then(|(pay, _)| lookup_payment_credential(pay))
+        .map(|e| (&e.category, e.category.to_string()));
+    let by_address = || {
+        lookup_address_match(address, RegistryNetwork::Mainnet)
+            .map(|(cat, _)| (cat, cat.to_string()))
+    };
+    if let Some((category, label)) = by_credential.or_else(by_address) {
+        let role = match category {
+            AC::Script(SC::Burn { .. }) => Some(Role::Burn),
+            AC::Script(SC::Vesting { .. }) => Some(Role::Lock),
+            AC::Script(SC::Staking { .. }) => Some(Role::Staking),
+            AC::Marketplace(_) | AC::Script(_) => Some(Role::Venue),
+            AC::Unknown => None,
+        };
+        if let Some(role) = role {
+            return (role, Some(label));
+        }
+    }
+    let stake = parts.as_ref().and_then(|(_, stake)| stake.as_deref());
+    let script = address_registry::registry::payment_credential_is_script(address);
+    match (script, stake) {
+        (true, None) => (Role::Contract, None),
+        _ => (Role::Person, None),
+    }
+}
+
+/// Write the summary and its checkpoint files, and remove checkpoint files it
+/// no longer names.
+///
+/// The summary through a RENAME, as the series is: a reader can open it while
+/// this writes. A checkpoint file is named by its content
+/// ([`policy_archive::summary::checkpoint_rel`]), so one already on disk is
+/// left alone, and the publisher uploads only the new ones.
+pub fn store_summary(
+    dir: &Path,
+    summary: &policy_archive::Summary,
+    checkpoints: &[policy_archive::Checkpoint],
+) -> Result<usize> {
+    let cp_dir = dir.join(policy_archive::CHECKPOINTS);
+    std::fs::create_dir_all(&cp_dir).with_context(|| format!("creating {}", cp_dir.display()))?;
+    for cp in checkpoints {
+        let raw = cp.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = dir.join(policy_archive::summary::checkpoint_rel(cp.slot, &raw));
+        if path.exists() {
+            continue;
+        }
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming into {}", path.display()))?;
+    }
+    let named = summary.files();
+    for entry in std::fs::read_dir(&cp_dir)? {
+        let entry = entry?;
+        let rel = format!(
+            "{}/{}",
+            policy_archive::CHECKPOINTS,
+            entry.file_name().to_string_lossy()
+        );
+        if !named.contains(&rel) {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("removing {}", entry.path().display()))?;
+        }
+    }
+
+    let raw = summary.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let path = dir.join(policy_archive::SUMMARY);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::SUMMARY));
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    tracing::info!(
+        policy = summary.policy,
+        bytes = raw.len(),
+        days = summary.daily.len(),
+        people = summary.distribution.people,
+        checkpoints = checkpoints.len(),
+        "policy: summary written"
+    );
+    Ok(raw.len())
+}
+
+/// The written summary, whatever archive version it describes. `Ok(None)` when
+/// there is none.
+pub fn read_summary(dir: &Path) -> Result<Option<policy_archive::Summary>> {
+    let path = dir.join(policy_archive::SUMMARY);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(Some(
+        policy_archive::Summary::decode(&bytes).map_err(|e| anyhow::anyhow!("{e}"))?,
+    ))
+}
+
+/// `token-ledger summary` — fold and write one policy's summary by hand, and
+/// say what is in it.
+#[derive(clap::Args, Debug)]
+pub struct SummaryArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+    /// Token registry, for the token's display decimals. A policy it does not
+    /// name is summarised RAW, which is the honest answer rather than `0`.
+    #[arg(long, default_value = "tokens.toml")]
+    pub tokens: PathBuf,
+    /// Also write the summary as JSON — the exact body `/summary` serves — to
+    /// this path, so a client can be reviewed against the real fold offline
+    /// instead of against a hand-built fixture.
+    #[arg(long)]
+    pub json: Option<PathBuf>,
+}
+
+pub fn summary(args: SummaryArgs) -> Result<()> {
+    let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let started = std::time::Instant::now();
+    let decimals = crate::registry::decimals(&args.tokens, &args.policy)?;
+    write_derived_at(&dir, decimals)?;
+    let Some(s) = read_summary(&dir)? else {
+        bail!("no archive at {}", dir.display());
+    };
+    let d = &s.distribution;
+    println!(
+        "{}: folded in {:.1}s, complete {}, {} days, {} hourly, {} unvalued trades, {}",
+        s.policy,
+        started.elapsed().as_secs_f64(),
+        s.complete,
+        s.daily.len(),
+        s.hourly.len(),
+        s.unvalued,
+        match s.decimals {
+            Some(dp) => format!("{dp} dp"),
+            None => "raw units (no decimals known)".to_string(),
+        }
+    );
+    println!(
+        "held {} burned {} circulating {}; {} parties, {} people, {} negative",
+        d.held, d.burned, d.circulating, d.parties, d.people, d.negative
+    );
+    println!(
+        "top 1 / 10 / 100: {:.2}% / {:.2}% / {:.2}%",
+        d.top1_ppm as f64 / 1e4,
+        d.top10_ppm as f64 / 1e4,
+        d.top100_ppm as f64 / 1e4
+    );
+    for b in &d.bands {
+        println!(
+            "  band ≥{:>7.3}%: {:>6} people, {}",
+            b.floor_ppm as f64 / 1e4,
+            b.people,
+            b.amount
+        );
+    }
+    for r in &d.roles {
+        println!("  {:?}: {} parties, {}", r.role, r.parties, r.amount);
+    }
+    report_segmentation(&s.segmentation);
+    let bytes: u64 = s
+        .checkpoints
+        .iter()
+        .filter_map(|c| std::fs::metadata(dir.join(&c.rel)).ok())
+        .map(|m| m.len())
+        .sum();
+    println!(
+        "{} checkpoints, {} bytes; summary {} bytes",
+        s.checkpoints.len(),
+        bytes,
+        std::fs::metadata(dir.join(policy_archive::SUMMARY)).map_or(0, |m| m.len())
+    );
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec(&s)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+/// What the tip decomposition found, in the same report the fold prints.
+///
+/// It is printed last because it is a read of the archive's observations, not
+/// of the movement rows the lines above fold: a reader comparing the two is
+/// comparing a summary at `settled_to` with a decomposition at `as_of`.
+fn report_segmentation(seg: &policy_archive::summary::Segmentation) {
+    use policy_archive::summary::LpStatus;
+
+    if seg.as_of == 0 && seg.vests.is_empty() && seg.lp.is_none() {
+        return;
+    }
+    let vested: u64 = seg.vests.iter().map(|v| v.amount).sum();
+    let locks: usize = seg.vests.iter().map(|v| v.locks.len()).sum();
+    println!(
+        "  segmentation as of slot {}: {} vesting owners, {} locks, {} units",
+        seg.as_of,
+        seg.vests.len(),
+        locks,
+        vested
+    );
+    for v in seg.vests.iter().take(5) {
+        println!("    vest {}: {} units", v.key, v.amount);
+    }
+    let Some(lp) = &seg.lp else {
+        println!("    lp: no pool observed");
+        return;
+    };
+    let attributed: u64 = lp.providers.iter().map(|p| p.amount).sum();
+    println!(
+        "    lp {}: reserve {}, {} LP tokens, {} providers, {} attributed, {} residual",
+        lp.pool_address,
+        lp.reserve,
+        lp.total_lp,
+        lp.providers.len(),
+        attributed,
+        lp.residual
+    );
+    match &lp.status {
+        LpStatus::Complete => println!("    lp status: complete"),
+        LpStatus::Partial { because } => println!("    lp status: partial — {because}"),
+        LpStatus::Unavailable { because } => println!("    lp status: unavailable — {because}"),
+    }
+    for p in lp.providers.iter().take(5) {
+        println!(
+            "      provider {}: {} lp -> {} units",
+            p.key, p.lp_tokens, p.amount
+        );
+    }
+}
+
+/// The balance state over the IMMUTABLE archive, for [`policy_archive::HOLDERS`].
+///
+/// ⚠️ See [`History::immutable_movements`]: the tail is replaced whole, so a
+/// carry that includes it cannot be resumed from a boundary. ⚠️ And see
+/// [`holders_from`]: plumbing units are not holdings.
+pub fn immutable_holders_carry_from(h: &mut History) -> Result<policy_archive::holders::Carry> {
+    Ok(policy_archive::holders::carry(
+        h.immutable_movements()?
+            .iter()
+            .filter(|m| is_user_unit(&m.unit_name)),
+    ))
+}
+
+/// Continue a carried balance table through every movement ABOVE `settled_to`.
+///
+/// Cheap by construction: [`History::movements_above`] skips whole row groups by
+/// their recorded slot range, so this reads the tail rather than the history.
+pub fn holders_tail(
+    h: &mut History,
+    carry: &policy_archive::holders::Carry,
+    settled_to: u64,
+) -> Result<policy_archive::holders::Fold> {
+    let rows = h.movements_above(settled_to)?;
+    Ok(policy_archive::holders::fold_onto(
+        // The same unit rule as the carried half — see [`holders_from`].
+        rows.iter().filter(|m| is_user_unit(&m.unit_name)),
+        carry,
+    ))
+}
+
+/// Write an ALREADY-FOLDED balance table as [`policy_archive::HOLDERS`].
+pub fn store_holders(
+    dir: &Path,
+    immutable_to: u64,
+    settled_to: u64,
+    carry: &policy_archive::holders::Carry,
+) -> Result<usize> {
+    let raw = policy_archive::HoldersFile {
+        format: policy_archive::HOLDERS_FORMAT,
+        immutable_to,
+        settled_to,
+        carry: carry.clone(),
+    }
+    .encode()
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let path = dir.join(policy_archive::HOLDERS);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::HOLDERS));
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(raw.len())
+}
+
+/// The written balance table, when it describes the archive version in hand.
+pub fn read_holders(dir: &Path, immutable_to: u64) -> Result<Option<policy_archive::HoldersFile>> {
+    let path = dir.join(policy_archive::HOLDERS);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let file = policy_archive::HoldersFile::decode(&bytes)?;
+    // ⚠️ The boundary must BE the immutable ceiling. A file folded through the
+    // volatile tail names a boundary inside a stretch that is replaced whole,
+    // so continuing it above that boundary counts the replacements on top of
+    // originals. Format 3 stopped writing those; this also refuses any
+    // that survive a format-compatible rewrite.
+    Ok((file.immutable_to == immutable_to && file.settled_to == immutable_to).then_some(file))
+}
+
+/// The archive's IMMUTABLE coverage ceiling — what invalidates a written
+/// series.
+///
+/// ⚠️ Not `updated_unix`: the tail rebuild moves that every 300 s without
+/// changing a single row at or below the carried boundary. What does
+/// invalidate the artefact is immutable coverage growing, because those rows
+/// are below every reader's start point and only a re-fold includes them.
+pub fn immutable_to(m: &Manifest) -> u64 {
+    m.passes
+        .iter()
+        .filter(|p| p.kind == RangeKind::Immutable)
+        .map(|p| p.ceiling)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Write an ALREADY-FOLDED series as [`policy_archive::SERIES`].
+///
+/// Split from [`write_series`] so a reader that has just paid for the fold can
+/// record it: `/live` builds the series on a cache miss anyway, and writing it
+/// there is what makes the artefact exist for a policy the publisher has not
+/// rewritten since the last restart.
+///
+/// Written through a RENAME: `/live` reads this while the scheduler writes it,
+/// and half a postcard stream decodes as corruption rather than as "not yet".
+pub fn store_series(
+    dir: &Path,
+    immutable_to: u64,
+    carry: &policy_archive::series::Carry,
+) -> Result<usize> {
+    let raw = policy_archive::SeriesFile {
+        format: policy_archive::SERIES_FORMAT,
+        immutable_to,
+        carry: carry.clone(),
+    }
+    .encode()
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let path = dir.join(policy_archive::SERIES);
+    let tmp = dir.join(format!("{}.tmp", policy_archive::SERIES));
+    std::fs::write(&tmp, &raw).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(raw.len())
+}
+
+/// The written series, when it describes the archive version in hand.
+///
+/// `Ok(None)` is the ordinary answer for an archive a publisher has not
+/// rewritten yet — the caller folds instead, which is what every read did
+/// before this existed. `Err` means the file is there and unusable, which is
+/// worth saying out loud rather than silently paying for the fold again.
+pub fn read_series(dir: &Path, immutable_to: u64) -> Result<Option<policy_archive::series::Carry>> {
+    let path = dir.join(policy_archive::SERIES);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let file = policy_archive::SeriesFile::decode(&bytes)?;
+    // See `read_holders`: a carry whose boundary is above the immutable
+    // ceiling was folded through a tail that is replaced whole.
+    Ok(
+        (file.immutable_to == immutable_to && file.carry.settled_to == immutable_to)
+            .then_some(file.carry),
+    )
 }
 
 /// Build the graph and write it beside the manifest, RAW. Returns its size,
@@ -1581,7 +2521,8 @@ fn report_supply(a: &mut PolicyArchive) -> Result<()> {
     let completeness = a.manifest.completeness();
     // Named offenders: `inspect` is the diagnostic surface, and a total with
     // no transaction behind it is not actionable.
-    let r = a.reconcile(Diagnose::PerTransaction)?;
+    let current = a.reconcile_current(Diagnose::PerTransaction)?;
+    let r = current.reconciler;
     let balances = r.balances();
     if balances.is_empty() {
         return Ok(());
@@ -1591,6 +2532,15 @@ fn report_supply(a: &mut PolicyArchive) -> Result<()> {
     println!(
         "supply      Σ net_mint={minted} Σ amounts={moved} over {} unit(s)",
         balances.len()
+    );
+    println!(
+        "  basis: {}",
+        match current.basis {
+            SupplyBasis::Snapshot => "certified Mithril history",
+            SupplyBasis::Tail => {
+                "includes the volatile chain tail — provisional until the next snapshot"
+            }
+        }
     );
     match r.verdict(completeness) {
         Verdict::Balanced => println!("  reconciled: the archive balances"),
@@ -1658,7 +2608,7 @@ fn unit_label(name: &[u8]) -> String {
     }
 }
 
-fn report_trades(a: &mut PolicyArchive) -> Result<()> {
+fn report_trades(a: &mut PolicyArchive, dir: &Path) -> Result<()> {
     use policy_archive::trade::{Event, Party};
     use std::collections::BTreeMap;
 
@@ -1668,7 +2618,11 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    let roles = venue_roles();
+    let observations = match load_manifest(dir)? {
+        Some(m) => read_observations(dir, &m)?,
+        None => Vec::new(),
+    };
+    let roles = venue_roles_for(&observations);
     let folded = policy_archive::trade::fold(&rows, &roles);
 
     let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1688,7 +2642,7 @@ fn report_trades(a: &mut PolicyArchive) -> Result<()> {
             Event::Placement { .. } => "placement",
             Event::Cancellation { .. } => "cancellation",
             Event::BatchedFill { .. } => "batched fill",
-            Event::Transfer => "transfer",
+            Event::Transfer | Event::Moved { .. } => "transfer",
         };
         *kinds.entry(k).or_default() += 1;
     }
@@ -1744,6 +2698,8 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
         let role = match site.role {
             SiteRole::Pool => Role::Pool,
             SiteRole::Order => Role::Order,
+            SiteRole::Book => Role::Book,
+            SiteRole::Escrow => Role::Escrow,
         };
         let cred = match site.key {
             SiteKey::Cred(c) => Some(hex(&c)),
@@ -1751,6 +2707,12 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
             // matches on the payment part, and deriving it here is what every
             // other consumer must do too.
             SiteKey::Address(a) => policy_archive::trade::address_parts(a).map(|(c, _)| c),
+            // A stake-keyed site (SaturnSwap's escrows) registers by stake,
+            // which also marks that stake as the venue's own, not a customer's.
+            SiteKey::Stake(s) => {
+                r.register_stake(hex(&s), role, site.venue);
+                continue;
+            }
         };
         let Some(cred) = cred else {
             continue;
@@ -1780,6 +2742,52 @@ pub fn venue_roles() -> policy_archive::trade::Roles {
         Role::Order,
         venue::SNEK_FUN,
     );
+    // LumpFun's ORDER contract IS shared across every launch — one address for
+    // every trader, no stake part — so a movement through it cannot name who
+    // placed the order. Its curve is per-launch and is registered by
+    // [`venue_roles_for`], from the observations that found it.
+    r.register(
+        hex(&mitos_launchpad_decode::LUMPFUN_ORDER_CRED),
+        Role::Order,
+        venue::LUMPFUN_V5,
+    );
+    r.keying.insert(
+        hex(&mitos_launchpad_decode::LUMPFUN_ORDER_CRED),
+        OrderKeying::Shared,
+    );
+    r
+}
+
+/// [`venue_roles`], plus the per-launch LumpFun curves these observations
+/// found.
+///
+/// ⚠️ **A per-launch credential cannot live in a static table.** LumpFun
+/// parameterises its curve validator with the token, so every pool has its own
+/// script hash; the only place a complete set exists is the observation tier,
+/// which recognised each curve by its state NFT. Registering them here is what
+/// turns a buy's `curve → wallet` movement into a [`policy_archive::trade::Event::Fill`]
+/// instead of a plain transfer — the same failure `venue::SITES` was created to
+/// end, in the one shape a registry cannot hold.
+///
+/// The curve takes `Role::Curve`, not `Role::Pool`: a fill against it is a
+/// trade, and it is not a DEX pool for any other purpose.
+pub fn venue_roles_for(
+    observations: &[policy_archive::Observation],
+) -> policy_archive::trade::Roles {
+    use mitos_dex_decode::venue;
+    use policy_archive::trade::Role;
+
+    let mut r = venue_roles();
+    for o in observations {
+        let Some(d) = &o.decoded else { continue };
+        if d.venue != venue::LUMPFUN_V5 {
+            continue;
+        }
+        let Some((cred, _)) = policy_archive::trade::address_parts(&o.address) else {
+            continue;
+        };
+        r.register(cred, Role::Curve, venue::LUMPFUN_V5);
+    }
     r
 }
 
@@ -1824,6 +2832,99 @@ pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive:
         })?;
         rows.extend(policy_archive::read_all(&bytes)?);
     }
+    redecode(&mut rows, m);
+    Ok(rows)
+}
+
+/// Every observation in the IMMUTABLE passes at or below `slot` — the carried
+/// half of a fold whose boundary is the immutable ceiling.
+///
+/// ⚠️ Immutable passes only. A volatile pass may overlap the immutable range,
+/// and its rows are replaced whole; including them here would put replaceable
+/// data behind a stable boundary, which is the defect this split exists to
+/// remove — see [`History::immutable_movements`].
+pub fn read_observations_upto(
+    dir: &Path,
+    m: &Manifest,
+    slot: u64,
+) -> Result<Vec<policy_archive::Observation>> {
+    let mut rows: Vec<policy_archive::Observation> = Vec::new();
+    for p in &m.passes {
+        if p.kind != RangeKind::Immutable || p.ceiling > slot {
+            continue;
+        }
+        let Some(rel) = p.observations_path() else {
+            continue;
+        };
+        let path = dir.join(&rel);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "pass {} names {rel} and it is not there — the archive is \
+                 incomplete and needs re-walking, not reading",
+                p.seq,
+            )
+        })?;
+        rows.extend(
+            policy_archive::read_all(&bytes)?
+                .into_iter()
+                .filter(|o| o.slot <= slot),
+        );
+    }
+    redecode(&mut rows, m);
+    Ok(rows)
+}
+
+/// What a decoder added since the walk claims of `rows`: every reader sees
+/// observations as THIS build decodes them (see `observer::redecode`).
+fn redecode(rows: &mut [policy_archive::Observation], m: &Manifest) {
+    if let Ok(policy) = hex::decode(&m.policy) {
+        crate::observer::redecode(rows, &policy);
+    }
+}
+
+/// Every observation ABOVE `slot` — the tail half of a carried fold.
+///
+/// Reads the VOLATILE passes, plus any pass whose ceiling is above `slot`.
+/// Everything at or below `slot` is already in the carried series, and an
+/// immutable pass normally cannot hold a row above it — `settled_to` is the
+/// maximum slot EITHER tier reached when the artefact was written.
+///
+/// ⚠️ The `ceiling > slot` arm is not decoration. A walk can land new
+/// immutable rows above an artefact written before it, and the artefact is
+/// only rewritten once that walk completes. Reading volatile passes alone in
+/// that window would return a series with no pool state for the new stretch —
+/// a price that silently stops moving rather than an error.
+///
+/// The slot filter stays on both arms as a second check, because being wrong
+/// here would double-count a trade rather than fail.
+pub fn read_observations_above(
+    dir: &Path,
+    m: &Manifest,
+    slot: u64,
+) -> Result<Vec<policy_archive::Observation>> {
+    let mut rows: Vec<policy_archive::Observation> = Vec::new();
+    for p in &m.passes {
+        if p.kind != RangeKind::Volatile && p.ceiling <= slot {
+            continue;
+        }
+        let Some(rel) = p.observations_path() else {
+            continue;
+        };
+        let path = dir.join(&rel);
+        let bytes = std::fs::read(&path).with_context(|| {
+            format!(
+                "pass {} names {rel} and it is not there — the archive is \
+                 incomplete and needs re-walking, not reading",
+                p.seq,
+            )
+        })?;
+        rows.extend(
+            policy_archive::read_all(&bytes)?
+                .into_iter()
+                .filter(|o| o.slot > slot),
+        );
+    }
+    redecode(&mut rows, m);
     Ok(rows)
 }
 
@@ -2085,7 +3186,7 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
 
     report_observations(&dir, m)?;
     report_supply(&mut a)?;
-    report_trades(&mut a)?;
+    report_trades(&mut a, &dir)?;
 
     let density = a.density(86_400);
     println!("density     {} daily buckets", density.len());
@@ -2163,16 +3264,78 @@ fn print_row(row: &FeedRow) {
 mod tests {
     use super::*;
 
-    fn mv(tx: u8, unit: &str, addr: &str, amount: i64, net_mint: i64) -> Movement {
+    /// A wallet address under `stake`, with an arbitrary key payment part.
+    fn wallet_under(stake: &str) -> String {
+        use pallas_addresses::{
+            Address, Network, ShelleyAddress, ShelleyDelegationPart, ShelleyPaymentPart,
+            StakePayload,
+        };
+        let Ok(Address::Stake(s)) = Address::from_bech32(stake) else {
+            panic!("{stake} is a stake address");
+        };
+        let StakePayload::Stake(hash) = s.payload() else {
+            panic!("{stake} is a key stake credential");
+        };
+        let payment = ShelleyPaymentPart::key_hash([7u8; 28].into());
+        Address::Shelley(ShelleyAddress::new(
+            Network::Mainnet,
+            payment,
+            ShelleyDelegationPart::key_hash(*hash),
+        ))
+        .to_bech32()
+        .expect("encodes")
+    }
+
+    /// WHO stays out of the summary. `$perpstaking` is named by the stake
+    /// table as PERP staking, and the wallet once listed as Wayup is a
+    /// person's; the summary stores both as what their addresses are, a
+    /// wallet, with no label, and a screen applies the published table.
+    #[test]
+    fn a_wallet_run_service_is_stored_as_what_its_address_is() {
+        for stake in [
+            "stake1uxw8pmwq7my926m9xuk5zpy83at8hyzqla4qxs843sfjznsgtwgxy",
+            "stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr",
+            "stake1uxwcw3rr36r8q9e5egy3e74cmazpjvx4t5ajsq50xhm568celda4g",
+        ] {
+            assert_eq!(
+                classify_holder(&wallet_under(stake)),
+                (policy_archive::summary::Role::Person, None),
+                "{stake}"
+            );
+        }
+    }
+
+    fn mv(tx: u8, unit: impl AsRef<[u8]>, addr: &str, amount: i64, net_mint: i64) -> Movement {
         Movement {
             slot: 100 + tx as u64,
             block_time: 1_700_000_000 + tx as u64,
             tx_hash: vec![tx; 32],
-            unit_name: unit.as_bytes().to_vec(),
+            unit_name: unit.as_ref().to_vec(),
             address: addr.to_string(),
             amount,
             net_mint,
+            tx_index: tx as u32,
         }
+    }
+
+    /// The unit named by a summary is the one the archive mostly moves, not
+    /// whichever row came first, and a tie is broken deterministically so a
+    /// re-fold cannot flip the picture.
+    #[test]
+    fn the_dominant_unit_is_the_one_most_movements_are_in() {
+        let rows = [
+            mv(1, "(333)twin", "addr1", 1, 0),
+            mv(2, "(222)token", "addr1", 1, 0),
+            mv(3, "(222)token", "addr2", 1, 0),
+        ];
+        assert_eq!(
+            dominant_unit(&rows).as_deref(),
+            Some("2832323229746f6b656e")
+        );
+        // Equal counts: the lower hex wins, whichever order the rows arrive in.
+        let tie = [mv(1, "b", "addr1", 1, 0), mv(2, "a", "addr1", 1, 0)];
+        assert_eq!(dominant_unit(&tie).as_deref(), Some("61"));
+        assert_eq!(dominant_unit(&[]), None);
     }
 
     fn stamp_for(policy: &str) -> policy_archive::Stamp {
@@ -2185,6 +3348,151 @@ mod tests {
             covered_to: 999,
             sealed_unix: 0,
         }
+    }
+
+    /// A pass entry for the separation test — only `kind`, `floor` and
+    /// `ceiling` are read by `volatile_is_separate`.
+    fn pass(seq: u32, kind: RangeKind, floor: u64, ceiling: u64) -> PassEntry {
+        PassEntry {
+            seq,
+            dir: PassEntry::dir_name(seq),
+            ceiling,
+            floor,
+            windows: Vec::new(),
+            kind,
+            rolled_up: false,
+            movements: None,
+            corrections: None,
+            observations: None,
+            segments: Vec::new(),
+            pending: 0,
+            found: 0,
+            written: 0,
+            backfilled: 0,
+            units: 0,
+            secs: 0.0,
+            written_unix: 0,
+        }
+    }
+
+    /// A tail TRANSFER is counted into `moved` but does not make the supply
+    /// figure provisional: it changes no mint. A live token with recent trades
+    /// and no new mint therefore stays on the ordinary `snapshot` answer.
+    #[test]
+    fn a_disjoint_volatile_transfer_is_counted_without_marking_supply() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+        let immutable = vec![mv(1, "A", "alice", 10, 10)];
+        let tail = vec![mv(2, "A", "alice", -10, 0), mv(2, "A", "bob", 10, 0)];
+        let mv_path = dir.path().join("movements.parquet");
+        let tail_path = dir.path().join("tail.parquet");
+        crate::segments::write_file(&mv_path, &stamp, immutable).unwrap();
+        crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+
+        let mut manifest = Manifest::new("aa");
+        manifest.passes.push(pass(0, RangeKind::Immutable, 0, 200));
+        manifest.passes.push(pass(1, RangeKind::Volatile, 200, 400));
+        let mut archive = PolicyArchive {
+            manifest,
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        let current = archive
+            .reconcile_current(policy_archive::Diagnose::Totals)
+            .unwrap();
+        assert_eq!(
+            current.basis,
+            SupplyBasis::Snapshot,
+            "a tail transfer does not move supply"
+        );
+        assert_eq!(current.reconciler.balances()[0].minted, 10);
+        assert_eq!(
+            current.reconciler.verdict(Completeness::Complete),
+            policy_archive::Verdict::Balanced,
+            "the tail continues the immutable history; it does not duplicate it"
+        );
+
+        // With no recorded coverage, separation cannot be proven, so the tail is
+        // left out. That is the conservative default, and the reason the
+        // existing overlap test keeps passing.
+        let mut blind = PolicyArchive {
+            manifest: Manifest::new("aa"),
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        assert_eq!(
+            blind
+                .reconcile_current(policy_archive::Diagnose::Totals)
+                .unwrap()
+                .basis,
+            SupplyBasis::Snapshot
+        );
+    }
+
+    /// A token launched after the last Mithril snapshot has its MINT in the
+    /// tail. The immutable reconcile reports zero for it — the reader's answer
+    /// must include the tail and say the supply is not yet certified.
+    #[test]
+    fn a_tail_mint_marks_the_supply_as_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+        let immutable = vec![mv(1, "A", "alice", 10, 10)];
+        let tail = vec![mv(2, "A", "bob", 5, 5)];
+        let mv_path = dir.path().join("movements.parquet");
+        let tail_path = dir.path().join("tail.parquet");
+        crate::segments::write_file(&mv_path, &stamp, immutable).unwrap();
+        crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+
+        let mut manifest = Manifest::new("aa");
+        manifest.passes.push(pass(0, RangeKind::Immutable, 0, 200));
+        manifest.passes.push(pass(1, RangeKind::Volatile, 200, 400));
+        let mut archive = PolicyArchive {
+            manifest,
+            files: vec![
+                OpenFile::open(&mv_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+            ],
+        };
+        let current = archive
+            .reconcile_current(policy_archive::Diagnose::Totals)
+            .unwrap();
+        assert_eq!(current.basis, SupplyBasis::Tail);
+        assert_eq!(current.reconciler.balances()[0].minted, 15);
+        assert_eq!(
+            current.reconciler.verdict(Completeness::Complete),
+            policy_archive::Verdict::Balanced
+        );
+    }
+
+    /// A launchpad pool's state NFT shares the token's policy. Before this
+    /// filter, $BUNNY's 1,000,000,000 mint reconciled as 1,000,000,002 — the
+    /// state NFT and one other CIP-67 unit were counted as supply.
+    #[test]
+    fn plumbing_units_are_not_part_of_supply() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_for("aa");
+        let mut nft = vec![0x00, 0x06, 0x43, 0xb0];
+        nft.extend_from_slice(b"POOL");
+        let rows = vec![
+            mv(1, "BUNNY", "alice", 1_000_000_000, 1_000_000_000),
+            mv(1, nft.as_slice(), "pool", 1, 1),
+        ];
+        let path = dir.path().join("movements.parquet");
+        crate::segments::write_file(&path, &stamp, rows).unwrap();
+        let mut archive = PolicyArchive {
+            manifest: Manifest::new("aa"),
+            files: vec![OpenFile::open(&path, FileKind::Movements, RangeKind::Immutable).unwrap()],
+        };
+        let current = archive
+            .reconcile_current(policy_archive::Diagnose::Totals)
+            .unwrap();
+        let balances = current.reconciler.balances();
+        assert_eq!(balances.len(), 1, "the state NFT is not a user unit");
+        assert_eq!(balances[0].minted, 1_000_000_000);
     }
 
     /// ⚠️ THE FALSE ALARM THIS GUARD EXISTS FOR.
@@ -2495,21 +3803,27 @@ mod tests {
         let hex = |b: &[u8; 28]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         for site in venue::SITES {
-            let cred = match site.key {
-                SiteKey::Cred(c) => hex(&c),
-                SiteKey::Address(a) => {
-                    policy_archive::trade::address_parts(a)
-                        .expect("a site address must parse")
-                        .0
-                }
+            let want = match site.role {
+                SiteRole::Pool => policy_archive::trade::Role::Pool,
+                SiteRole::Order => policy_archive::trade::Role::Order,
+                SiteRole::Book => policy_archive::trade::Role::Book,
+                SiteRole::Escrow => policy_archive::trade::Role::Escrow,
             };
-            let got = roles.role_of(&cred);
+            let (cred, got) = match site.key {
+                SiteKey::Cred(c) => (hex(&c), roles.role_of(&hex(&c))),
+                SiteKey::Address(a) => {
+                    let c = policy_archive::trade::address_parts(a)
+                        .expect("a site address must parse")
+                        .0;
+                    let got = roles.role_of(&c);
+                    (c, got)
+                }
+                // Known by stake, and only where the credential is not.
+                SiteKey::Stake(s) => (hex(&s), roles.role_at("", Some(&hex(&s)))),
+            };
             assert_eq!(
                 got,
-                Some(match site.role {
-                    SiteRole::Pool => policy_archive::trade::Role::Pool,
-                    SiteRole::Order => policy_archive::trade::Role::Order,
-                }),
+                Some(want),
                 "{} ({:?}) did not reach the fold",
                 site.venue,
                 site.role,
@@ -2569,5 +3883,362 @@ mod tests {
         );
         assert_eq!(roles.name_of(&order), Some(venue::SNEK_FUN));
         assert_ne!(order, curve, "the order is not the curve");
+    }
+
+    /// ⚠️ A LumpFun curve is parameterised per launch, so its credential cannot
+    /// be in the static table. If the observation tier's discoveries are not
+    /// folded into the roles, every buy of the token reads as a plain transfer
+    /// — the $DONUT failure, in the one shape a registry cannot hold.
+    #[test]
+    fn a_discovered_lumpfun_curve_turns_a_curve_payment_into_a_fill() {
+        use policy_archive::Observation;
+        use policy_archive::feed::{FeedRow, PartyMove, UnitMove};
+        use policy_archive::observation::Decoded;
+        use policy_archive::trade::{Event, Party, Role};
+
+        // The Dust Bunny pool and the wallet that received the sample buy's
+        // tokens (`1f7e8e57…`).
+        const POOL: &str = "addr1wyj2cxrm7pkfz0sx6j6lgueg8035yrs4ry9xupcvcxlrg6cywmqny";
+        const BUYER: &str = "addr1q99qpegypskhugq6nss8gjkwvjlj35wd54venfynreqxjgkt55dzuk6msq4qgq4g0dmz6tkvdvdfkmgd6uyd4urms2ksl0yc60";
+
+        let obs = Observation {
+            slot: 201_233_716,
+            block_time: 1_792_800_007,
+            tx_hash: vec![0x1f; 32],
+            address: POOL.into(),
+            lovelace: 1_562_000_000,
+            unit_name: b"BUNNY".to_vec(),
+            unit_amount: 733_043_488,
+            datum: None,
+            decoded: Some(Decoded {
+                venue: mitos_dex_decode::venue::LUMPFUN_V5.to_string(),
+                key_policy: hex::decode("a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293")
+                    .unwrap(),
+                key_name: mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec(),
+                key_basis: "datum".into(),
+                base_reserve: 858_381_090,
+                quote_policy: Some(Vec::new()),
+                quote_name: Some(Vec::new()),
+                quote_reserve: Some(1_555_000_000 + 5_000_000_130),
+                fee_bps: None,
+                total_lp: None,
+                reserve_source: "datum-plus-virtual".into(),
+                pricing: policy_archive::observation::pricing::CONSTANT_PRODUCT_VIRTUAL.into(),
+            }),
+        };
+
+        let roles = venue_roles_for(std::slice::from_ref(&obs));
+        let (curve, _) = policy_archive::trade::address_parts(POOL).unwrap();
+        assert_eq!(roles.role_of(&curve), Some(Role::Curve));
+        assert_eq!(
+            roles.name_of(&curve),
+            Some(mitos_dex_decode::venue::LUMPFUN_V5)
+        );
+
+        // A buy: the tokens leave the curve into the buyer's wallet.
+        let rows = vec![FeedRow {
+            tx_hash: vec![0x1f; 32],
+            tx_index: 0,
+            slot: 201_233_716,
+            block_time: 1_792_800_007,
+            units: vec![UnitMove {
+                name: b"BUNNY".to_vec(),
+                net_mint: 0,
+                parties: vec![
+                    PartyMove {
+                        address: POOL.into(),
+                        amount: -27_014_353,
+                    },
+                    PartyMove {
+                        address: BUYER.into(),
+                        amount: 27_014_353,
+                    },
+                ],
+            }],
+        }];
+        let folded = policy_archive::trade::fold(&rows, &roles);
+        assert_eq!(folded.len(), 1);
+        match &folded[0].event {
+            Event::Fill {
+                venue_cred,
+                party,
+                amount,
+                into_pool,
+            } => {
+                assert_eq!(venue_cred, &curve);
+                assert_eq!(party, &Party::Wallet(BUYER.into()));
+                assert_eq!(*amount, 27_014_353);
+                assert!(!into_pool, "a buy takes the asset OUT of the curve");
+            }
+            other => panic!("expected a Fill, got {other:?}"),
+        }
+
+        // And the static table alone cannot know it — the discovery is what did.
+        assert!(venue_roles().role_of(&curve).is_none());
+    }
+
+    /// A pass entry for the carried-artifact tests, with the fields those
+    /// tests exercise and honest zeros everywhere else.
+    fn archive_pass(
+        seq: u32,
+        kind: RangeKind,
+        floor: u64,
+        ceiling: u64,
+        movements: FileEntry,
+    ) -> PassEntry {
+        PassEntry {
+            seq,
+            dir: match kind {
+                RangeKind::Immutable => PassEntry::dir_name(seq),
+                RangeKind::Volatile => PassEntry::tip_dir_name(seq),
+            },
+            ceiling,
+            floor,
+            windows: Vec::new(),
+            kind,
+            rolled_up: false,
+            movements: Some(movements),
+            corrections: None,
+            observations: None,
+            segments: Vec::new(),
+            pending: 0,
+            found: 0,
+            written: 0,
+            backfilled: 0,
+            units: 0,
+            secs: 0.0,
+            written_unix: 0,
+        }
+    }
+
+    /// A complete archive with an immutable pass and a volatile tail, for the
+    /// carried-artifact tests. Returns the manifest and the tail's file path, so
+    /// a test can REPLACE the tail the way the tip does.
+    fn archive_with_a_tail(dir: &Path, tail: Vec<Movement>) -> (Manifest, PathBuf) {
+        let stamp = stamp_for("aa");
+        let mut manifest = Manifest::new("aa");
+        manifest.completeness = Completeness::Complete.as_wire().to_string();
+        manifest.walk_from = Some(0);
+        manifest.walk_to = Some(2_000);
+        manifest.updated_unix = 1;
+
+        let imm_dir = dir.join(PassEntry::dir_name(0));
+        std::fs::create_dir_all(&imm_dir).unwrap();
+        let movements = crate::segments::write_file(
+            &imm_dir.join(MOVEMENTS),
+            &stamp,
+            vec![
+                // A mint of 10 to alice, and 4 of it moved to bob.
+                row(10, 1, "addr_alice", 10, 10),
+                row(20, 2, "addr_alice", -4, 0),
+                row(20, 2, "addr_bob", 4, 0),
+                // A CIP-68 reference twin (label 100): real, held at a script,
+                // and NOT a holding — see `holders_from`.
+                row_unit(30, 6, b"\x00\x06\x43\xb0ref", "addr_script", 1, 1),
+            ],
+        )
+        .unwrap();
+        manifest
+            .passes
+            .push(archive_pass(0, RangeKind::Immutable, 0, 1_000, movements));
+
+        let tail_dir = dir.join(PassEntry::tip_dir_name(1));
+        std::fs::create_dir_all(&tail_dir).unwrap();
+        let tail_path = tail_dir.join(MOVEMENTS);
+        let written = crate::segments::write_file(&tail_path, &stamp, tail).unwrap();
+        manifest
+            .passes
+            .push(archive_pass(1, RangeKind::Volatile, 1_001, 2_000, written));
+        store_manifest(dir, &manifest).unwrap();
+        (manifest, tail_path)
+    }
+
+    fn row(slot: u64, tx: u8, addr: &str, amount: i64, net_mint: i64) -> Movement {
+        row_unit(slot, tx, b"Perp1", addr, amount, net_mint)
+    }
+
+    fn row_unit(
+        slot: u64,
+        tx: u8,
+        unit: impl AsRef<[u8]>,
+        addr: &str,
+        amount: i64,
+        net_mint: i64,
+    ) -> Movement {
+        Movement {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![tx; 32],
+            unit_name: unit.as_ref().to_vec(),
+            address: addr.to_string(),
+            amount,
+            net_mint,
+            tx_index: 0,
+        }
+    }
+
+    /// ⚠️ THE FLAP THIS PINS. A derived balance table used to be trusted
+    /// whenever the archive's IMMUTABLE ceiling matched, while its carry named
+    /// a boundary inside the VOLATILE tail. The tail is REPLACED WHOLE on
+    /// every refresh, so the next read continued a carry that already held the
+    /// replaced rows through whatever the replacement contained.
+    ///
+    /// MEASURED 2026-10-29 on $PERP (`e6ba9c0f…`): a cold `/holders` folded the
+    /// archive to 6,000 units across 428 parties; after `/live` had warmed the
+    /// shared cache from `holders.bin`, the same route reported 6,156 across
+    /// 429, from the same files.
+    #[test]
+    fn a_holder_artifact_never_carries_the_volatile_tail() {
+        use policy_archive::supply::Diagnose;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (mut manifest, tail_path) = archive_with_a_tail(
+            dir,
+            vec![
+                // A mint of 2 to carol, and 3 of bob's holding moved on.
+                row(1_500, 3, "addr_carol", 2, 2),
+                row(1_600, 4, "addr_bob", -3, 0),
+                row(1_600, 4, "addr_carol", 3, 0),
+            ],
+        );
+
+        // The publisher writes the carried artifacts.
+        write_derived(dir).unwrap();
+        let key = immutable_to(&manifest);
+        let artifact = read_holders(dir, key).unwrap().expect("a fresh artifact");
+        assert_eq!(
+            artifact.settled_to, key,
+            "a carry must end at the immutable ceiling, never inside the tail"
+        );
+
+        // The tail is REPLACED WHOLE: the same coverage, different rows.
+        crate::segments::write_file(
+            &tail_path,
+            &stamp_for("aa"),
+            vec![
+                row(1_500, 5, "addr_bob", -1, 0),
+                row(1_500, 5, "addr_dave", 1, 0),
+            ],
+        )
+        .unwrap();
+        manifest.updated_unix += 1;
+        store_manifest(dir, &manifest).unwrap();
+
+        let whole = build_holders(dir).unwrap().unwrap();
+        let mut h = History::open(dir).unwrap().unwrap();
+        let served = holders_tail(&mut h, &artifact.carry, artifact.settled_to).unwrap();
+
+        // ⚠️ THE INVARIANT: the carried table continued through the LIVE tail
+        // is the table a whole fold gives, so no party keeps units the chain
+        // has since moved, and none gains them without a departure.
+        assert_eq!(served, whole);
+        assert!(
+            whole.holders.iter().all(|h| h.key != "addr_script"),
+            "a CIP-68 reference twin is not a holding"
+        );
+
+        // And on a COMPLETE archive the table's total IS the net mint.
+        let mut a = PolicyArchive::open(dir).unwrap().unwrap();
+        let minted: i64 = a
+            .reconcile_current(Diagnose::Totals)
+            .unwrap()
+            .reconciler
+            .balances()
+            .iter()
+            .map(|b| b.minted)
+            .sum();
+        assert_eq!(whole.held, minted);
+    }
+
+    /// ⚠️ The artifact VERSION 1 wrote — its carry folded the whole archive and
+    /// named the tail's top slot as the boundary — is refused, not continued.
+    /// Without this the stale file already on a box outlives the fix, because
+    /// its `immutable_to` still matches until the next snapshot.
+    #[test]
+    fn a_holder_artifact_ending_inside_the_tail_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (manifest, _) = archive_with_a_tail(
+            dir,
+            vec![
+                row(1_500, 3, "addr_carol", 2, 2),
+                row(1_600, 4, "addr_bob", -3, 0),
+                row(1_600, 4, "addr_carol", 3, 0),
+            ],
+        );
+        let key = immutable_to(&manifest);
+
+        // Exactly what version 1 stored: the whole fold, and the tail's top
+        // slot as the boundary.
+        let mut h = History::open(dir).unwrap().unwrap();
+        let carry = policy_archive::holders::carry(h.all_movements().unwrap().iter());
+        store_holders(dir, key, 1_600, &carry).unwrap();
+
+        assert!(
+            read_holders(dir, key).unwrap().is_none(),
+            "a carry whose boundary is inside the replaced tail is not a \
+             resume point, and must be rebuilt rather than continued"
+        );
+    }
+
+    /// ⚠️ The same fault one layer down. A top-up walk into a stretch the
+    /// volatile tail also covers writes its own rows there, so for a window a
+    /// transaction exists in an immutable AND a volatile file. Folding both
+    /// counts an arrival twice with no departure — the shape that reads as a
+    /// holder conjuring units — so the stable copy is the only one counted at or
+    /// below the immutable ceiling.
+    #[test]
+    fn a_volatile_copy_of_immutable_rows_is_not_folded_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let stamp = stamp_for("aa");
+        let imm_path = dir.join("movements.parquet");
+        let tail_path = dir.join("tail.parquet");
+        let imm =
+            crate::segments::write_file(&imm_path, &stamp, vec![row(10, 1, "addr_alice", 10, 10)])
+                .unwrap();
+        let tail = crate::segments::write_file(
+            &tail_path,
+            &stamp,
+            vec![
+                // The SAME mint, as the tail's copy, plus a transfer only the
+                // tail holds.
+                row(10, 1, "addr_alice", 10, 10),
+                row(1_500, 2, "addr_alice", -4, 0),
+                row(1_500, 2, "addr_bob", 4, 0),
+            ],
+        )
+        .unwrap();
+        let mut manifest = Manifest::new("aa");
+        manifest
+            .passes
+            .push(archive_pass(0, RangeKind::Immutable, 0, 1_000, imm));
+        // ⚠️ The tail's floor is BELOW the immutable ceiling — the overlap.
+        manifest
+            .passes
+            .push(archive_pass(1, RangeKind::Volatile, 900, 2_000, tail));
+
+        let mut h = History {
+            archive: PolicyArchive {
+                manifest,
+                files: vec![
+                    OpenFile::open(&imm_path, FileKind::Movements, RangeKind::Immutable).unwrap(),
+                    OpenFile::open(&tail_path, FileKind::Movements, RangeKind::Volatile).unwrap(),
+                ],
+            },
+            all: None,
+            immutable: None,
+        };
+        let fold = holders_from(&mut h).unwrap();
+        assert_eq!(fold.held, 10, "the duplicated mint is counted once");
+        assert_eq!(
+            fold.holders
+                .iter()
+                .find(|x| x.key == "addr_alice")
+                .map(|x| x.amount),
+            Some(6),
+            "10 minted, 4 sent on"
+        );
     }
 }

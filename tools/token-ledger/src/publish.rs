@@ -31,7 +31,7 @@
 //! to `published.json` beside the manifest and logged, so "landed" and
 //! "published" are two facts, not one.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,14 @@ pub struct Record {
     /// What it weighed on the wire — gzipped when that measurably paid.
     #[serde(default)]
     pub graph_bytes: u64,
+    /// The SUMMARY and its checkpoint files, when one has been written.
+    #[serde(default = "Outcome::not_attempted")]
+    pub summary: Outcome,
+    #[serde(default)]
+    pub summary_bytes: u64,
+    /// Checkpoint files uploaded this time; the rest were already in R2.
+    #[serde(default)]
+    pub checkpoints_uploaded: usize,
     #[serde(default)]
     pub kv: Vec<KvOutcome>,
     pub prune: Outcome,
@@ -92,7 +100,7 @@ impl Record {
 
     pub fn summary(&self) -> String {
         format!(
-            "{} ({} up, {} same, {} B); {}; {}; {} ({} B); {} ({} pruned); {:.1}s",
+            "{} ({} up, {} same, {} B); {}; {}; {} ({} B); {} ({} B, {} checkpoints up); {} ({} pruned); {:.1}s",
             self.files.describe("files"),
             self.uploaded,
             self.skipped,
@@ -101,6 +109,9 @@ impl Record {
             self.bundle.describe("bundle"),
             self.graph.describe("graph"),
             self.graph_bytes,
+            self.summary.describe("summary"),
+            self.summary_bytes,
+            self.checkpoints_uploaded,
             self.prune.describe("prune"),
             self.pruned,
             self.secs
@@ -152,12 +163,16 @@ impl Publisher {
         let started = Instant::now();
         let manifest = crate::archive::load_manifest(dir)?
             .with_context(|| format!("no archive at {}", dir.display()))?;
-        // The bundle is written at landing; an archive from before it
-        // existed gets one here, so a publish always carries it.
+        // THE BUNDLE IS BUILT HERE, from the manifest this publish is about to
+        // flip. It is DERIVED — the manifest plus every footer the Worker needs
+        // to open the archive in one read — so it is built once, at the rate a
+        // publish happens, rather than on every landing and every tail write.
+        //
+        // ⚠️ Unconditionally, not "only when absent". A stale bundle is worse
+        // than none: the Worker opens the archive from it and would read a
+        // manifest the R2 flip has already replaced.
         let bundle_path = dir.join(policy_archive::BUNDLE);
-        if !bundle_path.exists() {
-            crate::archive::store_bundle(dir, &manifest)?;
-        }
+        crate::archive::store_bundle(dir, &manifest)?;
 
         let mut record = Record {
             policy: policy.to_string(),
@@ -172,6 +187,9 @@ impl Publisher {
             bundle: Outcome::NotAttempted,
             graph: Outcome::NotAttempted,
             graph_bytes: 0,
+            summary: Outcome::NotAttempted,
+            summary_bytes: 0,
+            checkpoints_uploaded: 0,
             kv: Vec::new(),
             prune: Outcome::NotAttempted,
             pruned: 0,
@@ -244,6 +262,28 @@ impl Publisher {
             Err(e) => record.graph = Outcome::failed(e),
         }
 
+        // 3b. The SUMMARY and its checkpoints, likewise derived and after the
+        // flip. Checkpoints FIRST, so a summary in R2 never names a file that
+        // is not there yet. Read once here so the prune below keeps exactly
+        // the files this summary names.
+        let summary = match crate::archive::read_summary(dir) {
+            Ok(s) => s,
+            Err(e) => {
+                record.summary = Outcome::failed(e);
+                None
+            }
+        };
+        if let Some(s) = &summary {
+            match self.put_summary(policy, dir, s).await {
+                Ok((bytes, uploaded)) => {
+                    record.summary = Outcome::Done;
+                    record.summary_bytes = bytes;
+                    record.checkpoints_uploaded = uploaded;
+                }
+                Err(e) => record.summary = Outcome::failed(e),
+            }
+        }
+
         // 4. The bundle, to every namespace.
         match self.cf.kv() {
             None => record.bundle = Outcome::NotConfigured,
@@ -295,7 +335,17 @@ impl Publisher {
             .chain([
                 Self::key(policy, policy_archive::GRAPH),
                 Self::key(policy, &format!("{}.gz", policy_archive::GRAPH)),
+                Self::key(policy, policy_archive::SUMMARY),
             ])
+            // Every checkpoint the summary names; the ones it no longer names
+            // (superseded by a correction, or off the grid after it doubled)
+            // are exactly what this prune is for.
+            .chain(
+                summary
+                    .iter()
+                    .flat_map(|s| s.files())
+                    .map(|rel| Self::key(policy, &rel)),
+            )
             .collect();
         match self.prune(policy, &keep).await {
             Ok(n) => {
@@ -360,28 +410,84 @@ impl Publisher {
         Ok(Some(n))
     }
 
+    /// The summary, and every checkpoint file it names that R2 does not hold.
+    /// Returns the summary's size and how many checkpoints went up.
+    ///
+    /// Both RAW: the flow explorer's Worker decodes them itself, and an R2
+    /// binding hands back the stored bytes whatever their `Content-Encoding`,
+    /// so a gzipped body would need an inflater in the Worker's bundle.
+    ///
+    /// A checkpoint is named by its content, so presence is identity and it
+    /// takes the files' immutable cache posture. The summary changes with
+    /// every walk and takes the graph's.
+    async fn put_summary(
+        &self,
+        policy: &str,
+        dir: &Path,
+        summary: &policy_archive::Summary,
+    ) -> Result<(u64, usize)> {
+        let prefix = ObjPath::from(format!("{PREFIX}/{policy}/{}", policy_archive::CHECKPOINTS));
+        let landed = self.cf.sizes_under(&prefix).await?;
+        let mut uploaded = 0usize;
+        for rel in summary.checkpoints.iter().map(|c| &c.rel) {
+            let key = Self::key(policy, rel);
+            if landed.contains_key(&key) {
+                continue;
+            }
+            let path = dir.join(rel);
+            let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            self.cf.put(&key, body, immutable_attributes()).await?;
+            uploaded += 1;
+        }
+
+        let path = dir.join(policy_archive::SUMMARY);
+        let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let n = body.len() as u64;
+        let mut attrs = Attributes::new();
+        attrs.insert(
+            object_store::Attribute::CacheControl,
+            "public, max-age=300".into(),
+        );
+        attrs.insert(
+            object_store::Attribute::ContentType,
+            "application/octet-stream".into(),
+        );
+        self.cf
+            .put(&Self::key(policy, policy_archive::SUMMARY), body, attrs)
+            .await?;
+        Ok((n, uploaded))
+    }
+
     async fn upload_files(&self, policy: &str, wanted: &[(String, PathBuf)]) -> Result<Uploaded> {
+        // ONE listing answers "what does R2 already hold?" for every file the
+        // manifest names. The per-file HEAD this replaced cost a round trip per
+        // file, so a long-lived policy's publish grew with its own history:
+        // 114 segment files meant 114 HEADs before a single byte moved.
+        let prefix = ObjPath::from(format!("{PREFIX}/{policy}"));
+        let landed = self.cf.sizes_under(&prefix).await?;
+
+        let mut files: Vec<(ObjPath, u64)> = Vec::with_capacity(wanted.len());
+        for (rel, path) in wanted {
+            let len = std::fs::metadata(path)
+                .with_context(|| format!("stat {}", path.display()))?
+                .len();
+            files.push((Self::key(policy, rel), len));
+        }
+
         let mut out = Uploaded {
             uploaded: 0,
             skipped: 0,
             bytes: 0,
         };
-        for (rel, path) in wanted {
-            let len = std::fs::metadata(path)
-                .with_context(|| format!("stat {}", path.display()))?
-                .len();
-            let key = Self::key(policy, rel);
-            // Immutable objects never reuse a name, so size is identity
-            // enough to skip the upload.
-            if self.cf.size_of(&key).await? == Some(len) {
-                out.skipped += 1;
-                continue;
-            }
+        for n in to_upload(&files, &landed) {
+            let (key, len) = &files[n];
+            let (_, path) = &wanted[n];
             let body = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-            self.cf.put(&key, body, immutable_attributes()).await?;
+            self.cf.put(key, body, immutable_attributes()).await?;
             out.uploaded += 1;
             out.bytes += len;
         }
+        out.skipped = files.len() - out.uploaded;
         Ok(out)
     }
 
@@ -392,6 +498,21 @@ impl Publisher {
     }
 }
 
+/// Which of `files` — `(key, size)` — R2 does not already hold, by index.
+///
+/// Size is identity for an IMMUTABLE object: the key names the bytes, so the
+/// same key at the same size is the same file. A key the listing does not
+/// mention is uploaded, and that is the only safe direction — a stale or
+/// partial listing costs an upload, never a skipped file.
+fn to_upload(files: &[(ObjPath, u64)], landed: &BTreeMap<ObjPath, u64>) -> Vec<usize> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, (key, len))| landed.get(key) != Some(len))
+        .map(|(n, _)| n)
+        .collect()
+}
+
 #[derive(Serialize)]
 struct BundleMetadata {
     updated_unix: u64,
@@ -400,8 +521,8 @@ struct BundleMetadata {
 // ── CLI ──────────────────────────────────────────────────────────────────
 
 /// `token-ledger publish` — publish one policy's archive by hand, from the
-/// same environment the service uses. What the landing path does after
-/// every pass; this is for archives it has not touched, and for looking.
+/// same environment the `sync` service uses. For archives it has not touched,
+/// and for looking.
 #[derive(clap::Args, Debug)]
 pub struct PublishArgs {
     /// Archive root (`<root>/<policy_hex>/manifest.json`).
@@ -464,6 +585,9 @@ mod tests {
             // No graph generated for this policy — a step that never ran.
             graph: Outcome::NotAttempted,
             graph_bytes: 0,
+            summary: Outcome::NotAttempted,
+            summary_bytes: 0,
+            checkpoints_uploaded: 0,
             kv: Vec::new(),
             prune: Outcome::Done,
             pruned: 0,
@@ -476,5 +600,27 @@ mod tests {
         assert!(r.summary().contains("prune skipped"));
         let back: Record = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back.manifest, r.manifest);
+    }
+
+    /// The listing is the whole answer to "what is already in R2?", so the
+    /// failure that matters is a key ABSENT from it being read as "skip" —
+    /// that would leave a manifest naming an object nothing ever uploaded.
+    #[test]
+    fn the_upload_set_comes_from_one_listing_and_never_skips_what_is_absent() {
+        let k = |rel: &str| ObjPath::from(format!("policy-archive/ab/{rel}"));
+        let landed = BTreeMap::from([
+            (k("observations-0000.parquet"), 8_625),
+            (k("observations-0001.parquet"), 1),
+        ]);
+        let files = vec![
+            (k("observations-0000.parquet"), 8_625),
+            (k("observations-0001.parquet"), 9_192),
+            (k("observations-0002.parquet"), 1),
+        ];
+        assert_eq!(
+            to_upload(&files, &landed),
+            vec![1, 2],
+            "same key and size is landed; a different size and a missing key both upload"
+        );
     }
 }

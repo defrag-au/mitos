@@ -1,0 +1,29 @@
+abi_version = 2
+
+# `holders-from-fold` is the fold plane's reader: it serves one published
+# holder-table artifact as a `collection-holders` snapshot.
+#
+# Interest is empty on purpose. The artifact names its subject (extension
+# tag 1 of `artifact.meta`), so there is nothing to subscribe to — a policy
+# in this table could only disagree with the rows the artifact already
+# contains. The module emits from `rebootstrap`, which the host drives at
+# startup with `start(module, rebootstrap = true)` and again on recapture.
+#
+# See `docs/design/FOLD_PLANE.md` §7 and §8.
+[interest]
+addresses = []
+policies = []
+
+[deps]
+mitos-community-events = { path = "../../crates/mitos-community-events" }
+# The envelope. Dependency-free, `#![forbid(unsafe_code)]`, and it builds for
+# `wasm32-unknown-unknown` — the schema, stamp and extensions are the reader's
+# contract, not a host-side detail.
+mitos-fold = { path = "../../crates/mitos-fold" }
+# `default-features = false` drops the two fold *shapes* (the walk aggregate and
+# the book view). Their dependencies are the chain stack and `memmap2`, and a
+# module needs neither: it reads bytes the host already serves.
+mitos-holder-table = { path = "../../crates/mitos-holder-table", default-features = false }
+# `is_script_address` — the payment-credential test the wire `HolderRef`
+# branches on. The table classifies cohorts; this asks about the address.
+mitos-cohort = { path = "../../crates/mitos-cohort" }

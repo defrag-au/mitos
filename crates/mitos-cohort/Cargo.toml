@@ -29,3 +29,9 @@ mitos-launchpad-decode = { path = "../mitos-launchpad-decode" }
 # (pools, lock credentials) stay parameters because they are per-walk; a
 # provably-unspendable script is not.
 address-registry = { workspace = true }
+
+[dev-dependencies]
+# For `tests/registry_drift.rs` only: the DEX venue registry, checked against
+# `address-registry` beside this crate's own launchpad and lock constants.
+mitos-dex-decode = { path = "../mitos-dex-decode" }
+hex = { workspace = true }

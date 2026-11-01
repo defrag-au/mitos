@@ -1,0 +1,9 @@
+# The mitos host binary is cross-built on the host (aarch64-unknown-linux-musl)
+# and copied here by up.sh; it is gitignored. Alpine gives us ca-certificates
+# (the artifact fetch is HTTPS) and curl (the healthcheck).
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates curl
+
+COPY mitos /usr/local/bin/mitos
+RUN chmod 0755 /usr/local/bin/mitos

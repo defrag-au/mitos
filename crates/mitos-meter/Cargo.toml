@@ -1,0 +1,29 @@
+# mitos-meter — structured timing for the operations mitos does repeatedly.
+#
+# Why a crate rather than `println!`: a hand-rolled timing line has four problems
+# that compound as the number of measured operations grows.
+#
+#   1. **Units drift.** One report says `1458 ns`, another `4.8 s`, a third
+#      `63643 ns/ref`. Nothing says which is per-item and which is a total.
+#   2. **No percentiles.** A mean hides the tail, and the tail is what a serving
+#      path is judged on.
+#   3. **The numbers are not machine-readable**, so comparing two runs — before
+#      and after a change, or this box against that one — is a manual diff.
+#   4. **Operation names are ad hoc**, so the same measurement acquires three names
+#      across three tools and stops being comparable at all.
+#
+# The vocabulary is therefore a closed enum in the crate: adding an operation is a
+# deliberate act, and a typo is a compile error rather than a row nobody can join.
+#
+# Zero dependencies on purpose — std only, and the JSONL is written by hand for a
+# fixed schema. Every tool in the workspace can link this without a thought, which
+# is the property that decides whether it gets used.
+[package]
+name = "mitos-meter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured timing for mitos operations: a closed vocabulary of operation names, bounded-memory percentiles, and a comparable report"
+
+[lib]
+path = "src/lib.rs"

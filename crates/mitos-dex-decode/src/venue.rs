@@ -47,12 +47,36 @@ pub const SUNDAE_V1: &str = "sundae-v1";
 pub const SUNDAE_V3: &str = "sundae-v3";
 pub const WINGRIDERS_V1: &str = "wingriders-v1";
 pub const WINGRIDERS_V2: &str = "wingriders-v2";
+/// VyFi. Recognised by credential; its pool reserves are not decoded yet.
+pub const VYFI: &str = "vyfi";
+/// SaturnSwap: an order book with escrows. See [`crate::saturnswap`].
+pub const SATURNSWAP: &str = "saturnswap";
+/// Axo: an order book whose orders trade against each other. See
+/// [`crate::axo`].
+pub const AXO: &str = "axo";
+/// DexHunter's own order contracts (limit, DCA, stop-loss). See
+/// [`crate::dexhunter`].
+pub const DEXHUNTER: &str = "dexhunter";
 /// snek.fun's bonding curve. ⚠️ Not a constant-product pool — its reserves are
 /// real and its rate is NOT `quote / base`.
 pub const SNEK_FUN: &str = "snek.fun";
+/// LumpFun's bonding curve, cohort `v5` (`"ada-order"`).
+///
+/// ⚠️ **A DIFFERENT PROTOCOL FROM LUMPPAD**, which shares the lumpfun.com
+/// domain family. The version is part of the identity because LumpFun's
+/// earlier cohorts publish different reserves: v1/v2 drain to a Minswap pool
+/// at graduation and v3 trades on a real-reserve curve, while v5 prices over
+/// **effective** reserves (a virtual offset on both sides) and graduates in
+/// place. One slug for all of them would present numbers computed by three
+/// different rules as one venue.
+///
+/// A v5 curve IS constant-product on its effective sides, so unlike
+/// [`SNEK_FUN`] it is priceable — see `mitos-launchpad-decode`'s
+/// `LumpFunCurve`.
+pub const LUMPFUN_V5: &str = "lumpfun-v5";
 
 /// Every venue this workspace can name.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 14] = [
     SPLASH,
     CSWAP,
     MINSWAP_V1,
@@ -61,7 +85,12 @@ pub const ALL: [&str; 9] = [
     SUNDAE_V3,
     WINGRIDERS_V1,
     WINGRIDERS_V2,
+    VYFI,
+    SATURNSWAP,
+    AXO,
+    DEXHUNTER,
     SNEK_FUN,
+    LUMPFUN_V5,
 ];
 
 /// What a contract DOES, as far as a trade fold is concerned.
@@ -76,10 +105,24 @@ pub enum SiteRole {
     Pool,
     /// Holds an order awaiting a batcher. May or may not name who placed it.
     Order,
+    /// Holds an order that is traded against IN PLACE, by a taker's wallet
+    /// or by another order, rather than spent into a pool: Axo's strategies,
+    /// SaturnSwap's exchange, DexHunter's DCA. Its owner is its address's
+    /// stake, when it has one that is not the venue's own.
+    Book,
+    /// Holds a filled order's proceeds until its owner collects them:
+    /// SaturnSwap's escrows. A wallet paying one is a taker's sell; one
+    /// paying out is a collection, not a trade.
+    Escrow,
 }
 
 impl SiteRole {
-    pub const ALL: [SiteRole; 2] = [SiteRole::Pool, SiteRole::Order];
+    pub const ALL: [SiteRole; 4] = [
+        SiteRole::Pool,
+        SiteRole::Order,
+        SiteRole::Book,
+        SiteRole::Escrow,
+    ];
 }
 
 /// How a contract is matched on chain.
@@ -91,6 +134,21 @@ pub enum SiteKey {
     Cred([u8; 28]),
     /// A genuine single address — CSwap and Splash really are one each.
     Address(&'static str),
+    /// The STAKE credential, for a venue whose scripts are many and share
+    /// only that: SaturnSwap's escrows, a dozen on one token. Matched after
+    /// every credential and address, so a venue's own stake on a contract
+    /// that has its own entry does not override it.
+    Stake([u8; 28]),
+}
+
+/// An Axo order script, by its index in [`crate::axo::ORDER_CREDS`].
+const fn axo(i: usize) -> Site {
+    Site {
+        key: SiteKey::Cred(crate::axo::ORDER_CREDS[i]),
+        venue: AXO,
+        role: SiteRole::Book,
+        shared: false,
+    }
 }
 
 /// One contract this workspace can name: where it is, whose it is, what it does.
@@ -123,7 +181,7 @@ pub struct Site {
 ///
 /// A venue added here reaches both halves. A venue added to only one of them
 /// is the bug above.
-pub const SITES: [Site; 13] = [
+pub const SITES: &[Site] = &[
     Site {
         key: SiteKey::Cred(crate::splash::POOL_CRED_A),
         venue: SPLASH,
@@ -132,6 +190,12 @@ pub const SITES: [Site; 13] = [
     },
     Site {
         key: SiteKey::Cred(crate::splash::POOL_CRED_B),
+        venue: SPLASH,
+        role: SiteRole::Pool,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::splash::POOL_CRED_C),
         venue: SPLASH,
         role: SiteRole::Pool,
         shared: false,
@@ -159,6 +223,12 @@ pub const SITES: [Site; 13] = [
         venue: MINSWAP_V1,
         role: SiteRole::Pool,
         shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::minswap::V1_ORDER_CRED),
+        venue: MINSWAP_V1,
+        role: SiteRole::Order,
+        shared: true,
     },
     Site {
         key: SiteKey::Cred(crate::minswap::V2_PAYMENT_CRED),
@@ -207,11 +277,165 @@ pub const SITES: [Site; 13] = [
         role: SiteRole::Pool,
         shared: false,
     },
+    // Customer-keyed, with a stake-less enterprise form beside it: the trade
+    // fold reads that form as shared per address (`Roles::keying_at`).
+    Site {
+        key: SiteKey::Cred(crate::wingriders::V1_REQUEST_CRED),
+        venue: WINGRIDERS_V1,
+        role: SiteRole::Order,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::wingriders::V2_REQUEST_CRED),
+        venue: WINGRIDERS_V2,
+        role: SiteRole::Order,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::vyfi::POOL_CRED),
+        venue: VYFI,
+        role: SiteRole::Pool,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::vyfi::ORDER_CRED),
+        venue: VYFI,
+        role: SiteRole::Order,
+        shared: true,
+    },
+    // DexHunter: two customer-keyed limit-order contracts, and the DCA and
+    // stop-loss contracts, which hold an owner's tokens and route them on.
+    Site {
+        key: SiteKey::Cred(crate::dexhunter::LIMIT_ORDER_CREDS[0]),
+        venue: DEXHUNTER,
+        role: SiteRole::Order,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::dexhunter::LIMIT_ORDER_CREDS[1]),
+        venue: DEXHUNTER,
+        role: SiteRole::Order,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::dexhunter::DCA_CRED),
+        venue: DEXHUNTER,
+        role: SiteRole::Book,
+        shared: false,
+    },
+    Site {
+        key: SiteKey::Cred(crate::dexhunter::STOP_LOSS_CRED),
+        venue: DEXHUNTER,
+        role: SiteRole::Book,
+        shared: false,
+    },
+    // SaturnSwap: the exchange, where orders sit under their owner's stake.
+    Site {
+        key: SiteKey::Cred(crate::saturnswap::EXCHANGE_CRED),
+        venue: SATURNSWAP,
+        role: SiteRole::Book,
+        shared: false,
+    },
+    // Axo: every order script $NikePig's history named. See `crate::axo`.
+    axo(0),
+    axo(1),
+    axo(2),
+    axo(3),
+    axo(4),
+    axo(5),
+    axo(6),
+    axo(7),
+    axo(8),
+    axo(9),
+    axo(10),
+    axo(11),
+    axo(12),
+    axo(13),
+    axo(14),
+    axo(15),
+    axo(16),
+    axo(17),
+    axo(18),
+    axo(19),
+    // LAST: SaturnSwap's escrows, by its stake, after every contract keyed by
+    // credential (its exchange carries the same stake).
+    Site {
+        key: SiteKey::Stake(crate::saturnswap::STAKE_CRED),
+        venue: SATURNSWAP,
+        role: SiteRole::Escrow,
+        shared: false,
+    },
 ];
+
+/// The registered contract an output sat at, if any: by its full `address`
+/// for the venues keyed that way, else by its payment `cred`.
+///
+/// The caller supplies the payment and stake credentials (`None` for an
+/// address without one) so this crate keeps out of address parsing. A site
+/// keyed by stake answers only when nothing keyed by credential or address
+/// does.
+pub fn site_of(
+    address: &str,
+    cred: Option<&[u8; 28]>,
+    stake: Option<&[u8; 28]>,
+) -> Option<&'static Site> {
+    SITES
+        .iter()
+        .find(|s| match s.key {
+            SiteKey::Address(a) => a == address,
+            SiteKey::Cred(c) => cred == Some(&c),
+            SiteKey::Stake(_) => false,
+        })
+        .or_else(|| {
+            SITES
+                .iter()
+                .find(|s| matches!(s.key, SiteKey::Stake(k) if stake == Some(&k)))
+        })
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An order contract and a pool contract are found by credential, CSwap's
+    /// pool by its one address, and anything else is nobody's.
+    #[test]
+    fn a_site_is_found_by_its_own_key() {
+        let order = site_of(
+            "addr1-any-stake-variant",
+            Some(&crate::splash::ORDER_CRED),
+            None,
+        )
+        .expect("splash order");
+        assert_eq!((order.venue, order.role), (SPLASH, SiteRole::Order));
+        let pool = site_of(crate::cswap::POOL_SCRIPT_ADDR, None, None).expect("cswap pool");
+        assert_eq!((pool.venue, pool.role), (CSWAP, SiteRole::Pool));
+        assert!(site_of("addr1elsewhere", Some(&[0u8; 28]), None).is_none());
+        assert!(
+            site_of("addr1elsewhere", None, None).is_none(),
+            "no credential, no address match: nobody's"
+        );
+    }
+
+    /// SaturnSwap's exchange carries SaturnSwap's own stake and is still the
+    /// exchange; any other script under that stake is an escrow.
+    #[test]
+    fn a_stake_keyed_site_answers_only_after_every_credential() {
+        let stake = crate::saturnswap::STAKE_CRED;
+        let exchange = site_of(
+            "addr1z",
+            Some(&crate::saturnswap::EXCHANGE_CRED),
+            Some(&stake),
+        )
+        .expect("the exchange");
+        assert_eq!(
+            (exchange.venue, exchange.role),
+            (SATURNSWAP, SiteRole::Book)
+        );
+        let escrow = site_of("addr1z", Some(&[7u8; 28]), Some(&stake)).expect("an escrow");
+        assert_eq!((escrow.venue, escrow.role), (SATURNSWAP, SiteRole::Escrow));
+        assert!(site_of("addr1z", Some(&[7u8; 28]), Some(&[8u8; 28])).is_none());
+    }
 
     /// ⚠️ Two venues sharing a name would silently merge their pools, their
     /// liquidity and their fills into one row.
@@ -257,7 +481,8 @@ mod tests {
     #[test]
     fn every_recognised_pool_contract_has_a_site() {
         type Pred = fn(&[u8; 28]) -> bool;
-        let recognised: [(&str, Pred); 7] = [
+        let recognised: [(&str, Pred); 8] = [
+            ("vyfi", crate::vyfi::is_vyfi_pool),
             ("splash", crate::splash::is_splash_pool),
             ("minswap-v1", crate::minswap::is_minswap_v1),
             ("minswap-v2", crate::minswap::is_minswap_v2),
@@ -270,7 +495,7 @@ mod tests {
             let found = SITES.iter().any(|s| match s.key {
                 SiteKey::Cred(c) => s.role == SiteRole::Pool && is_pool(&c),
                 // CSwap is the address-keyed one and has no cred predicate.
-                SiteKey::Address(_) => false,
+                SiteKey::Address(_) | SiteKey::Stake(_) => false,
             });
             assert!(
                 found,

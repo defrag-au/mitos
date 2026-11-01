@@ -42,6 +42,9 @@
 //! doc measured rather than the 2.5 MB the convenient API costs.
 
 pub mod bundle;
+/// A bonding curve's REALISED price — the delta between two sightings, which
+/// needs no curve formula, and the steps that are not trades at all.
+pub mod curve;
 pub mod density;
 pub mod feed;
 pub mod graph;
@@ -54,6 +57,9 @@ pub mod multi;
 /// What a script output HELD, decoded or not — the tier that lets a decoder
 /// added later re-derive its history from the archive instead of from chunks.
 pub mod observation;
+/// Who controls an address its stake credential does not say: rules over
+/// movements, joined transitively. Byron change chains are the first.
+pub mod owners;
 /// Price, as far as ONE policy's archive can honestly take it — and a name for
 /// everything it cannot.
 pub mod price;
@@ -68,6 +74,9 @@ pub mod series;
 /// merged onto a single spine, so every visualisation is a FOLD over it rather
 /// than a join across endpoints.
 pub mod story;
+/// The whole life folded ONCE into what a chart, a holder map and a far
+/// rewind need: candles, holder days, the distribution and checkpoints.
+pub mod summary;
 /// The archive's own reconciliation — `Σ amounts == Σ net_mint`, graded by how
 /// far the walk reached. Both sides come out of the same file.
 pub mod supply;
@@ -87,6 +96,7 @@ pub use graph::{
     Edge, GRAPH, GRAPH_FORMAT, Movement as PartyMovement, MovementGraph, Moves, NOBODY, PartyKey,
 };
 pub use groups::{BucketSummary, GroupPolicy, GroupSummary};
+pub use holders::{HOLDERS, HOLDERS_FORMAT, HoldersError, HoldersFile};
 pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
 pub use observation::{
@@ -96,7 +106,11 @@ pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
 pub use profile::{Class, Profile};
 pub use reader::{Archive, SparseBytes};
 pub use schema::{Completeness, Movement, Stamp};
+pub use series::{SERIES, SERIES_FORMAT, SeriesError, SeriesFile};
 pub use story::{Kind as StoryKind, PoolState, Story, StoryEvent, Trader};
+pub use summary::{
+    CHECKPOINT_FORMAT, CHECKPOINTS, Checkpoint, SUMMARY, SUMMARY_FORMAT, Summary, SummaryError,
+};
 pub use supply::{Balance, Because, Diagnose, Offender, Reconciler, Verdict};
 pub use writer::{ArchiveWriter, Written};
 

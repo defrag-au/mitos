@@ -26,6 +26,10 @@ anyhow = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `publish` names each build after a digest of the base it uploaded. Content-derived, because
+# a coverage-derived name would collide with a rebuild of that coverage and the upload would
+# then be skipped as "already there". Same version as `mithril-snapshot`, already in the lock.
+sha2 = "0.10"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

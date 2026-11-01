@@ -611,6 +611,39 @@ interface interest {
     }
 }
 
+/// The fold plane's artifacts, read-only.
+///
+/// A **fold artifact** is a directory a deterministic walk produced: a manifest
+/// naming its files, and the files. The host serves one per installation, and it
+/// is the same bytes whatever wrote them — the walk, a rebuild, or a copy.
+///
+/// The host deliberately hands back **bytes, not rows**. The row encoding is the
+/// one part of an artifact expected to change — the holder table is text today
+/// and a binary table later — and a module that owns its parsing does not move
+/// when the encoding does. The manifest is text by contract, so it is served
+/// whole and uninterpreted.
+///
+/// **A module checks the manifest, not the host.** The schema, the stamp and the
+/// counts are the reader's business: the reader is the one that knows what it
+/// requires, and a host that refused on a module's behalf could only refuse the
+/// one schema it was built against.
+interface fold-data {
+    /// The manifest verbatim, or `none` when this host serves no artifact.
+    meta: func() -> option<string>;
+
+    /// The names the manifest lists, in the order it lists them. Empty when the
+    /// host serves no artifact.
+    files: func() -> list<string>;
+
+    /// Up to `len` bytes of `file` at `offset`.
+    ///
+    /// `none` for a file the manifest does not name, for a host serving no
+    /// artifact, and for an offset at or past the end. A **short** read is the
+    /// tail of the file, not an error — ask again from the end and get `none`.
+    /// The host caps `len`, so a module pages rather than materialises.
+    read: func(file: string, offset: u64, len: u32) -> option<list<u8>>;
+}
+
 world mitos-module-v2 {
     use types.{trap-strategy, retry-policy, dispatch-event, rebootstrap-step, rebootstrap-mode};
     use interest.{interest-op};
@@ -619,6 +652,7 @@ world mitos-module-v2 {
     import state-kv;
     import emit;
     import logging;
+    import fold-data;
 
     /// ABI version handshake. v2 modules return `(2, 0)`.
     /// Mismatch is enforced at module load — v1 modules

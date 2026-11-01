@@ -222,6 +222,11 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
                     // walk expanding into thousands of unrelated sellers.
                     StakeServiceKind::Marketplace => ProviderCapability::Marketplace,
                     StakeServiceKind::Exchange => ProviderCapability::Dex,
+                    // A staking programme run from a wallet, for tokens or
+                    // NFTs: holders send it their assets and get them back,
+                    // so value from it is their own returning (a round trip),
+                    // and what it holds is theirs, pooled.
+                    StakeServiceKind::Staking => ProviderCapability::Staking,
                 },
                 Basis::Asserted,
             ));

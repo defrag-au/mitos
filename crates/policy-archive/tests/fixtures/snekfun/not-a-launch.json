@@ -1,0 +1,9 @@
+{
+  "source": "https://analytics.snek.fun/v1/pools-feed/initial/state?asset=279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f",
+  "fetched": "2026-10-25",
+  "http": 404,
+  "note": "Verbatim body of a 404. $SNEK is a token that is NOT a snek.fun launch, so the feed refuses it by naming the asset class rather than answering with an empty pool.",
+  "body": {
+    "what": "asset=AssetClass(279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3f,)"
+  }
+}

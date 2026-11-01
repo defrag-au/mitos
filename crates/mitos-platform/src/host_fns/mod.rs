@@ -35,6 +35,9 @@ fn cip25_source_tx(state: &mitos_data_plane::AssetMintState) -> Option<[u8; 32]>
 /// `(OutputRef, TypedOutput)` — so the conversion at the WIT
 /// boundary stays trivial. Missing entries are silently omitted
 /// (per the underlying contract).
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait DataPlaneFacade: Send + Sync + 'static {
     async fn read_utxos(
@@ -516,6 +519,19 @@ where
     }
 }
 
+/// Did the inner plane *decline* to answer, rather than fail?
+///
+/// `NotYetImplemented` is how a plane names a question it does not carry: the
+/// live book refuses aux-data, scripts, protocol parameters and net supply by
+/// name, with the reason in the message. A tiered lookup has to read that as a
+/// miss, or the tiers behind it are dead code — under `MITOS_DATA_PLANE=book`
+/// the local tx-index and the remote provider were both unreachable, and a
+/// module that reads metadata (vesting-tracker's key-674 lookup is the L1
+/// example) trapped instead of degrading.
+fn declines_to_answer(err: &mitos_data_plane::DataPlaneError) -> bool {
+    matches!(err, mitos_data_plane::DataPlaneError::NotYetImplemented(_))
+}
+
 /// Transparent `DataPlaneFacade` wrapper that adds the persistent
 /// `IndexerDataCache` and an optional Maestro fallback to the two
 /// hash-addressable lookups — `tx_metadata` (aux_data) and
@@ -614,8 +630,22 @@ impl DataPlaneFacade for CachingDataPlane {
             return Ok(Some(cached));
         }
 
-        // Tier 2: dolos `DATUM_NS` (refcounted witness datums).
-        if let Some(cbor) = self.inner.datum_by_hash(hash).await? {
+        // Tier 2: dolos `DATUM_NS` (refcounted witness datums). A plane with no
+        // datum index declines by name — a miss, not a failure, so the remote
+        // tier below still runs.
+        let inner = match self.inner.datum_by_hash(hash).await {
+            Ok(datum) => datum,
+            Err(e) if declines_to_answer(&e) => {
+                tracing::debug!(
+                    datum = %hex::encode(hash),
+                    reason = %e,
+                    "inner plane has no datum index; continuing to the fallback tier",
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(cbor) = inner {
             if let Some(cache) = &self.cache {
                 cache.insert_datum(hash, &cbor);
             }
@@ -680,9 +710,23 @@ impl DataPlaneFacade for CachingDataPlane {
             return Ok(Some(cached));
         }
 
-        // Tier 2: dolos archive (7-day window).
-        let result = self.inner.tx_metadata(tx_hash).await?;
-        if let Some(cbor) = result {
+        // Tier 2: dolos archive (7-day window). A plane with no archive (the
+        // live book) declines by name — a miss, not a failure, so the local
+        // tx-index and the provider below still run. `prefetch_tx_metadata`
+        // already reads an inner error as a miss; this is the same rule.
+        let inner = match self.inner.tx_metadata(tx_hash).await {
+            Ok(result) => result,
+            Err(e) if declines_to_answer(&e) => {
+                tracing::debug!(
+                    tx = %hex::encode(tx_hash),
+                    reason = %e,
+                    "inner plane has no aux-data; continuing to the next tier",
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(cbor) = inner {
             if let Some(cache) = &self.cache {
                 cache.insert_aux(tx_hash, &cbor);
             }
@@ -844,5 +888,169 @@ mod cip25_source_tx_tests {
     #[test]
     fn none_when_neither_known() {
         assert_eq!(cip25_source_tx(&state(None, None)), None);
+    }
+}
+
+/// `CachingDataPlane`'s tiers, against a plane that declines rather than fails.
+///
+/// The distinction is the whole point of the fix: a book-backed host refuses
+/// aux-data and datums *by name*, and treating that as an error made the local
+/// tx-index and the remote provider unreachable.
+#[cfg(test)]
+mod cached_plane_tests {
+    use std::sync::Arc;
+
+    use mitos_data_plane::{DataPlaneError, DecodeLevel, OutputRef, TypedDatum, TypedOutput};
+
+    use super::{CachingDataPlane, DataPlaneFacade};
+    use crate::fallback::{FallbackError, FallbackProvider};
+
+    /// What the inner plane answers with. `Declines` is the live book;
+    /// `Broken` is a real failure, which must not be swallowed.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        Declines,
+        Broken,
+    }
+
+    impl Answer {
+        fn error(self, reason: &'static str) -> DataPlaneError {
+            match self {
+                Self::Declines => DataPlaneError::NotYetImplemented(reason),
+                Self::Broken => DataPlaneError::Decode("the plane broke".to_owned()),
+            }
+        }
+    }
+
+    struct Inner(Answer);
+
+    #[async_trait::async_trait]
+    impl DataPlaneFacade for Inner {
+        async fn read_utxos(
+            &self,
+            _refs: &[OutputRef],
+            _decode: DecodeLevel,
+        ) -> mitos_data_plane::DataPlaneResult<Vec<(OutputRef, TypedOutput)>> {
+            Ok(Vec::new())
+        }
+
+        async fn utxos_by_address(
+            &self,
+            _address: &str,
+        ) -> mitos_data_plane::DataPlaneResult<Vec<OutputRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn utxos_by_policy(
+            &self,
+            _policy: &[u8],
+        ) -> mitos_data_plane::DataPlaneResult<Vec<OutputRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn utxos_by_payment_cred(
+            &self,
+            _cred: &[u8],
+        ) -> mitos_data_plane::DataPlaneResult<Vec<OutputRef>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve_stake_for_payment_pkh(
+            &self,
+            _pkh: &[u8],
+        ) -> mitos_data_plane::DataPlaneResult<Option<mitos_data_plane::StakeCred>> {
+            Ok(None)
+        }
+
+        async fn datum_by_hash(
+            &self,
+            _hash: &[u8; 32],
+        ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+            Err(self.0.error("a live book carries no datum index"))
+        }
+
+        async fn read_output_datums(
+            &self,
+            refs: &[OutputRef],
+        ) -> mitos_data_plane::DataPlaneResult<Vec<Option<TypedDatum>>> {
+            Ok(refs.iter().map(|_| None).collect())
+        }
+
+        async fn read_output_hashes(
+            &self,
+            refs: &[OutputRef],
+        ) -> mitos_data_plane::DataPlaneResult<Vec<Option<Vec<u8>>>> {
+            Ok(refs.iter().map(|_| None).collect())
+        }
+
+        async fn tx_metadata(
+            &self,
+            _tx_hash: &[u8; 32],
+        ) -> mitos_data_plane::DataPlaneResult<Option<Vec<u8>>> {
+            Err(self.0.error("aux data is history"))
+        }
+    }
+
+    struct Provider;
+
+    #[async_trait::async_trait]
+    impl FallbackProvider for Provider {
+        async fn fetch_aux_data(
+            &self,
+            _tx_hash_hex: &str,
+        ) -> Result<Option<Vec<u8>>, FallbackError> {
+            Ok(Some(vec![0xAB]))
+        }
+
+        async fn fetch_output(
+            &self,
+            _oref: &OutputRef,
+            _level: DecodeLevel,
+        ) -> Result<Option<TypedOutput>, FallbackError> {
+            Ok(None)
+        }
+
+        async fn fetch_datum(
+            &self,
+            _datum_hash_hex: &str,
+        ) -> Result<Option<Vec<u8>>, FallbackError> {
+            Ok(Some(vec![0xCD]))
+        }
+    }
+
+    fn plane(answer: Answer) -> CachingDataPlane {
+        CachingDataPlane::new(
+            Arc::new(Inner(answer)),
+            None,
+            None,
+            Some(Arc::new(Provider)),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_plane_that_declines_reaches_the_fallback_tier() {
+        let plane = plane(Answer::Declines);
+        assert_eq!(
+            plane.tx_metadata(&[7u8; 32]).await.unwrap(),
+            Some(vec![0xAB]),
+            "`NotYetImplemented` from the book is a miss; the provider behind it must be asked"
+        );
+        assert_eq!(
+            plane.datum_by_hash(&[9u8; 32]).await.unwrap(),
+            Some(vec![0xCD])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_error_is_not_swallowed() {
+        let plane = plane(Answer::Broken);
+        assert!(matches!(
+            plane.tx_metadata(&[7u8; 32]).await,
+            Err(DataPlaneError::Decode(_))
+        ));
+        assert!(matches!(
+            plane.datum_by_hash(&[9u8; 32]).await,
+            Err(DataPlaneError::Decode(_))
+        ));
     }
 }

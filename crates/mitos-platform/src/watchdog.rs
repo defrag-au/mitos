@@ -10,14 +10,28 @@
 //! mutations).
 //!
 //! The watchdog closes the class: every tick it compares the set of
-//! modules that *should* be running (companions registered) against
-//! truthful liveness (`list_running`, which excludes finished
-//! follower tasks) and restarts the difference. After a revive it
+//! INSTANCES that *should* be running against truthful liveness
+//! (`running_instances`, which excludes finished follower tasks) and
+//! restarts the difference. Per instance, because a module with two of them
+//! reads as "running" while either lives, and the dead one would then stay
+//! dead for ever. After a revive it
 //! re-asserts the module's scan-interest from the persisted companion
 //! set (`CompanionDialer::reconcile_module_interest`) so a companion
 //! that subscribed while the module was dead — whose interest
 //! mutation was dropped with `NotRunning` — is picked up instead of
 //! staying stranded until the next full host restart.
+//!
+//! "Should be running" is the LIFECYCLE's answer
+//! (`LifecycleManager::expects_follower`), not a companion count. Two
+//! consequences, both intended:
+//!
+//! - **An operator-stopped module is no longer revived.** v2 counted
+//!   companions, so `DELETE /_admin/modules/{id}` on a SUBSCRIBED
+//!   module was undone within one tick — not merely on the next
+//!   restart. That is the bug this closes.
+//! - **A pinned module with no companions that crashes IS revived.**
+//!   v2 treated "nothing subscribed" as a valid idle state and left
+//!   it dead. If an operator pinned it, they want it running.
 //!
 //! Guards:
 //! - skips modules with a recapture or bootstrap in flight (both
@@ -36,9 +50,13 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use mitos_lifecycle::ids::InstanceKey;
+use mitos_lifecycle::instance::BootAction;
+
 use crate::dialer::CompanionDialer;
 use crate::events::{EventKind, EventRing};
 use crate::host_v2::ModuleHostHandle;
+use crate::lifecycle::LifecycleManager;
 use crate::storage::ModuleStorage;
 
 /// Sweep cadence. A dead-but-subscribed module is an outage for its
@@ -58,6 +76,7 @@ pub const FIRST_TICK_DELAY: Duration = Duration::from_secs(120);
 pub fn spawn(
     storage: ModuleStorage,
     host: Arc<dyn ModuleHostHandle>,
+    lifecycle: Arc<LifecycleManager>,
     dialer: CompanionDialer,
     events: EventRing,
     cancel: CancellationToken,
@@ -65,6 +84,7 @@ pub fn spawn(
     spawn_with_config(
         storage,
         host,
+        lifecycle,
         dialer,
         events,
         cancel,
@@ -74,9 +94,11 @@ pub fn spawn(
 }
 
 /// As `spawn`, with explicit knobs (tests use shorter intervals).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_with_config(
     storage: ModuleStorage,
     host: Arc<dyn ModuleHostHandle>,
+    lifecycle: Arc<LifecycleManager>,
     dialer: CompanionDialer,
     events: EventRing,
     cancel: CancellationToken,
@@ -94,16 +116,17 @@ pub fn spawn_with_config(
                     return;
                 }
                 _ = tick.tick() => {
-                    sweep(&storage, host.as_ref(), &dialer, &events).await;
+                    sweep(&storage, host.as_ref(), &lifecycle, &dialer, &events).await;
                 }
             }
         }
     })
 }
 
-async fn sweep(
+pub(crate) async fn sweep(
     storage: &ModuleStorage,
     host: &dyn ModuleHostHandle,
+    lifecycle: &LifecycleManager,
     dialer: &CompanionDialer,
     events: &EventRing,
 ) {
@@ -114,7 +137,6 @@ async fn sweep(
             return;
         }
     };
-    let running: HashSet<String> = host.list_running().await.into_iter().collect();
     let busy: HashSet<String> = host
         .recapture_in_flight()
         .await
@@ -123,42 +145,80 @@ async fn sweep(
         .collect();
 
     for id in modules {
-        if running.contains(&id) || busy.contains(&id) {
+        if busy.contains(&id) {
             continue;
         }
-        if storage.count_companions(&id) == 0 {
-            // Nothing subscribed — a stopped module is a valid idle
-            // state, not an outage.
-            continue;
-        }
-        tracing::warn!(
-            module = %id,
-            "watchdog: module has registered companions but no live \
-             follower; restarting"
-        );
-        let outcome = match host.replace(&id).await {
-            Ok(()) => {
-                // Re-assert scan-interest from the persisted
-                // companion set — subscribes that landed while the
-                // module was dead dropped their interest mutation.
-                dialer.reconcile_module_interest(&id).await;
-                tracing::info!(module = %id, "watchdog: module restarted");
-                "restarted"
-            }
+        // Per INSTANCE: a module with two instances is "running" as far as
+        // `list_running` is concerned when either of them is, so asking that
+        // would leave a dead second follower dead for ever.
+        let running: HashSet<InstanceKey> = host.running_instances(&id).await.into_iter().collect();
+        let instances = match lifecycle.instances(&id) {
+            Ok(instances) => instances,
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     module = %id,
                     error = %e,
-                    "watchdog: restart failed; will retry next tick"
+                    "watchdog: cannot list this module's instances; leaving it alone",
                 );
-                "failed"
+                continue;
             }
         };
-        events.record(
-            id.as_str(),
-            EventKind::WatchdogRestart {
-                outcome: outcome.to_owned(),
-            },
-        );
+
+        // ONCE per module per sweep, however many of its instances were
+        // revived. `reconcile_module_interest` routes the union to every
+        // running instance already, and the dialer's own comment warns that
+        // repeating it per companion re-triggers a module's cold-start
+        // machinery.
+        let mut revived = false;
+        for view in instances {
+            let key = view.key();
+            if running.contains(key) {
+                continue;
+            }
+            // The lifecycle decides, not a companion count. An instance an
+            // operator stopped stays stopped — that is the whole fix. An
+            // `Unmanaged` one is never started; nothing here made it.
+            match view.on_boot() {
+                BootAction::StartFollower => {}
+                BootAction::LeaveStopped => continue,
+            }
+            // Everything above is a SNAPSHOT, taken with no lock. The restart
+            // itself goes through the lifecycle, which takes the module lock
+            // and asks again — see `LifecycleManager::revive` for what an
+            // upload does in the gap this would otherwise act on.
+            let outcome = match lifecycle.revive(key).await {
+                crate::lifecycle::Revival::NotNeeded => continue,
+                crate::lifecycle::Revival::Restarted => {
+                    revived = true;
+                    tracing::warn!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        "watchdog: instance had no live follower; restarted",
+                    );
+                    "restarted"
+                }
+                crate::lifecycle::Revival::Failed(e) => {
+                    tracing::error!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "watchdog: restart failed; will retry next tick"
+                    );
+                    "failed"
+                }
+            };
+            events.record(
+                id.as_str(),
+                EventKind::WatchdogRestart {
+                    outcome: outcome.to_owned(),
+                },
+            );
+        }
+        if revived {
+            // Re-assert scan-interest from the persisted companion set —
+            // subscribes that landed while the module was dead dropped their
+            // interest mutation.
+            dialer.reconcile_module_interest(&id).await;
+        }
     }
 }

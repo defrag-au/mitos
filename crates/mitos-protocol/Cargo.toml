@@ -15,6 +15,11 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+# The validated id newtypes (`ModuleId`, `Sha256Hex`, `Revision`) an
+# announcement is made of, so a malformed digest is a DECODE error rather than
+# something each side checks by hand. Pure — `serde` + `thiserror` only — so
+# this crate stays wasm-safe for the companions that compile it.
+mitos-lifecycle = { path = "../mitos-lifecycle" }
 serde_bytes = "0.11"
 # CBOR encode/decode helpers ride alongside the wire types so both
 # host (mitos-core) and CF companion can use them. Framework-free.
@@ -32,6 +37,12 @@ pipeline-types = { workspace = true }
 # Error type for the wire codec helpers (`SubscribeRequest::encode`,
 # etc.). Workspace pin — same major as the rest of the workspace.
 thiserror = { workspace = true }
+
+# `AnnouncedModule::from_built` hashes the config bytes a worker embedded and
+# compares them with the digest its build recorded. Pure Rust, so this crate
+# stays compilable for wasm32 in the companions.
+sha2 = "0.10"
+hex = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

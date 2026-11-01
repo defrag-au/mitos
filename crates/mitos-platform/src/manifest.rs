@@ -51,6 +51,22 @@ pub struct Manifest {
     /// declare interest in their config or by other means.
     #[serde(default, skip_serializing_if = "InterestSection::is_empty")]
     pub interest: InterestSection,
+    /// What the module declares about its own lifecycle: its revision, its
+    /// state schema, and the actions a client must run when it crosses a
+    /// revision. Copied verbatim from the module's `[lifecycle]` table by
+    /// `mitos-build`.
+    ///
+    /// Last, and skipped when it is the default, for two reasons. Skipping
+    /// means a manifest for a module that declares nothing serialises EXACTLY
+    /// as it did before this field existed — every artifact already in a CAS
+    /// stays byte-identical. Last, because the section ends in an array of
+    /// tables (`[[lifecycle.upgrade]]`), which in TOML would swallow any
+    /// top-level key written after it.
+    #[serde(
+        default,
+        skip_serializing_if = "mitos_lifecycle::artifact::LifecycleSection::is_default"
+    )]
+    pub lifecycle: mitos_lifecycle::artifact::LifecycleSection,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,24 +96,38 @@ pub struct InterestSection {
     pub payment_credentials: Vec<String>,
 }
 
-/// Modules that cold-start a newly-subscribed predicate via the
-/// budget-safe chunked `rebootstrap` pump (the host drives it after
-/// `update-interest` on an Add) rather than the host's inline
-/// synthetic bootstrap. These page-oriented modules dropped their
-/// inline single-fuel cold-start (which trapped + emitted nothing
-/// for large collections) and seed a scoped onboard set instead.
+/// Modules that produce their state in `rebootstrap`, so a newly-subscribed
+/// predicate is cold-started by the budget-safe `rebootstrap` pump — the host
+/// drives it after `update-interest` on an Add, and again on the startup
+/// reconcile — rather than by the host's inline synthetic bootstrap.
 ///
-/// Hardcoded rather than manifest-driven: the natural home is a
-/// manifest `[interest]` flag, but `toml::to_string` drops a trailing
-/// nested table whose siblings are empty-skipped, silently losing the
-/// flag for exactly these (no static interest) modules. Revisit as a
-/// manifest field if the serializer is fixed or the manifest moves to
-/// CBOR. Other modules must NOT be listed here — a pump on a module
-/// that also cold-starts inline (burn-address) would double-emit.
+/// Two reasons an id is here, and the second one is not the name:
+///
+/// - **Page-oriented scanners** — `collection-holders`, `collection-metadata`,
+///   `holder-distribution`, `vesting-tracker` — dropped their inline single-fuel
+///   cold start (it trapped and emitted nothing for large collections) and seed
+///   a scoped onboard set instead.
+/// - **`holders-from-fold`** has no inline cold start at all. Its entire state
+///   is a published artifact it pages out of `fold-data`, and `handle-events` is
+///   a no-op, so the synthetic-event path would replay history at a module that
+///   ignores it and the companion would receive nothing. Subscribing is what has
+///   to drive `rebootstrap`, and this list is what makes subscribing do that.
+///
+/// Hardcoded rather than manifest-driven: the natural home is a manifest
+/// `[interest]` flag, but `toml::to_string` drops a trailing nested table whose
+/// siblings are empty-skipped, silently losing the flag for exactly these (no
+/// static interest) modules. Revisit as a manifest field if the serializer is
+/// fixed or the manifest moves to CBOR. Other modules must NOT be listed here —
+/// a pump on a module that also cold-starts inline (burn-address) would
+/// double-emit.
 pub fn is_chunked_cold_start_module(module_id: &str) -> bool {
     matches!(
         module_id,
-        "collection-holders" | "collection-metadata" | "holder-distribution" | "vesting-tracker"
+        "collection-holders"
+            | "collection-metadata"
+            | "holder-distribution"
+            | "vesting-tracker"
+            | "holders-from-fold"
     )
 }
 
@@ -193,6 +223,13 @@ pub enum ManifestError {
     InvalidTrapStrategy(String),
     #[error("invalid module id `{0}` — must be [a-z0-9-]+ (max 64 chars)")]
     InvalidModuleId(String),
+    /// The `[lifecycle]` section's upgrade ledger does not hold together —
+    /// an action `since` a revision the artifact has not reached, a duplicate
+    /// `since`, or `since = 0`. The module is REFUSED, here as well as at
+    /// build time: an artifact is not trusted because a builder once accepted
+    /// it.
+    #[error("lifecycle: {0}")]
+    Lifecycle(#[from] mitos_lifecycle::upgrade::LedgerError),
 }
 
 impl Manifest {
@@ -237,6 +274,11 @@ impl Manifest {
                 computed: computed_sha,
             });
         }
+
+        // The upgrade ledger must hold together. Checked here as well as in
+        // `mitos-build` because an artifact is not trusted on the grounds
+        // that a builder once accepted it.
+        self.lifecycle.validate()?;
 
         Ok(())
     }
@@ -341,6 +383,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mitos_lifecycle::artifact::LifecycleSection;
+    use mitos_lifecycle::ids::Revision;
+    use mitos_lifecycle::state_prep::StateSchema;
+    use mitos_lifecycle::upgrade::{UpgradeAction, UpgradeEntry};
 
     fn sample(sha: &str, size: u64) -> Manifest {
         Manifest {
@@ -370,6 +416,7 @@ mod tests {
                 crate_version: "0.1.0".to_owned(),
             },
             interest: InterestSection::default(),
+            lifecycle: Default::default(),
         }
     }
 
@@ -536,5 +583,98 @@ mod tests {
             .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
             .unwrap_err();
         assert!(matches!(err, ManifestError::InvalidTrapStrategy(_)));
+    }
+
+    // ---------------------------------------------------------------------
+    // `[lifecycle]` — what the module declares about itself.
+    // ---------------------------------------------------------------------
+
+    /// Every manifest already in a CAS has no `[lifecycle]` at all, and must
+    /// keep parsing unedited.
+    #[test]
+    fn a_manifest_without_lifecycle_parses_as_pre_v3() {
+        let text = sample(&"ab".repeat(32), 10).to_toml().unwrap();
+        assert!(!text.contains("lifecycle"));
+        let parsed = Manifest::parse(&text).unwrap();
+        assert!(parsed.lifecycle.is_default());
+        assert_eq!(parsed.lifecycle.revision, Revision(0));
+    }
+
+    /// The `skip_serializing_if` is load-bearing: a manifest for a module
+    /// that declares nothing must serialise EXACTLY as it did before this
+    /// field existed, or every artifact in a CAS changes digest on rewrite.
+    #[test]
+    fn a_default_lifecycle_is_not_serialised() {
+        let manifest = sample(&"ab".repeat(32), 10);
+        assert!(manifest.lifecycle.is_default());
+        assert!(!manifest.to_toml().unwrap().contains("lifecycle"));
+    }
+
+    #[test]
+    fn a_declared_lifecycle_round_trips() {
+        let mut manifest = sample(&"ab".repeat(32), 10);
+        manifest.lifecycle = LifecycleSection {
+            revision: Revision(5),
+            state_schema: StateSchema(2),
+            upgrade: vec![UpgradeEntry {
+                since: Revision(3),
+                actions: [UpgradeAction::Recapture].into_iter().collect(),
+            }],
+        };
+        let text = manifest.to_toml().unwrap();
+        assert_eq!(Manifest::parse(&text).unwrap(), manifest);
+    }
+
+    /// An artifact is not trusted because a builder once accepted it.
+    #[test]
+    fn a_bad_ledger_refuses_the_module() {
+        let bytes = b"hello wasm";
+        let mut manifest = sample(&sha256_hex(bytes), bytes.len() as u64);
+        manifest.lifecycle = LifecycleSection {
+            revision: Revision(2),
+            state_schema: StateSchema(0),
+            // `since` ahead of the revision the artifact has reached.
+            upgrade: vec![UpgradeEntry {
+                since: Revision(3),
+                actions: [UpgradeAction::Resync].into_iter().collect(),
+            }],
+        };
+        let err = manifest
+            .validate_against_host(bytes, &[(2, "mitos:platform-v2/mitos-module-v2")])
+            .unwrap_err();
+        assert!(matches!(err, ManifestError::Lifecycle(_)), "{err}");
+    }
+
+    /// The host-rollback guarantee, as a test. There is deliberately no
+    /// `deny_unknown_fields` on `Manifest`, so a host that predates this
+    /// order reads a manifest carrying `[lifecycle]` and ignores it — which
+    /// is what makes rolling the host back safe.
+    #[test]
+    fn an_older_host_would_ignore_the_section() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreWo04Manifest {
+            module: ModuleSection,
+            abi: AbiSection,
+            trap_policy: TrapPolicySection,
+            build: BuildSection,
+            #[serde(default)]
+            interest: InterestSection,
+        }
+
+        let mut manifest = sample(&"ab".repeat(32), 10);
+        manifest.lifecycle = LifecycleSection {
+            revision: Revision(7),
+            state_schema: StateSchema(1),
+            upgrade: vec![UpgradeEntry {
+                since: Revision(4),
+                actions: [UpgradeAction::PurgeEmissions].into_iter().collect(),
+            }],
+        };
+        let text = manifest.to_toml().unwrap();
+        assert!(text.contains("lifecycle"), "the fixture must exercise it");
+        let old: PreWo04Manifest =
+            toml::from_str(&text).expect("an older host must still parse this manifest");
+        assert_eq!(old.module.sha256, manifest.module.sha256);
     }
 }

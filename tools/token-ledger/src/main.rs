@@ -15,18 +15,30 @@
 //! - `stats` — derived balances at tip, for reconciliation against a known total
 //! - `export`/`serve` — later; see the design doc's three-tier artifact
 
+mod ambiguous;
 mod archive;
+mod book_prices;
 mod buffer;
+mod events;
 mod export;
+mod names;
 mod observer;
+mod pack;
 mod policy_api;
+mod profile;
 mod publish;
+mod publish_tape;
+mod pull;
 mod registry;
 mod reverse;
 mod scheduler;
+mod segmentation;
 mod segments;
 mod serve;
+mod shared_fills;
 mod store;
+mod sync;
+mod tapes;
 mod tip;
 mod walk;
 
@@ -71,6 +83,19 @@ enum Command {
     /// distinct edges, not rows. The measurement that decides whether the
     /// graph is one fetch or six hundred paged requests.
     Graph(archive::GraphArgs),
+    /// Fold a policy's whole life into its summary — candles, holder days,
+    /// the distribution and balance checkpoints — and say what is in it. A
+    /// completed walk writes one; this forces it.
+    Summary(archive::SummaryArgs),
+    /// Write a policy's history as `token-tape` files: stable party numbers,
+    /// and day chunks of market, transfer and order events.
+    Pack(pack::PackArgs),
+    /// Name a packed token's parties from the ADA Handle policy's archive:
+    /// who holds which handle, joined to the party table by stake key.
+    Names(names::NamesArgs),
+    /// Sort a policy's "ambiguous" movements (not one sender and one
+    /// receiver) into what they turn out to be. Read-only.
+    Ambiguous(ambiguous::AmbiguousArgs),
     /// Fold a policy's passes into ONE file at its root — fewer footers per
     /// read, one object per policy for R2. Runs on its own after every few
     /// passes; this forces it.
@@ -83,9 +108,26 @@ enum Command {
     /// KV — from its manifest. Landing writes one; this backfills.
     Bundle(archive::BundleArgs),
     /// Publish one policy's archive — R2 and the KV bundle — by hand, from
-    /// the same environment `serve --publish-archive` uses, and print the
-    /// per-step record.
+    /// the same environment `sync` uses, and print the per-step record.
     Publish(publish::PublishArgs),
+    /// Publish one policy's pack — the pages and meta a replay reads — to R2
+    /// under a build named by its bytes, then flip the policy's pointer.
+    PublishTape(publish_tape::PublishTapeArgs),
+    /// Pull one policy's published archive from R2 into a local archive
+    /// directory — the mirror of `publish`, for working on folds without the
+    /// box. A read-only R2 token is enough, and the safer one to hold.
+    Pull(pull::PullArgs),
+    /// Keep R2 and Workers KV level with the archives on disk.
+    ///
+    /// Runs as its own service rather than inside `serve`, so a slow upload
+    /// cannot delay the tail refresh and the two can be restarted apart. A
+    /// pass publishes every archive whose `published.json` does not name its
+    /// manifest's current version, so it is safe to interrupt and re-run.
+    Sync(sync::SyncArgs),
+    /// Keep every registered token's published tape level with its archive:
+    /// pack and publish each one whose archive moved since its last publish.
+    /// Runs as its own service beside `sync`.
+    Tapes(tapes::TapesArgs),
     /// Derived balances at tip — the reconciliation surface.
     Stats {
         #[arg(long)]
@@ -156,6 +198,9 @@ fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        // Logs go to stderr, always. stdout is data: `walk --events` writes NDJSON there
+        // and nothing else, so a tracing line on stdout would corrupt a pipe.
+        .with_writer(std::io::stderr)
         .init();
 
     match Cli::parse().command {
@@ -163,10 +208,18 @@ fn main() -> Result<()> {
         Command::Reverse(args) => reverse::run(args),
         Command::Archive(args) => archive::inspect(args),
         Command::Graph(args) => archive::graph(args),
+        Command::Summary(args) => archive::summary(args),
+        Command::Pack(args) => pack::pack(args),
+        Command::Names(args) => names::names(args),
+        Command::Ambiguous(args) => ambiguous::ambiguous(args),
         Command::Rollup(args) => segments::run_rollup(args),
         Command::RepairObservations(args) => segments::run_repair_observations(args),
         Command::Bundle(args) => archive::bundle(args),
         Command::Publish(args) => publish::run(args),
+        Command::PublishTape(args) => publish_tape::run(args),
+        Command::Pull(args) => pull::run(args),
+        Command::Sync(args) => sync::run(args),
+        Command::Tapes(args) => tapes::run(args),
         Command::Stats { db, top } => walk::stats(&db, top),
         Command::Export(args) => export::run(args),
         Command::Serve(args) => serve::run(args),

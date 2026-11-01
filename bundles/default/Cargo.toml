@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 mitos-core = { path = "../../crates/mitos-core" }
+mitos-config = { path = "../../crates/mitos-config" }
 none-match-indexer = { path = "../../crates/none-match-indexer" }
 
 # Dolos for the embedded data plane.
@@ -29,3 +30,10 @@ anyhow = { workspace = true }
 # CLI / config.
 clap = { workspace = true }
 config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

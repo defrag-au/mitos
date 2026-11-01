@@ -1,43 +1,38 @@
-//! Shared-secret bearer-token auth for replication + admin
-//! endpoints.
+//! Bearer-token auth for the bundle's own routes.
 //!
-//! Three places use this:
+//! The authenticator itself lives in [`mitos_platform::auth`] — one
+//! implementation for all three routers, resolving a token to a
+//! `mitos_lifecycle::access::Principal` and asking `access::Registry::authorize`
+//! who may do what. This module is the mitos-core-side adapter: it re-exports
+//! that middleware under the names the bundle and its binaries already use, and
+//! keeps [`AuthToken`] for the one job that is genuinely a shared secret rather
+//! than an identity — presenting a credential on an OUTBOUND dial.
 //!
-//! - `/replicate/{indexer}` (test/synthetic-client surface) — checks
-//!   the upgrade request's `Authorization: Bearer <token>` header.
-//! - `/_admin/subscriptions` — same.
-//! - `Replicator` outbound dials — adds the header to its
-//!   tungstenite request so the CF DO can verify the connection
-//!   came from mitos, not an attacker who guessed the URL.
-//!
-//! Token comes from `MITOS_AUTH_TOKEN`. If unset, all of the above
-//! run in open mode and a warning is logged at startup. Suitable
-//! for `wrangler dev` and synthetic tests; production should
-//! always set the env.
+//! Token comes from `MITOS_AUTH_TOKEN`. If unset, the host runs in open mode
+//! and a warning is logged at startup. Suitable for `wrangler dev` and
+//! synthetic tests; production should always set the env.
 
-use axum::extract::{FromRequestParts, OptionalFromRequestParts, Request};
-use axum::http::{StatusCode, header, request::Parts};
-use axum::middleware::Next;
-use axum::response::Response;
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum::http::request::Parts;
 
-/// Token loaded once at startup. `None` ⇒ open mode (no auth).
+pub use mitos_platform::auth::{
+    Authenticator, Resolution, authenticate, require_read_chain, require_submit_tx,
+};
+
+/// A shared secret, as an OUTBOUND credential.
+///
+/// Inbound gating is [`Authenticator`]'s job. What is left is the dial-back
+/// side: the `Replicator` and the in-tree indexer bridge add this token to
+/// their requests so the far end can tell the connection came from mitos and
+/// not from somebody who guessed the URL.
 #[derive(Clone, Debug)]
 pub struct AuthToken(pub Option<String>);
 
 impl AuthToken {
     pub fn from_env() -> Self {
         match std::env::var("MITOS_AUTH_TOKEN") {
-            Ok(t) if !t.is_empty() => {
-                tracing::info!("auth token loaded; replicate + admin endpoints require it");
-                Self(Some(t))
-            }
-            _ => {
-                tracing::warn!(
-                    "MITOS_AUTH_TOKEN not set — running in open mode (no auth on \
-                     /replicate or /_admin). Set the env var in production."
-                );
-                Self(None)
-            }
+            Ok(t) if !t.is_empty() => Self(Some(t)),
+            _ => Self(None),
         }
     }
 
@@ -48,40 +43,6 @@ impl AuthToken {
     pub fn is_open(&self) -> bool {
         self.0.is_none()
     }
-}
-
-/// axum middleware that rejects requests missing or mismatching the
-/// configured token. Open mode lets every request through.
-pub async fn require_auth(
-    axum::extract::State(token): axum::extract::State<AuthToken>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if let Some(expected) = token.as_deref() {
-        let provided = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "));
-        match provided {
-            Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => {}
-            _ => return Err(StatusCode::UNAUTHORIZED),
-        }
-    }
-    Ok(next.run(req).await)
-}
-
-/// Constant-time string compare so an attacker can't leak the token
-/// via response-time side channels.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 // FromRequestParts so handlers that want the token directly (e.g.

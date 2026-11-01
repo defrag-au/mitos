@@ -74,7 +74,8 @@ async fn start_replace_stop_roundtrip_v2() {
             rx: rx_holder.clone(),
         }
     });
-    let kv_factory: KvFactory = Arc::new(|_id: &str| state_kv::ModuleKv::new_in_memory());
+    let kv_factory: KvFactory =
+        Arc::new(|_key: &mitos_lifecycle::ids::InstanceKey| state_kv::ModuleKv::new_in_memory());
     let emitter_factory: EmitterFactory = Arc::new(emit::EventSink::new);
 
     let host = ModuleHostV2::new(
@@ -215,7 +216,8 @@ async fn start_refuses_a_module_built_against_a_different_wit() {
             rx: rx_holder.clone(),
         }
     });
-    let kv_factory: KvFactory = Arc::new(|_id: &str| state_kv::ModuleKv::new_in_memory());
+    let kv_factory: KvFactory =
+        Arc::new(|_key: &mitos_lifecycle::ids::InstanceKey| state_kv::ModuleKv::new_in_memory());
     let emitter_factory: EmitterFactory = Arc::new(emit::EventSink::new);
 
     let host = ModuleHostV2::new(

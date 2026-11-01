@@ -1,0 +1,51 @@
+[package]
+name = "mitos-holder-table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The holder table: one policy's current holders, grouped by stake credential, classified by mitos-cohort. Exists as both a fold aggregate and a projection over the published book, so the two shapes check each other."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[features]
+default = ["fold"]
+# The two shapes that read a chain or a book: the `Aggregate` over a decoded walk and the
+# `View` over a published book. **Off for a wasm module.** The view links `live-book`, which
+# maps files through `memmap2` and does not build for `wasm32-unknown-unknown`; a module reads
+# a published artifact through `fold-data` and needs neither shape, only the table, its rows
+# file and the envelope it came in.
+fold = ["dep:chain-decode", "dep:live-book"]
+
+[dependencies]
+# The table type, its rows codec and the envelope helpers are unconditional: a module reads a
+# published table and must not link a chain stack or a file mapper to do it. `mitos-fold` stays
+# unconditional because `POLICY_EXTENSION` and `policy_of` *are* the envelope contract — the
+# subject tag is how any reader of this artifact learns which policy the rows belong to. It is
+# dependency-free and builds for `wasm32-unknown-unknown`.
+mitos-cohort = { path = "../mitos-cohort" }
+pallas-addresses.workspace = true
+mitos-fold = { path = "../mitos-fold" }
+chain-decode = { path = "../chain-decode", optional = true }
+# The substrate the view reads. A view of the book has to name the book; the aggregate
+# above does not, which is why the crate carries both shapes rather than one.
+live-book = { path = "../live-book", optional = true }
+
+# The two integration tests drive the fold shapes, so they are absent from a
+# `--no-default-features` build rather than a compile error inside the test.
+[[test]]
+name = "book_view"
+required-features = ["fold"]
+
+[[test]]
+name = "walk"
+required-features = ["fold"]
+
+[dev-dependencies]
+mitos-fold-walk = { path = "../mitos-fold-walk" }
+mitos-community-events = { path = "../mitos-community-events" }
+pallas-traverse.workspace = true
+anyhow = { workspace = true }
+ciborium = "0.2"
+hex = { workspace = true }

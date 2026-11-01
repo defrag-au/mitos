@@ -16,7 +16,7 @@
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::wire::ChainPoint;
-use mitos_protocol::SubscribeTarget;
+use mitos_protocol::{AnnouncedModule, SubscribeTarget};
 
 /// Top-level companion trait. Implemented once per dApp companion.
 /// Owns the channel set, config, schema, and dApp RPC routes.
@@ -29,6 +29,9 @@ use mitos_protocol::SubscribeTarget;
 /// CF DO, which is single-threaded but uses async APIs. All sync
 /// methods on the trait stay as plain `fn`; the macro only
 /// rewrites methods declared `async fn`.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait MitosCompanion: Send + Sync + 'static {
     /// Stable name (matches the indexer's `name()` on the mitos
@@ -120,6 +123,23 @@ pub trait MitosCompanion: Send + Sync + 'static {
         None
     }
 
+    /// The module artifact(s) this worker was BUILT against, announced on
+    /// every subscribe.
+    ///
+    /// Default empty, so no existing companion changes and a worker that
+    /// returns nothing gets a byte-identical subscribe. A worker opts in by
+    /// embedding its `built-module.json` and returning
+    /// [`AnnouncedModule::from_built`] — and by SERVING the two files at
+    /// `BuiltModule::served_paths()` under its own hostname, which is where
+    /// the host will fetch them from.
+    ///
+    /// Announcing is idempotent and cheap: every one of a client's ~91 DOs
+    /// announces the same build, and all but the first are recognised as
+    /// already-in-flight and cause no second fetch.
+    fn announced_modules(&self) -> Vec<AnnouncedModule> {
+        Vec::new()
+    }
+
     /// Drop the portion of the dApp's projected state that
     /// originated from `module`, in preparation for a refill from
     /// the host's bootstrap pass against that one module. Called
@@ -173,6 +193,9 @@ pub trait MitosCompanion: Send + Sync + 'static {
 /// `?Send` is used on the trait method because worker-rs's DO
 /// futures are single-threaded (wasm); requiring `Send` on user
 /// code would be a footgun.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait MitosChannel: 'static {
     /// Stable channel name. Matches the host-side indexer channel
@@ -213,6 +236,9 @@ pub trait MitosChannel: 'static {
 ///
 /// Blanket-impl'd for any `MitosChannel`; dApps never write this
 /// themselves.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait(?Send)]
 pub trait MitosChannelDyn: 'static {
     /// Stable channel name (matches `MitosChannel::NAME`).

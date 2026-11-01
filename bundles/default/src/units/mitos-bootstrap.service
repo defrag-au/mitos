@@ -1,0 +1,21 @@
+[Unit]
+Description=mitos bootstrap (Mithril fetch + import)
+Documentation=https://github.com/defrag-au/mitos
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Slice=mitos.slice
+# False after a successful bootstrap, so this unit is skipped. A skipped
+# Condition satisfies Requires= from mitos.service — that is what we want
+# AFTER bootstrap, and must not be what happens after a FAILED one
+# (.bootstrapped is written last, only on success).
+ConditionPathExists=!__MITOS_DATA_DIR__/.bootstrapped
+Environment=MITOS_CONFIG=__MITOS_CONFIG__
+ExecStart=__MITOS_EXEC__ bootstrap
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

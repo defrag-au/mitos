@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# PATH shim in front of nix's zig. cargo-zigbuild invokes `zig cc`; rustc
+# still injects -Wl,--fix-cortex-a53-843419, which zig 0.16 rejects.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REAL=""
+while IFS= read -r p; do
+    if [[ "$p" == "$HERE/zig" ]]; then
+        continue
+    fi
+    REAL="$p"
+    break
+done < <(type -ap zig 2>/dev/null || true)
+if [[ -z "$REAL" ]]; then
+    echo "scripts/zig: no real zig on PATH" >&2
+    exit 127
+fi
+filtered=()
+for a in "$@"; do
+    case "$a" in
+        *fix-cortex-a53-843419*) continue ;;
+    esac
+    filtered+=("$a")
+done
+exec "$REAL" "${filtered[@]}"

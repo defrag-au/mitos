@@ -1,0 +1,45 @@
+# live-book — the on-disk format of the live UTxO set, and a read-only view of it.
+#
+# Extracted from `tools/fold-probe/src/book.rs` on 2026-09-23, when the second
+# consumer appeared. The probe WRITES the artifact and mitos wants to SERVE it,
+# and a binary crate cannot be depended on — so the format and its reader get a
+# home of their own. The builder and the verifier are still the probe's for now;
+# they import this crate rather than keeping a second copy of the layout.
+#
+# Design: ../../docs/design/LIVE_BOOK.md.
+[package]
+name = "live-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The live UTxO set as an immutable artifact: the row store, its three narrow orderings, and a mapping reader over them"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["mmap"]
+# The file-backed path: `MmapSource`, the `open(&Path)` constructors, and the
+# datum table. On for every native consumer, and it must be OFF for wasm —
+# `memmap2` cannot build for `wasm32-unknown-unknown`, and a Cloudflare Worker
+# serving a published book needs only the parsing, which is `&[u8]` throughout.
+mmap = ["dep:memmap2"]
+
+[dependencies]
+# The one arm of the credential derivation that is a parse rather than a slice.
+# Nothing else here needs pallas: a row's outref is a `[u8; 32]`, not pallas's
+# `Hash<32>`, so the format is independent of that type on purpose — whoever
+# holds a `Hash<32>` converts once at the boundary.
+pallas-addresses = { workspace = true }
+# Blake2b-256, for the content-addressed name of a published datum object: the
+# digest in the key is what makes a re-capture that finds the same datums land on
+# the same object and upload nothing, and what lets a reader check what it fetched
+# against the key it asked for. Already in this crate's graph through
+# `pallas-addresses`, so this is a direct declaration and not a new crate in the
+# build; the format stays keyed on `[u8; 32]` rather than on a pallas type.
+pallas-crypto = { workspace = true }
+# Read-only mappings, as `tx-index` and `policy-index` map their bases. The
+# artifact is published whole and swapped by rename, so a mapping never observes
+# a write. Optional because it does not build for wasm — see the `mmap` feature.
+memmap2 = { workspace = true, optional = true }
+anyhow = { workspace = true }

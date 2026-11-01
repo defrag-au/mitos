@@ -1,0 +1,20 @@
+[package]
+name = "event-firehose"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A terminal firehose over the chain-events NDJSON stream"
+
+[[bin]]
+name = "event-firehose"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+chain-events = { workspace = true }
+clap = { workspace = true }
+crossterm = "0.28"
+hex = { workspace = true }
+ratatui = "0.29"
+serde_json = { workspace = true }

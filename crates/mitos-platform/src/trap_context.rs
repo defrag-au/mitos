@@ -484,16 +484,18 @@ pub enum FixtureWriteError {
 }
 
 /// Write a captured log as a fixture TOML to `path`. Caller
-/// supplies the path (the host knows where the per-module
-/// directory is via `ModuleStorage`).
+/// supplies the path (the host knows where the per-instance
+/// directory is via `ModuleStorage::last_trap_path`).
+///
+/// The parent directory must already exist. A trap can fire at any moment,
+/// including the instant `activate` is renaming the instance directory, and
+/// creating the parent here would resurrect the old path — see
+/// `ModuleStorage::write_instance_marker` for why that must not happen.
 pub fn write_fixture(
     log: &TrapContextLog,
     module_id: &str,
     path: &std::path::Path,
 ) -> Result<(), FixtureWriteError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let toml = render_fixture_toml(log, module_id);
     std::fs::write(path, toml)?;
     Ok(())

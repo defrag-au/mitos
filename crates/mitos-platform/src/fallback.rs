@@ -39,6 +39,9 @@ pub struct FallbackError(pub String);
 
 /// A pluggable source for chain data that dolos can't serve past its
 /// archive horizon.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait FallbackProvider: Send + Sync {
     /// Auxiliary-data (tx metadata) CBOR for a tx by hex hash.

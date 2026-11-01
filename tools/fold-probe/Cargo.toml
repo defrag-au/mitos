@@ -1,0 +1,61 @@
+# fold-probe — what a UTxO fold over the Mithril chunk log actually costs.
+#
+# A measurement tool, not a service. It depends on `tx-index` for
+# `list_chunks` (the one place that decides which chunks are complete) and on
+# `mitos-chain-walk` for `CHUNK_SLOTS`, so the windows it reports agree with
+# the walkers. `pallas-addresses` is here for `byron::AddressPayload`: pallas
+# hands a Byron address over as an opaque byte string, so the only way to check
+# one is to make it parse as what it claims to be. No new external crates:
+# every dependency below is already in `[workspace.dependencies]`.
+[package]
+name = "fold-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Measure decode/apply split, same-chunk spend rate and live-set size for a UTxO fold over Mithril chunks"
+
+[[bin]]
+name = "fold-probe"
+path = "src/main.rs"
+
+[dependencies]
+# The artifact format and its reader. Extracted on 2026-09-23 because the second
+# consumer appeared: the probe WRITES the book and mitos wants to SERVE it. The
+# probe is now a client of the layout rather than its owner — the row offsets,
+# the entry shape, the directory fill and the policy table live there.
+live-book = { path = "../../crates/live-book" }
+# The offer pass's two registries of truth: which marketplace contracts carry
+# collection offers (the registry, shared with the frontend and the ledger tool)
+# and how each venue's datum reads (the decode crate, shared with the backfill).
+# `OFFER_INDEX_FORMAT.md` §7 step 3 is what they are here for.
+address-registry = { workspace = true }
+mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
+# Structured timing, so a number this tool prints can be compared with one another
+# tool prints — one vocabulary of operation names, one report shape.
+mitos-meter = { path = "../../crates/mitos-meter" }
+# The fold plane's contract, walker and first aggregate. The pilot command uses all
+# three so the same walk can write the book and the holder table.
+mitos-fold = { path = "../../crates/mitos-fold" }
+mitos-fold-walk = { path = "../../crates/mitos-fold-walk" }
+mitos-holder-table = { path = "../../crates/mitos-holder-table" }
+
+tx-index = { path = "../../crates/tx-index" }
+mitos-chain-walk = { path = "../mitos-chain-walk" }
+
+# The metadata readers, both of them: `cip25_metadata_value` /
+# `asset_from_metadata_value` are the document path the live modules and
+# collection-ownership run, and `decode_document` is the direct `Metadatum` walk
+# that replaced the probe's own copy of it. The comparison is between two readers
+# of one crate rather than between a crate and a probe, which is what made the
+# move worth doing. In `[workspace.dependencies]`, so the "no new external
+# crates" rule above still holds.
+cardano-assets = { workspace = true }
+hex = { workspace = true }
+
+pallas-addresses = { workspace = true }
+pallas-codec = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-traverse = { workspace = true }
+
+clap = { workspace = true }
+anyhow = { workspace = true }

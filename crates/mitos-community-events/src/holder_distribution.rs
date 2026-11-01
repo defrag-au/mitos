@@ -90,6 +90,42 @@ pub enum HolderRole {
     VestingContract,
 }
 
+/// The supply cohort a holder belongs to. Mirrors `mitos_cohort::Cohort` on
+/// the wire, deliberately without making every consumer link the classifier's
+/// decode stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cohort {
+    /// Provably unspendable. Removed from supply, permanently.
+    Burn,
+    /// Sitting on a launchpad bonding curve, unsold. Nobody has ever owned it.
+    Inventory,
+    /// A DEX pool or a staking contract holding holders' tokens.
+    Pool,
+    /// A vesting or time lock.
+    Vesting,
+    /// A script nobody has named.
+    Script,
+    /// A plain holder.
+    #[default]
+    Wallet,
+}
+
+/// How a [`Cohort`] was established — what the claim rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// The address cannot spend: a registered burn sink.
+    Proven,
+    /// A decoded contract or datum named it.
+    Decoded,
+    /// The tracker's own registry named it, without a datum.
+    Registered,
+    /// The address's shape (key vs script) is all that was read.
+    #[default]
+    Chain,
+}
+
 /// One holder's stake of one policy. For pure fungible tokens
 /// `assets` is length-1; for NFT-collection policies it can be
 /// length-N where each entry is a distinct asset name held by
@@ -110,11 +146,19 @@ pub struct HolderEntry {
     /// `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md`.
     #[serde(default)]
     pub lp_amount: u64,
-    /// The module's role tag for this holder. The worker's
-    /// classifier reads this first, then overrides with config
-    /// (e.g. enterprise → burn) where applicable.
+    /// The module's role tag for this holder. Superseded by [`HolderEntry::cohort`]
+    /// for anything that needs the full vocabulary; retained for the parked
+    /// notification path and for consumers that have not moved.
     #[serde(default)]
     pub role: HolderRole,
+    /// The ONE supply classification, from the address the module actually saw.
+    /// Includes burn sinks, unnamed scripts and launchpad inventory that the
+    /// module's own decomposition never needed to know about.
+    #[serde(default)]
+    pub cohort: Cohort,
+    /// How [`HolderEntry::cohort`] was established.
+    #[serde(default)]
+    pub basis: Basis,
     /// Vesting decomposition — the lock positions beneficially
     /// owned by this holder (the "Vested" band). Reuses
     /// `vesting_tracker::LockEntry` so the per-module
@@ -210,4 +254,58 @@ pub fn decode_emit(channel: u32, payload: &[u8]) -> Option<String> {
     }
     let event: HolderEvent = ciborium::de::from_reader(payload).ok()?;
     serde_json::to_string_pretty(&event).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id() -> HolderId {
+        HolderId::Stake("00".repeat(28))
+    }
+
+    #[test]
+    fn a_cohort_and_basis_round_trip_through_cbor() {
+        let entry = HolderEntry {
+            id: id(),
+            assets: Vec::new(),
+            lp_amount: 7,
+            role: HolderRole::DexPool,
+            cohort: Cohort::Pool,
+            basis: Basis::Decoded,
+            vests: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&entry, &mut bytes).expect("encode");
+        let back: HolderEntry = ciborium::de::from_reader(bytes.as_slice()).expect("decode");
+        assert_eq!(back, entry);
+    }
+
+    /// A payload written before `cohort` existed must still decode, and must
+    /// not invent a classification it was never told.
+    #[test]
+    fn a_payload_without_a_cohort_reads_as_wallet_chain() {
+        #[derive(Serialize)]
+        struct Old<'a> {
+            id: &'a HolderId,
+            assets: &'a [AssetBalance],
+            lp_amount: u64,
+            role: HolderRole,
+            vests: &'a [crate::vesting_tracker::LockEntry],
+        }
+
+        let identity = id();
+        let old = Old {
+            id: &identity,
+            assets: &[],
+            lp_amount: 0,
+            role: HolderRole::Wallet,
+            vests: &[],
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&old, &mut bytes).expect("encode");
+        let back: HolderEntry = ciborium::de::from_reader(bytes.as_slice()).expect("decode");
+        assert_eq!(back.cohort, Cohort::Wallet);
+        assert_eq!(back.basis, Basis::Chain);
+    }
 }

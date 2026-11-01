@@ -1,0 +1,63 @@
+[upstream]
+peer_address = "backbone.mainnet.cardanofoundation.org:3001"
+
+[storage]
+version = "v3"
+path = "data"
+
+[storage.state]
+backend = "fjall"
+cache = 500
+max_history = 604800
+
+[storage.archive]
+backend = "redb"
+
+[genesis]
+byron_path = "byron.json"
+shelley_path = "shelley.json"
+alonzo_path = "alonzo.json"
+conway_path = "conway.json"
+
+[sync]
+max_history = 604800
+max_rollback = 129600
+
+[submit]
+prune_height = 200
+
+# NOTE: mitos embeds dolos as its chain follower + state store but does
+# NOT start dolos's serve stack (mitos_core::setup_domain only inits the
+# follower). These [serve.*] sections are therefore VESTIGIAL — the only
+# one mitos reads is [serve.minibf], and only to mount the minibf bridge
+# onto mitos's OWN listener (BUNDLE_LISTEN), not to bind these ports. The
+# real serve ports are owned by the standalone dolos-mainnet service.
+# Kept here matching dolos-mainnet's numbers for self-documentation.
+[serve.grpc]
+listen_address = "127.0.0.1:50051"
+
+[serve.ouroboros]
+listen_path = "dolos.socket"
+
+[serve.minibf]
+listen_address = "127.0.0.1:3000"
+
+[serve.minikupo]
+listen_address = "127.0.0.1:1442"
+
+[serve.trp]
+listen_address = "127.0.0.1:8164"
+
+[mithril]
+aggregator = "https://aggregator.release-mainnet.api.mithril.network/aggregator"
+genesis_key = "5b3139312c36362c3134302c3138352c3133382c31312c3233372c3230372c3235302c3134342c32372c322c3138382c33302c31322c38312c3135352c3230342c31302c3137392c37352c32332c3133382c3139362c3231372c352c31342c32302c35372c37392c33392c3137365d"
+# Ancillary verification key — required by dolos v1.2.0's incremental
+# `cardano_database` (UTxO-HD) snapshot validation. From dolos's built-in
+# KnownNetwork::CardanoMainnet default; without it bootstrap fails snapshot
+# certificate validation. (mainnet)
+ancillary_key = "5b32332c37312c39362c3133332c34372c3235332c3232362c3133362c3233352c35372c3136342c3130362c3138362c322c32312c32392c3132302c3136332c38392c3132312c3137372c3133382c3230382c3133382c3231342c39392c35382c32322c302c35382c332c36395d"
+
+[chain]
+type = "cardano"
+magic = 764824073
+is_testnet = false

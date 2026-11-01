@@ -8,12 +8,20 @@
 
 Make mitos the authoritative source for *current holders* and *current metadata* of any policy whose tokens behave as **discrete collectible identities** — i.e. each `asset_name_hex` represents a distinct thing (an artwork, a card, a slot, a membership), and quantity-per-`asset_name_hex` is small and meaningful.
 
-Two collection-shaped primitives:
+Two collection-shaped primitives, and the fold plane's reader for the first of them:
 
 | Module | Subscribe → emits |
 |---|---|
 | `collection-holders` | `Snapshot{Begin,Chunk,End}` (all `(asset_name, holder, qty)` tuples at a cursor) + `CollectionDelta` events on asset movement |
 | `collection-metadata` | `MetadataSnapshot` (all `(asset_name, metadata)` pairs at a cursor) + `MetadataUpdate` events for CIP-68 datum rotations |
+| `holders-from-fold` | The same `Snapshot{Begin,Chunk,End}` as `collection-holders`, read from a published fold artifact instead of scanned — **no deltas**; see below |
+
+`holders-from-fold` is the fold plane's reader (`docs/design/FOLD_PLANE.md` §7): the host
+serves a finished `holder-table` artifact through `fold-data`, the module pages `holders.tsv`,
+parses it with the table's own rows codec and emits the identical wire sequence, reporting
+the artifact's base slot in `SnapshotBegin`. It has no interest set and no delta path. A
+consumer that wants live movement pairs it with `collection-holders` for the same
+`companion_key` — same event shape, two cadences, one base to pair on.
 
 A consumer subscribing to both for the same `companion_key` gets the entire "what does this collection currently look like, and how does it change" picture in two parallel typed event streams. CIP-25 and CIP-68 are presented uniformly — see [The CIP-68 Facade](#the-cip-68-facade-for-cip-25).
 

@@ -45,6 +45,7 @@
 //! consumer needed v1 dispatch.
 
 pub mod admin;
+pub mod auth;
 pub mod backfill_v2;
 pub mod bindings_v2;
 pub mod bootstrap_v2;
@@ -57,6 +58,7 @@ pub mod emissions;
 pub mod event_bindings;
 pub mod events;
 pub mod fallback;
+pub mod fetch;
 pub mod follower_v2;
 pub mod host_fns;
 pub mod host_fns_v2;
@@ -66,11 +68,15 @@ pub mod indexer_data_cache;
 pub mod inspect;
 pub mod koios;
 pub mod lag_tolerant;
+pub mod lifecycle;
 pub mod local_tx_index;
 pub mod maestro;
 pub mod maestro_fallback_plane;
 pub mod manifest;
+pub mod moves;
 pub mod registry_v2;
+pub mod rows;
+pub mod selected_plane;
 pub mod storage;
 pub mod supervisor;
 pub mod trap_context;
@@ -79,6 +85,9 @@ pub mod watchdog;
 pub mod watched_ref_index;
 
 pub use budget::{AdaptiveSizer, BudgetLimiter, TrapClass};
+/// Re-exported so `bundle.rs` can choose the live-book plane without a
+/// separate dependency on `mitos-data-plane`.
+pub use mitos_data_plane::BookDataPlane;
 /// Re-exported so bundle consumers can construct
 /// `Arc<dyn ChainDataPlane>` to pass into
 /// `admin::admin_router_with_host` without a separate dep on
@@ -145,6 +154,45 @@ pub enum PlatformError {
     /// Maps to HTTP 504 from the admin endpoint.
     #[error("recapture coordination failed: {0}")]
     RecaptureCoordination(String),
+
+    /// A whole-module operation (recapture, evict) was asked of a module
+    /// that has more than one instance. Both were written when a module WAS
+    /// an instance; neither has a defined meaning across two, so they refuse
+    /// rather than pick one. Unreachable in production, where every module
+    /// has exactly one instance.
+    #[error(
+        "module `{module}` has {found} instances; recapture and evict are whole-module \
+         operations and have no defined meaning across more than one"
+    )]
+    MultipleInstances { module: String, found: usize },
+
+    /// A reap asked for the instance `current.toml` points at, while the
+    /// module has others.
+    ///
+    /// Removing it would leave the pointer naming a directory that is gone
+    /// and every `&str`-addressed tool — the admin routes, the watchdog, the
+    /// operator CLI — resolving to whichever sibling the crash repair happens
+    /// to pick. Choosing a successor is part of the switch (WO-09); until
+    /// then the case cannot arise outside a test.
+    #[error(
+        "`{instance}` is module `{module}`'s current instance and it has {siblings} sibling(s); \
+         reaping it would leave current.toml pointing at nothing"
+    )]
+    CurrentInstanceHasSiblings {
+        module: String,
+        instance: String,
+        siblings: usize,
+    },
+
+    /// The dialer's drain did not release an instance's emissions store
+    /// within the bound. It releases between ticks, and a tick can be held
+    /// up for as long as a companion takes to time out. NOT a failure of the
+    /// reap: the request stays queued, and the retry finds it done.
+    #[error(
+        "the drain for module `{module}` is mid-tick and has not yet released instance \
+         `{instance}`; the reap will be retried"
+    )]
+    DrainBusy { module: String, instance: String },
 }
 
 pub type PlatformResult<T> = Result<T, PlatformError>;

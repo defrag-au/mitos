@@ -19,8 +19,32 @@ market-ledger stats --db ledger.db                    # corpus-sanity report
 market-ledger seal --db ledger.db --out-dir parquet   # completed months → Parquet (duckdb CLI)
 market-ledger upload --db ledger.db --endpoint <url>  # hot window → worker D1 ingest
 market-ledger serve --db ledger.db                    # HTTP read surface (compact binary)
+market-ledger events --db ledger.db --policy <hex>    # one policy as `chain-events` NDJSON
 market-ledger follow --db ledger.db                   # chainsync tip tail (resumes from walk cursor)
 ```
+
+## Events (the achievements input)
+
+`events` reads the ledger's own rows and writes one `chain-events` line per market fact, in
+slot order. It reuses both halves of the existing read path — `serve`'s page builder to
+intern the rows, and `chain_events_cardano::market::Collection::from_market_page` to
+translate — so a row exported here and the same row fetched over HTTP are the same page, and
+the two readers of one ledger cannot drift.
+
+```sh
+market-ledger events --db ledger.db --policy e6ba9c0f… --out .tmp/streams2
+```
+
+History is what this mode exists for: every predicate on the achievements market axis is an
+"ever did X" question, and the live companion feed starts at its deployment rather than at
+the collection's first sale. `--partial` states that the walk began after the collection's
+first market fact; the tool prints the slot range it wrote so the claim is checkable.
+
+**The transaction's block position is not carried.** Neither the ledger schema nor the
+postcard wire stores `tx_index`, so it is written as `0` — the same "the source does not
+say" convention the OpenSea adapter uses. It is a coordinate, not identity: it is not hashed
+into `EventId`, so a producer that later knows the position can fill it in without rewriting
+an id.
 
 ## Where it runs
 

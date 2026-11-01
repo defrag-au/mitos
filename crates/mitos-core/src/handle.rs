@@ -47,6 +47,9 @@ const BROADCAST_CAPACITY: usize = 4096;
 /// heterogeneous collections. All methods take only `Send + Sync`
 /// types — the indexer's `Scope` and `Change` are erased behind CBOR
 /// bytes.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait IndexerHandle: Send + Sync {
     fn name(&self) -> &'static str;
@@ -525,6 +528,9 @@ where
 /// call and Ack/Nack into the emissions log status update path.
 /// Object-safe so `Box<dyn InboundFrameHandler>` flows through
 /// the indexer-handle / run_subscriber surface.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait InboundFrameHandler: Send + Sync {
     /// Called on `ClientMessage::Interest`. `items` is the typed

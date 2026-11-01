@@ -29,11 +29,14 @@
 
 pub mod block_events;
 pub mod dispatch;
+pub mod fold_artifact;
 pub mod impls;
 pub mod types;
 
 #[cfg(test)]
 mod tests;
+
+pub use fold_artifact::{FoldArtifact, FoldError, MAX_PAGE as MAX_FOLD_PAGE};
 
 pub use types::{
     AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip,
@@ -46,7 +49,8 @@ pub use types::{
 };
 
 pub use impls::{
-    LocalDataPlane, UTXOS_BY_ADDRESS_HARD_CAP, extract_aux_cbor, project_typed_output,
+    BookDataPlane, LocalDataPlane, UTXOS_BY_ADDRESS_HARD_CAP, extract_aux_cbor,
+    project_typed_output,
 };
 
 use async_trait::async_trait;
@@ -65,6 +69,9 @@ use cardano_assets::PolicyId;
 /// in-process impls return immediately; IPC / wasm / gRPC impls
 /// genuinely await. Consumers don't need to special-case the
 /// transport.
+// `async_trait` adds a bare `#[must_use]` to every generated async method, and
+// these return a `Result`, which is already `#[must_use]`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ChainDataPlane: Send + Sync {
     /// Fetch a single output by reference. Returns `None` if the

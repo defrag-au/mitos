@@ -547,6 +547,23 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         Err(CompanionError::UnknownChannel(name.to_string()))
     }
 
+    /// The key mitos routes deliveries back to this companion by.
+    ///
+    /// The dApp Worker names the object with `id_from_name(companion_key)`, so
+    /// the name round-trips here. `wrangler dev`'s local runtime reports no
+    /// name from inside the object (workerd#2240), and an empty key is rejected
+    /// by the host (`1..=128` chars) — so fall back to the object's unique id,
+    /// which is the same identity in hex: stable across restarts, distinct per
+    /// instance, and never empty. The companion's `NAME` is deliberately not a
+    /// fallback: it is the *type*, so two instances would collide in the host's
+    /// registry.
+    fn companion_key(&self) -> String {
+        let id = self.state.id();
+        id.name()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     // ========================================================================
     // Route handlers
     // ========================================================================
@@ -559,17 +576,12 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
     /// `SubscribeRequest` to the mitos host, and caches the result so
     /// subsequent wakes can short-circuit.
     async fn handle_wake(&self) -> worker::Result<Response> {
-        // The companion key is the DO's own name — the dApp Worker
+        // The companion key is the DO's own identity — the dApp Worker
         // creates the DO with `id_from_name(companion_key)`, so
         // `state.id().name()` round-trips. Multi-tenant dApps that
         // want richer key derivation (e.g. per-customer) override
         // by passing the name explicitly through their wrapper.
-        let companion_key = self
-            .state
-            .id()
-            .name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        let companion_key = self.companion_key();
 
         let sql = self.state.storage().sql();
         let resume_from = meta::read_cursor(&sql)?;
@@ -638,6 +650,11 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         // `Module { name: C::NAME }` for backward compat with
         // single-wasm-module companions.
         let targets = self.inner.subscribe_targets();
+        // What this worker was BUILT against. Empty for every companion that
+        // has not opted in, and then the request encodes exactly as it always
+        // did. Every one of a client's DOs announces the same build; the host
+        // recognises all but the first as already in flight.
+        let announced = self.inner.announced_modules();
         let request = SubscribeRequest {
             targets,
             companion_key,
@@ -645,10 +662,21 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
             resume_from,
             interests,
             dial_back,
+            announced,
         };
 
         match subscribe_via_env(&self.env, &request).await {
             Ok(resp) => {
+                // An announcement never fails the subscribe, so an outcome is
+                // reported rather than acted on: a refusal leaves this
+                // companion registered and served where it already was.
+                for outcome in &resp.announced {
+                    tracing::info!(
+                        module = %outcome.module,
+                        result = ?outcome.result,
+                        "announcement outcome",
+                    );
+                }
                 tracing::info!(
                     next_emission_id = resp.next_emission_id,
                     "subscribe call succeeded"
@@ -797,12 +825,7 @@ impl<C: MitosCompanion> MitosCompanionRuntime<C> {
         value: &str,
         channel: &str,
     ) -> Result<()> {
-        let companion_key = self
-            .state
-            .id()
-            .name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        let companion_key = self.companion_key();
         let row = crate::interest::InterestRow {
             kind: kind.to_string(),
             value: value.to_string(),

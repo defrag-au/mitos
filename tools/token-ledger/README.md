@@ -37,6 +37,32 @@ token-ledger reverse --archive-dir <dir> --token <policy> --data-dir <db> \
     [--days N | --to-slot S] [--first-mint S] [--probe-first-mint] \
     [--policy-index-dir <dir>] [--tx-index-dir <dir>] [--no-observe]
 
+# The independent forward derivation. With --events it also writes the same rows as
+# chain-events NDJSON on stdout (logs stay on stderr), which `event-firehose` draws.
+# `--policy` takes a bare 56-hex id and is repeatable; it needs no registry, and each
+# policy gets its own <policy>.db. Ids are derived from the fact, so ingesting the
+# finished archive later upserts over the stream instead of duplicating it.
+token-ledger walk --data-dir <db> (--token <name-or-unit> | --policy <hex>...) \
+    [--from-slot S] [--max-blocks N] [--events]
+
+# A whole project from one file: the snapshot, where each ledger lives, and every
+# collection. The NFT and the token are separate policies, so each gets its own db, and
+# `event-firehose --profile <file>` runs exactly this as its child.
+token-ledger walk --profile profiles/perps.toml [--events] [--max-blocks N] [--fresh]
+
+# One file per collection instead of one stdout run after another. A profile walks its
+# collections in turn and their runs do NOT overlap in time — Perps starts where $PERP
+# has been trading for ten months — so anything that needs chain order wants the split:
+# `event-merge --policy <a> --policy <b> streams/*.ndjson > perps.ndjson`.
+token-ledger walk --profile profiles/perps.toml --events --events-out .tmp/streams
+
+# A collection that is not in tokens.toml. Keep the stream for the viewer: write it to a
+# file and let `event-firehose --follow` read it, so the viewer keeps the terminal for keys
+# and the run stays replayable (the pipe works too, but only in a real terminal):
+token-ledger walk --data-dir <db> --policy <hex> --from-slot S --events \
+    > .tmp/perps.ndjson 2> .tmp/walk.log
+event-firehose .tmp/perps.ndjson --follow
+
 # Read an archive back the way a Worker would — footers first, then only the
 # row groups a page needs — and report what it cost in requests and bytes.
 # Also prints the supply reconciliation, observations, trades and density.
@@ -45,18 +71,34 @@ token-ledger archive --archive-dir <dir> --policy <policy> [--density]
 # Party-to-party movement graph. --by-stake is usually what you want.
 token-ledger graph --archive-dir <dir> --policy <policy> --by-stake --write
 
+# The whole life, folded once for the edge: daily and hourly candles, holders
+# per day, the distribution by share band and role, the top 500 holders, and
+# balance checkpoints every ~25k movements (complete archives only). Written
+# beside the series when a walk completes; `publish` carries summary.bin and
+# checkpoints/ to R2. This forces a fold and prints what is in it. $NIKEPIG:
+# 4.6 s, a 184 KB summary, 28 checkpoints totalling 14.6 MB.
+token-ledger summary --archive-dir <dir> --policy <policy>
+
 token-ledger rollup    # fold a policy's passes into one file
 token-ledger bundle    # manifest + every footer, one blob for KV
-token-ledger publish   # R2 + KV, by hand, with a per-step record
+token-ledger publish   # R2 + KV, one policy, by hand, with a per-step record
+token-ledger pull      # one policy's published archive from R2 into --archive-dir
+                       # (--derived adds summary, checkpoints, graph). The local-dev
+                       # source for fold work: what the Worker reads, no box needed.
+                       # Same R2_* variables as publish; use a READ-ONLY token.
+token-ledger sync      # keep R2 + KV level with the archives on disk (its own service)
 token-ledger export    # the artifacts a frontend loads
 token-ledger stats     # derived balances at tip — the reconciliation surface
 token-ledger classify  # cohort a set of addresses
 token-ledger probe     # what a policy looks like before committing to a walk
 
 # The hosted surface: any token on demand, behind a poll endpoint.
-token-ledger serve --data-dir <db> --archive-dir <dir> [--publish-archive] \
+token-ledger serve --data-dir <db> --archive-dir <dir> \
     [--tx-index-dir <dir>] [--policy-index-dir <dir>] [--tail-db <spool>] \
     [--walk-workers 4] [--seek-workers 20]
+
+# Publishing is NOT part of serve: a slow upload cannot delay the tail refresh.
+token-ledger sync --archive-dir <dir> [--interval 15] [--concurrency 8] [--once]
 ```
 
 ## Serve surface

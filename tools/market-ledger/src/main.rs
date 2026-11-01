@@ -1,7 +1,8 @@
 //! market-ledger — deep marketplace-history walker + ledger for CNFT venues.
 //!
-//! One binary, three modes: `walk` (snapshot walk into a local ledger), `serve`
-//! (HTTP read surface, compact binary), `follow` (phase 3, self-contained
+//! One binary, four modes: `walk` (snapshot walk into a local ledger), `serve`
+//! (HTTP read surface, compact binary), `events` (the ledger read as
+//! `chain-events` NDJSON), `follow` (phase 3, self-contained
 //! chainsync tip tail — see the design doc's "Follow mode"). Decode stays in
 //! `mitos-marketplace-decode`; this tool maps certified chain data into that
 //! crate's `DecodeTx` and stores what it returns. NOT a second follower STORE —
@@ -10,6 +11,7 @@
 
 mod buffer;
 mod checkpoint;
+mod events;
 mod follow;
 mod metadata;
 mod prune;
@@ -53,6 +55,8 @@ enum Command {
     Prune(prune::PruneArgs),
     /// Serve the ledger over HTTP (compact binary read surface).
     Serve(serve::ServeArgs),
+    /// Export a policy's market history as `chain-events` NDJSON (the achievements input).
+    Events(events::EventsArgs),
     /// Follow the chain tip via self-contained chainsync (resumes from the walk cursor).
     Follow(follow::FollowArgs),
 }
@@ -74,6 +78,7 @@ fn main() -> Result<()> {
         Command::Reset(args) => checkpoint::run_reset(args),
         Command::Prune(args) => prune::run(args),
         Command::Serve(args) => serve::run(args),
+        Command::Events(args) => events::run(args),
         Command::Follow(args) => follow::run(args),
     }
 }

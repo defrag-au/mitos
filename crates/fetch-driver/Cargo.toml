@@ -1,0 +1,37 @@
+# fetch-driver — readiness-driven dispatch for ranged object reads.
+#
+# A reader of a published artifact does not know its whole question up front: the
+# rows worth reading are discovered from the entries that answer the first read,
+# a window worth widening is discovered from a row that would not parse, and a
+# payload's offset is discovered from the window that indexes it. Today that is
+# expressed as phases — plan everything for this stage, await it all, plan the
+# next — and a phase waits for its slowest item, so every boundary costs a round
+# trip for work that was computable long before.
+#
+# This crate is the other shape: a queue of wants, dispatched as readiness
+# arrives, bounded by the protocol rather than by the stage. It is pure — no
+# I/O, no async, no runtime, no clock — so the browser, a Worker and a test drive
+# the same core, and the tests are a scripted transport rather than a HAR.
+#
+# See `mitos/docs/design/MITOS_AT_THE_EDGE.md` §10.2 for why the client is the
+# one that batches.
+[package]
+name = "fetch-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Readiness-driven dispatch for ranged object reads: wants in, planned requests out, no I/O"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The planning half this crate drives: wants → batches per object, ascending,
+# coalesced, capped at the protocol's 299 ranges. Taken as given rather than
+# reimplemented — a second copy of that arithmetic is how the two cap constants
+# in the frontend drifted (256 in the chunk reader, 299 in `plan`).
+#
+# `default-features = false` is not decoration: the default feature is `mmap`,
+# whose `memmap2` cannot build for `wasm32-unknown-unknown`, and the first
+# consumer of this crate is a browser.
+live-book = { path = "../live-book", default-features = false }

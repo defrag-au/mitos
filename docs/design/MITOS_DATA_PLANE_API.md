@@ -27,6 +27,8 @@ trait is the foundation that the wasm host-function surface
 (historically called "Phase C") sits on.
 
 Cross-references:
+- `PHONEBOOK_COVERAGE.md` — this surface mapped method by method
+  onto the live book, and what the book cannot yet answer
 - `MITOS_ISOLATION_ROADMAP.md` — host fn surface for wasm modules
   is one transport for this API
 - `SUBSCRIPTION_MECHANICS.md` — `Interest` is the *event filter*

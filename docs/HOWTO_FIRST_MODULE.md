@@ -428,11 +428,70 @@ tables (`mitos_companion_meta`, `mitos_companion_interest`).
 ```bash
 $ cd workers/<my-worker>
 $ mitos-build --crate-name <feature> --module-id <feature>
-# emits:  modules/target/mitos/<feature>/{<feature>.wasm, manifest.toml, config.cbor}
+# emits:  modules/target/mitos/<feature>/
+#           <feature>.wasm  manifest.toml  config.cbor  built-module.json
 ```
 
 Release-only — debug builds fuel-exhaust on realistic blocks.
 See `design/MITOS_BUILD.md` for the full CLI.
+
+`built-module.json` holds the digests of what was just built — the wasm, its
+manifest, and the config. A worker embeds it so it can tell the host, on
+subscribe, exactly which artifact it was built against. Nothing reads it yet.
+
+## Declaring a revision
+
+A module can declare what it is and what a consumer must do when it changes.
+Everything here is OPTIONAL: a module that declares nothing is revision 0,
+schema 0, no upgrades — which is what every module built before this existed
+is, and it behaves exactly as it always has.
+
+```toml
+[lifecycle]
+revision = 5
+state_schema = 2
+
+[[lifecycle.upgrade]]
+since = 3
+actions = ["recapture"]
+```
+
+**`revision`** — bump it on any change a consumer could observe: a new field
+on an emission, a different interpretation of an existing one, a bug fix that
+changes what gets emitted. It is a build counter, not a version: gaps and
+repeats are fine.
+
+`revision` is **not** identity. What identifies a running instance is
+`(module, wasm sha, config sha)`. Bumping the revision alone moves nobody and
+forks nothing — it is what the host consults to work out which upgrade actions
+a client crosses when it *does* move.
+
+**`state_schema`** — bump it when the module's kv layout changes, so old state
+is no longer something the new code can resume on. Today that means the state
+cannot be carried over at all: there is no `migrate` export in the WIT yet, so
+a schema bump means the instance rebuilds from scratch. Leave it alone if the
+new code can read what the old code wrote.
+
+**`[[lifecycle.upgrade]]`** — what a client must do when it crosses `since`.
+An entry with `since = 3` runs for a client moving from any revision below 3
+to any revision at or above it. The four actions:
+
+| Action | What it does |
+|---|---|
+| `reset-watched` | Clear the new instance's watched-UTxO index when it is created. |
+| `purge-emissions` | Discard the moving client's undelivered emissions on the old instance instead of draining them — for when the old wire shape is not worth delivering. |
+| `resync` | The module re-emits current state to the moving client; its companions keep what they have. |
+| `recapture` | The moving client's companions DROP projected state and are refilled. The heaviest, and the one to reach for when a consumer's stored shape changed. |
+
+`since` must be ≥ 1 and ≤ the module's own `revision`, and no two entries may
+share a `since`. A ledger that breaks those rules fails the BUILD, and the
+host refuses the artifact too — a module is not trusted on the grounds that a
+builder once accepted it. An action name the builder does not recognise is a
+parse error, not a silently skipped entry.
+
+The `[lifecycle]` table is stripped from `config.cbor`, so it never reaches
+the module's own `Config` — which also means you are free to have a config key
+of your own called `revision`.
 
 ## Step 5 — deploy the module to mitos
 

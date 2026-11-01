@@ -1,0 +1,27 @@
+# chain-decode — Cardano chain bytes into the parts a fold or a walker needs.
+#
+# Extracted from `tools/mitos-chain-walk/src/decode.rs` on 2026-09-22. The
+# module was already a *shared* decode — five crates and every walker use it —
+# and it is the seam a hand-rolled, era-specialised decoder will replace, so it
+# gets its own crate before that work starts rather than after.
+#
+# `mitos-chain-walk` re-exports this crate as `decode`, so no call site moved.
+[package]
+name = "chain-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bare-pallas block/tx decode shared by the Mithril walkers and the fold: outputs with datums, inputs with canonical-order redeemers, witness datums, aux data"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The only dependencies are pallas *types* — no I/O, no anyhow, no runtime.
+# `DecodedTx` and friends are mitos types built out of pallas primitives, which
+# is what keeps this crate consumable from a worker, a game, or the platform.
+# The single pallas-traversal coupling is `decode_tx`'s `&MultiEraTx` argument;
+# a hand-rolled decoder takes `&[u8]` plus an era instead.
+pallas-traverse = { workspace = true }
+pallas-primitives = { workspace = true }
+pallas-codec = { workspace = true }

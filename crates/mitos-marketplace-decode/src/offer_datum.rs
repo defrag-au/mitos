@@ -34,6 +34,18 @@ pub struct DecodedOffer {
     pub target_recipient: Option<[u8; 28]>,
 }
 
+impl DecodedOffer {
+    /// The bidder's credential, as the 28 bytes a lookup is keyed by.
+    ///
+    /// ⚠️ **Which credential this is, is the venue's rule, not this one's.** jpg encodes
+    /// the bidder's **payment** pkh and Wayup their **stake** credential, so a caller that
+    /// selected the venue already knows what it is holding; this turns the hex into bytes
+    /// and nothing else.
+    pub fn bidder_credential(&self) -> Option<[u8; 28]> {
+        hex::decode(&self.bidder_pkh).ok()?.try_into().ok()
+    }
+}
+
 fn is_constructor_zero(c: &Constr<PlutusData>) -> bool {
     c.tag == 121 && c.any_constructor.is_none()
 }
@@ -192,5 +204,22 @@ mod tests {
     fn rejects_non_constr_and_wrong_arity() {
         assert!(decode_jpg_offer_datum(&[0x00]).is_none());
         assert!(decode_wayup_offer_datum(&[]).is_none());
+    }
+
+    #[test]
+    fn the_bidder_credential_is_28_bytes_of_hex_and_nothing_else() {
+        let offer = |pkh: &str| DecodedOffer {
+            bidder_pkh: pkh.to_owned(),
+            target_policy: None,
+            target_asset_names: Vec::new(),
+            target_recipient: None,
+        };
+        assert_eq!(
+            offer(&"11".repeat(28)).bidder_credential(),
+            Some([0x11; 28])
+        );
+        assert_eq!(offer(&"11".repeat(27)).bidder_credential(), None);
+        assert_eq!(offer(&"11".repeat(29)).bidder_credential(), None);
+        assert_eq!(offer("not hex").bidder_credential(), None);
     }
 }

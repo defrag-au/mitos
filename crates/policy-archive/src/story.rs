@@ -60,6 +60,8 @@
 /// wrong shape for tens of thousands of events and the module says why.
 pub mod wire;
 
+use std::collections::HashMap;
+
 use crate::feed::FeedRow;
 use crate::observation::{Observation, pricing};
 use crate::trade::{Event, Party, Roles, fold};
@@ -413,12 +415,16 @@ pub fn markers(
         });
     }
 
+    // ⚠️ CURVES ARE SELECTED BY MODEL, NOT BY VENUE, and `is_curve` covers
+    // both the evaluable sort (LumpFun v5, constant-product over effective
+    // reserves) and the deliberately unpriceable one (snek.fun). A second
+    // launchpad lands here without touching this function.
     let mut curve: Vec<&Observation> = all
         .iter()
         .filter(|o| {
             o.decoded
                 .as_ref()
-                .is_some_and(|d| d.pricing == pricing::BONDING_CURVE)
+                .is_some_and(|d| pricing::is_curve(&d.pricing))
         })
         .collect();
     curve.sort_by_key(|o| o.slot);
@@ -435,12 +441,23 @@ pub fn markers(
     // venue happened afterwards. A curve still being traded is not a
     // graduation, and calling it one would put a finish line on a token that
     // never crossed it.
-    if let Some(last) = curve.last() {
+    //
+    // ⚠️ **Only for a curve whose graduation this crate can recognise.** That
+    // is snek.fun, where trading moving to another venue IS the finish line.
+    // LumpFun v5 graduates IN PLACE — same address, same pool, a datum that
+    // flips to AMM mode — and nothing here reads that flip yet, so a marker
+    // inferred from "traded elsewhere" would be a guess about a token that may
+    // simply have found a second venue while still bonding.
+    if let Some(last) = curve.last().filter(|o| {
+        o.decoded
+            .as_ref()
+            .is_some_and(|d| d.pricing == pricing::BONDING_CURVE)
+    }) {
         let traded_elsewhere_after = all.iter().any(|o| {
             o.slot > last.slot
                 && o.decoded
                     .as_ref()
-                    .is_some_and(|d| d.pricing != pricing::BONDING_CURVE)
+                    .is_some_and(|d| !pricing::is_curve(&d.pricing))
         });
         if traded_elsewhere_after {
             out.push(Marker {
@@ -487,6 +504,19 @@ fn intern_pool(
 pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> Story {
     let mut events: Vec<StoryEvent> = Vec::new();
     let mut pools: Vec<PoolIdent> = Vec::new();
+
+    // ⚠️ INDEXED, not scanned. [`direction_of`] is asked once per unit a
+    // transaction moved, so finding the row by scan is O(rows × units) — and
+    // `build_series` deliberately hands `build` a WHOLE archive paged into one
+    // `rows`, which on the widest policy here is 38 MB of movements. That
+    // product is what pinned a worker for minutes on 2026-10-24.
+    //
+    // `or_insert` keeps the FIRST row for a transaction, which is exactly what
+    // `rows.iter().find(..)` returned.
+    let mut by_tx: HashMap<&[u8], &FeedRow> = HashMap::with_capacity(rows.len());
+    for r in rows {
+        by_tx.entry(r.tx_hash.as_slice()).or_insert(r);
+    }
 
     // ⚠️ A trade event carries the venue's CREDENTIAL; a pool observation
     // carries its NAME. Resolve here so both sides of the stream speak the
@@ -544,8 +574,14 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 orders: *orders,
                 amount: *amount,
             },
+            // One leg of a movement that also held a trade: exact.
+            Event::Moved { from, to, amount } => Kind::Transfer {
+                from: from.clone(),
+                to: to.clone(),
+                amount: *amount,
+            },
             // A plain movement: the direction the rows themselves support.
-            Event::Transfer => match direction_of(rows, &f.tx_hash, &f.unit) {
+            Event::Transfer => match direction_of(&by_tx, &f.tx_hash, &f.unit) {
                 Some(k) => k,
                 None => continue,
             },
@@ -580,7 +616,7 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
         // reserves for a later decoder to re-read.
         if o.decoded.is_none()
             && crate::trade::address_parts(&o.address)
-                .is_some_and(|(cred, _)| roles.role_of(&cred).is_some())
+                .is_some_and(|(cred, stake)| roles.role_at(&cred, stake.as_deref()).is_some())
         {
             continue;
         }
@@ -590,6 +626,15 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
                 amount: o.unit_amount,
                 has_datum: o.datum.is_some(),
             },
+            // ⚠️ Only a curve whose price this crate CANNOT compute is a
+            // `CurveState`. `CurveState` carries the raw balances — lovelace in
+            // the UTxO and units actually on the curve — because that is what
+            // the launch timeline plots. A curve that IS priceable (LumpFun v5)
+            // needs its EFFECTIVE reserves to travel with the event, or the
+            // story fold and the observation fold price it differently; it is a
+            // `PoolState` for that reason. The launch timeline still finds it,
+            // through `pricing::is_curve` in [`markers`] and in the `/launch`
+            // route.
             Some(d) if d.pricing == pricing::BONDING_CURVE => Kind::CurveState {
                 pool: intern_pool(&mut pools, o, d),
                 lovelace: o.lovelace,
@@ -648,14 +693,9 @@ pub fn build(rows: &[FeedRow], observations: &[Observation], roles: &Roles) -> S
 /// Reuses [`crate::feed::direction`] so the stream and the feed cannot
 /// disagree about the same transaction — the one place a second
 /// implementation would be invisible.
-fn direction_of(rows: &[FeedRow], tx: &[u8], unit: &[u8]) -> Option<Kind> {
+fn direction_of(by_tx: &HashMap<&[u8], &FeedRow>, tx: &[u8], unit: &[u8]) -> Option<Kind> {
     use crate::feed::Direction;
-    let u = rows
-        .iter()
-        .find(|r| r.tx_hash == tx)?
-        .units
-        .iter()
-        .find(|u| u.name == unit)?;
+    let u = by_tx.get(tx)?.units.iter().find(|u| u.name == unit)?;
     let amount = u.parties.iter().map(|p| p.amount.abs()).max().unwrap_or(0);
     Some(match crate::feed::direction(u) {
         Direction::Mint { to } => Kind::Mint {
@@ -687,6 +727,7 @@ mod tests {
     fn row(tx: u8, slot: u64, unit: &str, net_mint: i64, parties: &[(&str, i64)]) -> FeedRow {
         FeedRow {
             tx_hash: vec![tx; 32],
+            tx_index: 0,
             slot,
             block_time: 1_700_000_000 + slot,
             units: vec![UnitMove {
@@ -870,9 +911,10 @@ mod tests {
         ));
     }
 
-    /// Several parties a side: stated, never resolved to a guess.
+    /// Several parties a side, no venue: transfers whose totals per party are
+    /// the chain's (`trade::exact_transfers` pairs them largest to largest).
     #[test]
-    fn a_batched_move_stays_ambiguous() {
+    fn a_batched_move_is_transfers_with_exact_totals() {
         let rows = vec![row(
             1,
             10,
@@ -881,10 +923,18 @@ mod tests {
             &[("a", -10), ("b", -10), ("c", 12), ("d", 8)],
         )];
         let s = build(&rows, &[], &Roles::default());
-        match &s.events[0].kind {
-            Kind::Ambiguous { parties, .. } => assert_eq!(*parties, 4),
-            k => panic!("expected Ambiguous, got {k:?}"),
+        let mut net: std::collections::BTreeMap<&str, i64> = Default::default();
+        for e in &s.events {
+            let Kind::Transfer { from, to, amount } = &e.kind else {
+                panic!("expected transfers, got {:?}", e.kind);
+            };
+            *net.entry(from.as_str()).or_default() -= amount;
+            *net.entry(to.as_str()).or_default() += amount;
         }
+        assert_eq!(
+            net.into_iter().collect::<Vec<_>>(),
+            vec![("a", -10), ("b", -10), ("c", 12), ("d", 8)]
+        );
     }
 
     /// Curve sightings sharing a slot come back by position up the curve, so a

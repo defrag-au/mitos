@@ -18,6 +18,8 @@
 //!   stop slot, drop dialer state, remove artifact directory.
 //!   Refuses if companion records exist for the module unless
 //!   `?force=true`. Idempotent across re-invocation.
+//! - `GET  /_admin/modules/{id}/instances` — every instance directory
+//!   of a module, and which one `current.toml` points at
 //! - `GET  /_admin/modules/{id}/last-trap` — trap-context fixture
 //! - `GET  /_admin/modules/{id}/emissions` — emissions log
 //! - `DELETE /_admin/modules/{id}/emissions` — purge
@@ -31,36 +33,55 @@
 //!   slot in `X-Mitos-Block-Slot` so the operator can label the
 //!   fixture without a second round trip.
 //!
-//! Auth is a self-contained shared-secret bearer-token
-//! middleware mirroring `mitos-core::auth` rather than depending
-//! on mitos-core (which pulls in the dolos crate transitively).
-//! Multi-user auth is future work; today every endpoint is gated
-//! on a single `MITOS_AUTH_TOKEN`.
+//! Auth lives in [`crate::auth`] — one authenticator for all three
+//! routers, resolving a bearer token to a
+//! `mitos_lifecycle::access::Principal` and asking `authorize` the
+//! rest. This router asks for `Admin(Read)` on `GET` and
+//! `Admin(Mutate)` otherwise, with ONE exception: recapture, which
+//! a worker calls (see `Attempt::RecaptureModule`).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use axum::Json;
-use axum::extract::{Multipart, Path, Query, Request, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
+use mitos_lifecycle::access::{ClientSet, OperatorTokenAsClient};
+// The move's phase, not the instance's — both are called `Phase`, and they
+// describe different things: where a client's move has got to versus what an
+// instance IS.
+use mitos_lifecycle::client_move::{Phase as MovePhase, Stage};
+use mitos_lifecycle::ids::Revision;
+use mitos_lifecycle::instance::{
+    BootAction, DesiredState, Effect, Event, EvictMode, Instance, OperatorCommand, Phase, Rejected,
+};
+use mitos_lifecycle::policy::Tier;
+use mitos_lifecycle::state_prep::StateSchema;
+use mitos_lifecycle::upgrade::Refill;
+
+use crate::auth::{AuthMode, Authenticator};
+use crate::lifecycle::LifecycleError;
 use crate::manifest::{Manifest, ManifestError};
 use crate::storage::{ModuleStorage, StorageError};
 
-/// Auth posture for the admin endpoints.
+/// A shared-secret bearer token, as an OUTBOUND credential.
+///
+/// No longer an inbound gate — that is [`crate::auth::Authenticator`]'s job.
+/// What is left is the dial-back side: the companion dialer and the in-tree
+/// indexer bridge present this token when they call a worker, so the worker
+/// can tell the connection came from mitos rather than from somebody who
+/// guessed the URL.
 #[derive(Clone, Debug)]
 pub struct AuthToken(pub Option<String>);
 
 impl AuthToken {
-    /// Load from `MITOS_AUTH_TOKEN`. If unset, returns open
-    /// mode (every request allowed); a warn-level diagnostic
-    /// is left to callers since this constructor is used by
-    /// production binaries AND tests with different posture
-    /// expectations.
+    /// Load from `MITOS_AUTH_TOKEN`. `None` means the host has no
+    /// shared secret, so dial-backs go out unauthenticated — the
+    /// same posture v2 had.
     pub fn from_env() -> Self {
         match std::env::var("MITOS_AUTH_TOKEN") {
             Ok(t) if !t.is_empty() => Self(Some(t)),
@@ -71,85 +92,6 @@ impl AuthToken {
     pub fn as_deref(&self) -> Option<&str> {
         self.0.as_deref()
     }
-
-    /// Optional **read-only** scope token from `MITOS_READONLY_TOKEN`.
-    /// When set, it authorizes `GET` (read-only) admin endpoints but
-    /// not the mutating ones (recapture/evict/restart/upload/delete/
-    /// purge/replay) — handy for dashboards + agents that should
-    /// observe but not act. Unset → only the full token works.
-    pub fn readonly_from_env() -> Option<String> {
-        match std::env::var("MITOS_READONLY_TOKEN") {
-            Ok(t) if !t.is_empty() => Some(t),
-            _ => None,
-        }
-    }
-}
-
-/// Auth scopes for the admin middleware: a full-access token (any
-/// method) and an optional read-only token (`GET` only). Open mode
-/// (no full token) allows everything, preserving prior behaviour.
-#[derive(Clone)]
-struct AuthScopes {
-    full: Option<String>,
-    readonly: Option<String>,
-}
-
-async fn require_auth(
-    State(scopes): State<AuthScopes>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    // Open mode: no full token configured → allow everything
-    // (mirrors the prior behaviour; the read-only scope is moot).
-    let Some(full) = scopes.full.as_deref() else {
-        return Ok(next.run(req).await);
-    };
-
-    let provided = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "));
-
-    if authorize(full, scopes.readonly.as_deref(), req.method(), provided) {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
-/// Pure authorization decision (extracted for unit testing). `full` is
-/// the configured full token (caller handles open mode). Returns true
-/// when `provided` matches the full token (any method), or matches the
-/// read-only token on a `GET`.
-fn authorize(
-    full: &str,
-    readonly: Option<&str>,
-    method: &axum::http::Method,
-    provided: Option<&str>,
-) -> bool {
-    let Some(provided) = provided else {
-        return false;
-    };
-    if constant_time_eq(provided.as_bytes(), full.as_bytes()) {
-        return true;
-    }
-    // Read-only token → GET only. Every read endpoint in this router is
-    // a GET; every mutation is POST/DELETE, so method is a sound proxy
-    // for "read-only-safe".
-    method == axum::http::Method::GET
-        && readonly.is_some_and(|ro| constant_time_eq(provided.as_bytes(), ro.as_bytes()))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Shared state passed to every handler.
@@ -176,6 +118,19 @@ struct AdminState {
     /// `GET /_admin/events` + records recapture events; the host /
     /// follower record traps into the same instance.
     events: crate::events::EventRing,
+    /// The host's authenticator. Handlers do not authorize with it — the
+    /// layers already did — but `GET /_admin/status` reports the posture
+    /// (mode, namespaces, unowned clients) from it.
+    auth: Arc<Authenticator>,
+    /// The instance lifecycle. Every handler that stops, starts, uploads or
+    /// retires a module goes through this rather than calling the host
+    /// directly, because the host has no idea what an operator wants.
+    /// `None` in artifact-only routers, where there is no host either.
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    /// The client rows' manager, for the READ surfaces only: the catch-up
+    /// slot is in memory and this is the only thing that holds it. `None`
+    /// where no worker can announce, and then there is no queue to report.
+    moves: Option<Arc<crate::moves::MoveManager>>,
 }
 
 /// Build the admin router with artifact-only behaviour. Uploads
@@ -186,7 +141,7 @@ struct AdminState {
 /// Production wires the lifecycle-aware variant
 /// `admin_router_with_host` which actually starts running
 /// modules after upload.
-pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
+pub fn admin_router(storage: ModuleStorage, auth: Arc<Authenticator>) -> axum::Router {
     admin_router_inner(
         storage,
         None,
@@ -195,6 +150,8 @@ pub fn admin_router(storage: ModuleStorage, auth: AuthToken) -> axum::Router {
         SystemTime::now(),
         crate::events::EventRing::new(),
         auth,
+        None,
+        None,
     )
 }
 
@@ -220,7 +177,9 @@ pub fn admin_router_with_host(
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     started_at: SystemTime,
     events: crate::events::EventRing,
-    auth: AuthToken,
+    auth: Arc<Authenticator>,
+    lifecycle: Arc<crate::lifecycle::LifecycleManager>,
+    moves: Arc<crate::moves::MoveManager>,
 ) -> axum::Router {
     admin_router_inner(
         storage,
@@ -230,6 +189,8 @@ pub fn admin_router_with_host(
         started_at,
         events,
         auth,
+        Some(lifecycle),
+        Some(moves),
     )
 }
 
@@ -241,7 +202,9 @@ fn admin_router_inner(
     chain_data: Option<Arc<dyn mitos_data_plane::ChainDataPlane>>,
     started_at: SystemTime,
     events: crate::events::EventRing,
-    auth: AuthToken,
+    auth: Arc<Authenticator>,
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    moves: Option<Arc<crate::moves::MoveManager>>,
 ) -> axum::Router {
     let state = AdminState {
         storage,
@@ -250,29 +213,43 @@ fn admin_router_inner(
         chain_data,
         started_at,
         events,
-    };
-    // Auth scopes: the full token (any method) + an optional
-    // read-only token (`GET` only) from `MITOS_READONLY_TOKEN`.
-    let scopes = AuthScopes {
-        full: auth.0,
-        readonly: AuthToken::readonly_from_env(),
+        auth: auth.clone(),
+        lifecycle,
+        moves,
     };
 
-    // Bearer-gated admin surface. The auth layer is applied to this
-    // sub-router only, so the open `/metrics` route below is exempt.
+    // Recapture is its OWN sub-router because it is the one admin route a
+    // WORKER calls: `holder-map`'s production cron recaptures
+    // `holder-distribution` with the same secret it subscribes with. Under
+    // `Admin(Mutate)` — which every namespace token is refused — that cron
+    // would 403 the day its secret is rotated.
+    let recapture = axum::Router::new()
+        .route("/_admin/modules/{id}/recapture", post(recapture_module))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_recapture,
+        ));
+
+    // Everything else: `Admin(Read)` on `GET`, `Admin(Mutate)` otherwise,
+    // decided once in the layer rather than in twenty handlers.
     let authed = axum::Router::new()
         .route("/_admin", get(admin_index))
         .route("/_admin/status", get(status))
         .route("/_admin/events", get(list_events))
         .route("/_admin/modules", get(list_modules))
+        .route("/_admin/catch-up", get(catch_up))
         .route(
             "/_admin/modules/{id}",
             get(get_module).post(upload_module).delete(delete_module),
         )
         .route("/_admin/modules/{id}/restart", post(restart_module))
-        .route("/_admin/modules/{id}/recapture", post(recapture_module))
+        .route("/_admin/modules/{id}/start", post(start_module))
+        .route("/_admin/modules/{id}/pin", post(pin_module))
+        .route("/_admin/modules/{id}/unpin", post(unpin_module))
         .route("/_admin/modules/{id}/evict", post(evict_module))
         .route("/_admin/modules/{id}/companions", get(list_companions))
+        .route("/_admin/modules/{id}/rows", get(list_rows))
+        .route("/_admin/modules/{id}/instances", get(list_instances))
         .route(
             "/_admin/modules/{id}/companions/{client_id}/{companion_key}",
             axum::routing::delete(delete_companion),
@@ -289,15 +266,29 @@ fn admin_router_inner(
         .route("/_admin/utxos", get(get_utxos_by_address))
         .route("/_admin/blocks/{slot}", get(get_block_by_slot))
         .route("/_admin/blocks/by-tx/{tx_hash}", get(get_block_by_tx))
-        .layer(axum::middleware::from_fn_with_state(scopes, require_auth));
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            crate::auth::require_admin,
+        ));
+
+    // Authentication wraps BOTH authorized sub-routers, outermost, so a
+    // handler can only ever run with a `Principal` in its extensions and an
+    // unknown token is a 401 before any `authorize` call is reached.
+    let gated = recapture
+        .merge(authed)
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::authenticate,
+        ));
 
     // `/metrics` is OPEN (no auth), like `/health` — operational
     // gauges/counters for Prometheus, no secrets. Kept in this router
     // (rather than the bundle) so it shares `AdminState` + the
-    // emission-scan helpers.
+    // emission-scan helpers. Merged AFTER the auth layers so it is exempt
+    // from both.
     let open = axum::Router::new().route("/metrics", get(metrics));
 
-    authed.merge(open).with_state(state)
+    gated.merge(open).with_state(state)
 }
 
 // -----------------------------------------------------------------------------
@@ -312,6 +303,21 @@ pub struct ModuleSummary {
     pub abi_version: String,
     pub trap_strategy: String,
     pub crate_version: String,
+    /// What the module declares about itself. `0` for a pre-v3 artifact,
+    /// which is informative rather than missing — every artifact built before
+    /// `[lifecycle]` existed IS revision 0, schema 0.
+    ///
+    /// `revision` is NOT identity: bumping it alone moves nobody. It is what
+    /// a client move consults to decide which upgrade actions it crosses.
+    pub revision: Revision,
+    /// The kv layout the module expects. A bump means the state is not
+    /// copy-compatible; with no `migrate` export in the WIT it means rebuild.
+    pub state_schema: StateSchema,
+    /// The instance lifecycle, on the READ routes (`GET /_admin/modules` and
+    /// `GET /_admin/modules/{id}`). Absent from an upload response, which
+    /// describes the artifact rather than what is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<StatusLifecycle>,
 }
 
 impl From<&Manifest> for ModuleSummary {
@@ -323,6 +329,9 @@ impl From<&Manifest> for ModuleSummary {
             abi_version: format!("{}.{}", m.abi.version_major, m.abi.version_minor),
             trap_strategy: m.trap_policy.strategy.clone(),
             crate_version: m.build.crate_version.clone(),
+            revision: m.lifecycle.revision,
+            state_schema: m.lifecycle.state_schema,
+            lifecycle: None,
         }
     }
 }
@@ -357,6 +366,47 @@ pub struct StatusResponse {
     pub archive_horizon_slot: Option<u64>,
     /// Per-module summary.
     pub modules: Vec<StatusModule>,
+    /// Which auth posture the host booted into — `legacy` when
+    /// `MITOS_NAMESPACES_FILE` is unset, `namespaces` otherwise. Lets an
+    /// operator confirm a rollout step took effect without reading the unit
+    /// file.
+    #[serde(default = "AuthMode::legacy_default")]
+    pub auth_mode: AuthMode,
+    /// The configured namespaces. Names, tiers and COUNTS only — never a
+    /// token, never a `token_env` value, never a client list that would let
+    /// this endpoint enumerate the deployment.
+    #[serde(default)]
+    pub namespaces: Vec<StatusNamespace>,
+    /// Client ids with a registration on disk that no namespace owns. They
+    /// keep running and keep being dialled; their next subscribe is a 403,
+    /// which is the signal to add them to a namespace.
+    #[serde(default)]
+    pub unowned_clients: Vec<String>,
+}
+
+impl AuthMode {
+    /// A status response from a host that predates this field came from a
+    /// host with no namespaces.
+    fn legacy_default() -> Self {
+        Self::Legacy
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusNamespace {
+    pub name: String,
+    /// The queue order for staging catch-ups, and (today) the rule for
+    /// whether this namespace may run a whole-module recapture. The lifecycle
+    /// crate's own enum, not a rendering of it — a new tier is then a compile
+    /// error here rather than a string nobody updated.
+    pub tier: Tier,
+    /// How many clients the namespace lists. A count, not the list: the
+    /// deployment's client roster is not something a read-only dashboard
+    /// token should be able to enumerate.
+    pub clients: usize,
+    /// Where the rollout has got to: still accepting the operator token as a
+    /// client credential, or refusing it.
+    pub operator_token_as_client: OperatorTokenAsClient,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -396,6 +446,532 @@ pub struct StatusModule {
     /// Age of the last captured trap fixture, or `None` if none.
     /// A small value means a module recently trapped.
     pub last_trap_secs_ago: Option<u64>,
+    /// The instance lifecycle. `None` only on an artifact-only router, which
+    /// has no lifecycle wired.
+    ///
+    /// Read `lifecycle.desired` against `running` to tell the two failures
+    /// apart: `Running`/`false` is an outage the watchdog is about to fix;
+    /// `Stopped`/`false` is an operator's decision and must be left alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<StatusLifecycle>,
+}
+
+/// An instance's lifecycle, as the admin API reports it. The lifecycle
+/// crate's own enums, not renderings of them — a new phase is then a compile
+/// error here rather than a string nobody updated.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusLifecycle {
+    /// What IS: `active`, `draining`, `stopped`, `staging`, `reaped`.
+    pub phase: Phase,
+    /// What is WANTED: `running`, `stopped`, `pinned`. Orthogonal to `phase`.
+    pub desired: DesiredState,
+    /// Attached clients as `namespace/client`. These are what keeps the
+    /// instance alive; when the last one leaves, WHY it left decides whether
+    /// the instance drains, stops or alerts.
+    pub attached: Vec<String>,
+    /// The tier governing this instance — the most protected of every
+    /// namespace that has EVER attached, never relaxed on detach. `None`
+    /// before any client has attached.
+    pub governing_tier: Option<Tier>,
+}
+
+impl From<&Instance> for StatusLifecycle {
+    fn from(instance: &Instance) -> Self {
+        Self {
+            phase: instance.phase,
+            desired: instance.desired,
+            attached: crate::lifecycle::attached_labels(instance),
+            governing_tier: instance.governing.map(|p| p.tier),
+        }
+    }
+}
+
+/// One client's row: where it is being served from, and where it is going.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RowSummary {
+    /// `namespace/client`.
+    pub client: String,
+    /// The instance serving it today. `None` only for a client that has
+    /// never been served — a first subscribe before its move commits.
+    pub current: Option<RowPlacement>,
+    /// The move in flight, if any.
+    pub pending: Option<RowPending>,
+    /// The hand-off watermark on the instance serving this client: every
+    /// block at or before it was delivered by the instance it moved FROM, so
+    /// this one withholds them.
+    ///
+    /// `None` for a client that was never handed over, and for one whose
+    /// watermark the chain has moved a stability window past — after that it
+    /// can never be lowered and never withholds anything again.
+    pub watermark: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RowPlacement {
+    /// The instance directory name — truncated digests, as on disk.
+    pub instance: String,
+    pub revision: Revision,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RowPending {
+    pub target: String,
+    pub revision: Revision,
+    pub stage: RowStage,
+    /// `None` while fetching — there is no plan until the upgrade ledger has
+    /// been read off the artifact.
+    pub phase: Option<MovePhase>,
+    /// Where this move stands in the host-wide catch-up queue.
+    pub slot: SlotStanding,
+    /// How far the staging instance has to go. `None` until it is catching
+    /// up — before that there is no staging cursor to compare.
+    pub catch_up: Option<CatchUpProgress>,
+    /// Why this move is not advancing, when the answer is not "the chain".
+    pub blocked: Option<MoveBlocked>,
+}
+
+/// Why a move that has everything it needs is still not advancing.
+///
+/// An enum, not a message: an operator asks "will this ever finish", and the
+/// answer is a named condition with a fix, not prose.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "blocked")]
+pub enum MoveBlocked {
+    /// The move's upgrade ledger asks for a refill — a `resync` or a
+    /// `recapture` of the client's projected state — and the host cannot yet
+    /// make that debt durable. `RunRefill` is issued once, by the transition
+    /// that clears the pending move, so a crash in between would lose it and
+    /// leave a client whose state was silently never rebuilt. The move waits
+    /// at `catching-up` and the client stays where it is.
+    AwaitingRefillSupport { refill: Refill },
+}
+
+/// A move's standing in the host-wide catch-up queue.
+///
+/// One staging follower replays the chain at a time, so for most moves the
+/// interesting number is how many are ahead of it.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "slot")]
+pub enum SlotStanding {
+    /// This move holds the slot — it is the one catching up.
+    Holds,
+    Waiting {
+        /// Moves that will be granted before this one.
+        ahead: usize,
+    },
+    /// Not in the queue: still fetching, or not asked for yet.
+    Idle,
+}
+
+/// The gap a catching-up move still has to close, as an operator watches it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpProgress {
+    /// The staging instance's own cursor. `None` before its first block.
+    pub staging_slot: Option<u64>,
+    /// The instance still serving the client.
+    pub live_slot: Option<u64>,
+}
+
+/// `GET /_admin/catch-up` — the host-wide catch-up slot.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpView {
+    /// The one move catching up. `None` when nothing is.
+    pub holder: Option<CatchUpHolder>,
+    /// Everyone else, IN THE ORDER THEY WILL BE GRANTED — production before
+    /// development, then first come first served.
+    pub waiting: Vec<CatchUpWaiting>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpHolder {
+    /// `namespace/client`.
+    pub client: String,
+    pub module: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatchUpWaiting {
+    pub client: String,
+    pub module: String,
+    pub tier: Tier,
+    /// Unix seconds when it asked.
+    pub queued_at: u64,
+}
+
+/// How far a pending move has got. The lifecycle crate's `Stage` carries the
+/// resolved plan with it; this is the half an operator reads.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RowStage {
+    /// The artifact is being pulled, so there is no plan yet.
+    Fetching,
+    Planned,
+}
+
+/// `GET /_admin/modules/{id}/rows` — the client rows for a module.
+///
+/// READ-ONLY, and deliberately so: it lists what is on disk and never adopts
+/// a row on the way past. Adoption WRITES, and this route does not hold the
+/// row lock.
+async fn list_rows(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
+    }
+    // ONE snapshot for the whole listing: the slot is host-wide and taking it
+    // per row would show a different queue in each.
+    let slot = state.moves.as_ref().map(|moves| moves.catch_up());
+    let rows = state
+        .storage
+        .list_rows(&id)?
+        .into_iter()
+        .map(|row| {
+            let standing = standing_of(slot.as_ref(), &row.client, &row.module);
+            let live = row.current.as_ref().map(|p| p.instance.clone());
+            RowSummary {
+                client: format!("{}/{}", row.client.namespace, row.client.client),
+                current: row.current.map(|p| RowPlacement {
+                    instance: p.instance.dir_name(),
+                    revision: p.revision,
+                }),
+                pending: row.pending.map(|p| RowPending {
+                    target: p.target.instance.dir_name(),
+                    revision: p.target.revision,
+                    stage: match p.stage {
+                        Stage::Fetching => RowStage::Fetching,
+                        Stage::Planned { .. } => RowStage::Planned,
+                    },
+                    phase: match p.stage {
+                        Stage::Fetching => None,
+                        Stage::Planned { phase, .. } => Some(phase),
+                    },
+                    slot: standing,
+                    catch_up: match p.stage {
+                        Stage::Planned {
+                            phase: MovePhase::CatchingUp,
+                            ..
+                        } => Some(CatchUpProgress {
+                            staging_slot: cursor_slot(&state, &p.target.instance),
+                            live_slot: live.as_ref().and_then(|key| cursor_slot(&state, key)),
+                        }),
+                        _ => None,
+                    },
+                    // DERIVED, not stored: the same condition the moves tick
+                    // tests before it declines to advance, so the two cannot
+                    // drift.
+                    blocked: match p.stage {
+                        Stage::Planned {
+                            plan,
+                            phase: MovePhase::CatchingUp,
+                        } if plan.refill != Refill::None => {
+                            Some(MoveBlocked::AwaitingRefillSupport {
+                                refill: plan.refill,
+                            })
+                        }
+                        _ => None,
+                    },
+                }),
+                watermark: live.as_ref().and_then(|key| {
+                    state
+                        .storage
+                        .read_handoffs_at(key)
+                        .ok()?
+                        .watermark(&row.client.client)
+                        .map(|slot| slot.0)
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(rows).into_response())
+}
+
+/// One instance's cursor, as a slot number. A cursor that will not read is
+/// `None` — a read surface must not 500 because one instance is mid-anything.
+fn cursor_slot(state: &AdminState, key: &mitos_lifecycle::ids::InstanceKey) -> Option<u64> {
+    state
+        .storage
+        .read_cursor_at(key)
+        .ok()
+        .flatten()
+        .map(|point| point.slot())
+}
+
+fn standing_of(
+    slot: Option<&crate::moves::CatchUpSnapshot>,
+    client: &mitos_lifecycle::ids::ClientKey,
+    module: &mitos_lifecycle::ids::ModuleId,
+) -> SlotStanding {
+    // No move manager wired (an artifact-only router): there is no queue to
+    // stand in, which is what `Idle` says.
+    let Some(slot) = slot else {
+        return SlotStanding::Idle;
+    };
+    if slot.holder.as_ref() == Some(&(client.clone(), module.clone())) {
+        return SlotStanding::Holds;
+    }
+    match slot
+        .waiting
+        .iter()
+        .position(|m| &m.client == client && &m.module == module)
+    {
+        Some(ahead) => SlotStanding::Waiting { ahead },
+        None => SlotStanding::Idle,
+    }
+}
+
+/// `GET /_admin/catch-up` — who is catching up, and who is next.
+///
+/// Host-wide, not per module: ONE staging follower replays the chain at a
+/// time, so "why has my move not started" is a question about this queue and
+/// not about the module the operator happens to be looking at.
+async fn catch_up(State(state): State<AdminState>) -> Result<Response, HandlerError> {
+    let Some(moves) = state.moves.as_ref() else {
+        return Ok(Json(CatchUpView {
+            holder: None,
+            waiting: Vec::new(),
+        })
+        .into_response());
+    };
+    let slot = moves.catch_up();
+    Ok(Json(CatchUpView {
+        holder: slot.holder.map(|(client, module)| CatchUpHolder {
+            client: format!("{}/{}", client.namespace, client.client),
+            module: module.to_string(),
+        }),
+        waiting: slot
+            .waiting
+            .into_iter()
+            .map(|m| CatchUpWaiting {
+                client: format!("{}/{}", m.client.namespace, m.client.client),
+                module: m.module.to_string(),
+                tier: m.tier,
+                queued_at: m.queued_at.0,
+            })
+            .collect(),
+    })
+    .into_response())
+}
+
+/// One instance directory of a module.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstanceSummary {
+    /// The directory name on disk, and how a row's placement spells an
+    /// instance (`RowPlacement::instance`) — so an operator can match the two
+    /// by eye.
+    pub dir: String,
+    /// The FULL key. `dir` truncates both digests to 16 hex characters, which
+    /// is enough for a directory name and not enough to identify an artifact.
+    pub wasm: String,
+    /// `None` for an instance with no config override.
+    pub config: Option<String>,
+    pub role: InstanceRole,
+    pub slot: SlotState,
+    /// The instance's own cursor. `None` when it has never checkpointed — a
+    /// second instance that has not started yet reads exactly like one that
+    /// has started and not yet reached a block.
+    pub cursor: Option<u64>,
+    /// Phase, desired state and attached clients — or `unmanaged`.
+    pub lifecycle: InstanceLifecycle,
+    /// Every client this instance was HANDED OVER, and the slot its
+    /// predecessor had delivered up to. This instance withholds every block
+    /// at or before that slot from that client — see
+    /// `mitos_lifecycle::handoff`.
+    ///
+    /// Empty for an instance nobody moved onto, and for one whose watermarks
+    /// the chain has moved a stability window past.
+    pub watermarks: Vec<Watermark>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Watermark {
+    /// The client id, as the directory under `companions/` spells it.
+    pub client: String,
+    pub after_slot: u64,
+}
+
+/// What governs an instance, as the admin API reports it.
+///
+/// An enum rather than an `Option<StatusLifecycle>`: "there is no record"
+/// and "it has no attached clients" are different answers, and a reader that
+/// saw `null` for both would conflate an instance the lifecycle is not
+/// managing with one it is managing and finding empty.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "state")]
+pub enum InstanceLifecycle {
+    Managed(StatusLifecycle),
+    /// An instance directory with no `lifecycle.toml` that is not the
+    /// module's current one. Not adopted, not started, not reaped — see
+    /// `crate::lifecycle::InstanceView`. An operator seeing this has a
+    /// directory here that no client move made.
+    Unmanaged,
+    /// The admin router has no lifecycle wired (artifact-only deployments).
+    Unknown,
+}
+
+/// Whether `current.toml` resolves to this instance.
+///
+/// An enum, not a `bool`: a third answer is coming the moment a move can
+/// create a staging instance, and it must arrive as a compile error at every
+/// match rather than as a `false`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstanceRole {
+    /// What every `&str`-addressed operator tool means by "the module".
+    Current,
+    Other,
+}
+
+/// Whether the host has a live slot for this instance. An instance directory
+/// outlives its slot — `stop` leaves the directory alone — so "on disk" and
+/// "running" are two questions.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SlotState {
+    Running,
+    Stopped,
+}
+
+/// `GET /_admin/modules/{id}/instances` — every instance directory of a
+/// module, and which one is current.
+///
+/// READ-ONLY, and deliberately so: it reads the markers, `current.toml`, each
+/// instance's cursor and the host's slot table. It never creates an instance
+/// directory, adopts a row or repairs a pointer — which is why it goes
+/// through `read_cursor_at` (which requires the directory) rather than
+/// anything that would create one on the way past.
+async fn list_instances(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    let not_registered = || (StatusCode::NOT_FOUND, "module not registered").into_response();
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Ok(not_registered());
+    }
+    // A registered module always has a parsable id; an unparsable one cannot
+    // be registered, so this is the same 404 rather than a new error shape.
+    let Ok(module) = mitos_lifecycle::ids::ModuleId::parse(&id) else {
+        return Ok(not_registered());
+    };
+
+    let current = state.storage.current_instance(&id)?;
+    let running = match &state.host {
+        Some(host) => host.running_instances(&id).await,
+        None => Vec::new(),
+    };
+    // The module's clients, read ONCE — each instance's watermarks are asked
+    // per client rather than enumerated out of the file.
+    let clients: Vec<mitos_lifecycle::ids::ClientId> = state
+        .storage
+        .list_rows(&id)?
+        .into_iter()
+        .map(|row| row.client.client)
+        .collect();
+    // One listing, matched by key below. Asking the lifecycle per instance
+    // would re-walk `companions/` per instance for the adoption it derives.
+    let governed = match state.lifecycle.as_ref() {
+        Some(lifecycle) => match lifecycle.instances(&id) {
+            Ok(views) => Some(views),
+            Err(e) => {
+                tracing::warn!(module = %id, error = %e, "instances: lifecycle unreadable");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let instances = state
+        .storage
+        .list_instances(&module)?
+        .into_iter()
+        .map(|key| InstanceSummary {
+            dir: key.dir_name(),
+            wasm: key.wasm.to_string(),
+            config: key.config.as_ref().map(|c| c.to_string()),
+            role: match current.as_ref() {
+                Some(current) if *current == key => InstanceRole::Current,
+                _ => InstanceRole::Other,
+            },
+            slot: match running.contains(&key) {
+                true => SlotState::Running,
+                false => SlotState::Stopped,
+            },
+            // A cursor this route cannot read is reported as absent rather
+            // than failing the listing: one unreadable instance must not hide
+            // the others, exactly as `list_rows` treats an unparsable row.
+            cursor: state
+                .storage
+                .read_cursor_at(&key)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "instances: cursor unreadable",
+                    );
+                    None
+                })
+                .map(|c| c.slot()),
+            lifecycle: match governed.as_ref() {
+                None => InstanceLifecycle::Unknown,
+                Some(views) => match views.iter().find(|view| view.key() == &key) {
+                    Some(view) => match view.managed() {
+                        Some(instance) => InstanceLifecycle::Managed(instance.into()),
+                        None => InstanceLifecycle::Unmanaged,
+                    },
+                    // Listed by storage but not by the lifecycle: its record
+                    // would not read, and `instances` left it out rather than
+                    // hiding the rest.
+                    None => InstanceLifecycle::Unknown,
+                },
+            },
+            // Asked per CLIENT THE MODULE HAS, rather than by enumerating the
+            // file: `Handoffs` is deliberately a decision type with no
+            // iterator, and reading its map here would mean this route knew
+            // the file's shape — the drift that type exists to prevent. A
+            // watermark for a client that has since withdrawn is not shown,
+            // and `Handoffs::settle` is what eventually drops it.
+            //
+            // A file that will not parse reports NO watermarks, exactly as
+            // the drain treats it: one read surface must not tell a different
+            // story from the code it describes.
+            watermarks: match state.storage.read_handoffs_at(&key) {
+                Ok(handoffs) => clients
+                    .iter()
+                    .filter_map(|client| {
+                        handoffs.watermark(client).map(|after| Watermark {
+                            client: client.to_string(),
+                            after_slot: after.0,
+                        })
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        module = %id,
+                        instance = %key.dir_name(),
+                        error = %e,
+                        "instances: hand-off watermarks unreadable",
+                    );
+                    Vec::new()
+                }
+            },
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(instances).into_response())
+}
+
+/// Best-effort: a read surface must not 500 because one module's record is
+/// unreadable, and the operator has `/_admin/events` for the reason.
+fn lifecycle_of(state: &AdminState, id: &str) -> Option<StatusLifecycle> {
+    let instance = state.lifecycle.as_ref()?.instance(id);
+    match instance {
+        Ok(instance) => instance.as_ref().map(StatusLifecycle::from),
+        Err(e) => {
+            tracing::warn!(module = %id, error = %e, "status: lifecycle unreadable");
+            None
+        }
+    }
 }
 
 /// Serialized view of a module's last rebootstrap result.
@@ -568,6 +1144,24 @@ enum HandlerError {
     /// `recapture_failed` event from the detached recapture task.
     #[error("module `{0}` not registered")]
     ModuleNotFound(String),
+
+    /// The instance lifecycle refused the operator's command. A legitimate
+    /// state, not a malformed request — `StillAttached` is the evict
+    /// safety check, and `Reaped` is a module that is already gone.
+    #[error("{0}")]
+    Lifecycle(#[from] crate::lifecycle::LifecycleError),
+
+    /// An operator command on a router with no lifecycle wired (artifact-only
+    /// deployments and the inspector). Same posture as `RecaptureUnavailable`.
+    #[error("lifecycle unavailable: no host wired in this admin router")]
+    LifecycleUnavailable,
+
+    /// An operation that would START a follower, on an instance that is not
+    /// supposed to be running. Recapture is the one that does: it wipes the
+    /// bootstrap flags and restarts the module, so allowing it here would be
+    /// a fourth way an operator's stop gets undone.
+    #[error("module `{0}` is not running; start it first (POST …/start)")]
+    NotRunnable(String),
 }
 
 impl HandlerError {
@@ -585,6 +1179,7 @@ impl HandlerError {
             Self::Manifest(ManifestError::InvalidModuleId(_)) => "invalid_module_id",
             Self::Manifest(ManifestError::InvalidTrapStrategy(_)) => "invalid_trap_strategy",
             Self::Manifest(ManifestError::Parse(_)) => "manifest_parse",
+            Self::Manifest(ManifestError::Lifecycle(_)) => "lifecycle_ledger",
             Self::Storage(StorageError::UploadInProgress(_)) => "upload_in_progress",
             Self::Storage(_) => "storage_io",
             Self::Wasmtime(_) => "wasm_invalid",
@@ -595,6 +1190,14 @@ impl HandlerError {
             Self::RecaptureInProgress(_) => "recapture_in_progress",
             Self::RecaptureUnavailable(_) => "recapture_unavailable",
             Self::ModuleNotFound(_) => "not_found",
+            Self::Lifecycle(LifecycleError::NotRegistered(_)) => "not_found",
+            Self::Lifecycle(LifecycleError::Rejected(_)) => "lifecycle_rejected",
+            Self::Lifecycle(LifecycleError::Unmanaged { .. }) => "instance_unmanaged",
+            Self::Lifecycle(LifecycleError::Storage(_)) => "storage_io",
+            // What `restart` reported when it called the host itself.
+            Self::Lifecycle(LifecycleError::Host(_)) => "wasm_invalid",
+            Self::LifecycleUnavailable => "lifecycle_unavailable",
+            Self::NotRunnable(_) => "not_runnable",
         }
     }
 
@@ -608,6 +1211,17 @@ impl HandlerError {
             Self::RecaptureUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::RecaptureCompanionUnknown(_) => StatusCode::NOT_FOUND,
             Self::ModuleNotFound(_) => StatusCode::NOT_FOUND,
+            // A refusal is a state, not a bad request: `StillAttached` is the
+            // evict safety check an operator overrides with `?force=true`.
+            Self::Lifecycle(LifecycleError::Rejected(_)) => StatusCode::CONFLICT,
+            Self::Lifecycle(LifecycleError::NotRegistered(_)) => StatusCode::NOT_FOUND,
+            // An instance nothing here governs, asked of by key. Unreachable
+            // from a `&str` route — they all mean the current instance, which
+            // is adopted if it has no record.
+            Self::Lifecycle(LifecycleError::Unmanaged { .. }) => StatusCode::CONFLICT,
+            Self::Lifecycle(LifecycleError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::LifecycleUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NotRunnable(_) => StatusCode::CONFLICT,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -780,7 +1394,9 @@ async fn admin_index() -> Json<AdminIndex> {
         service: "mitos-admin",
         version: env!("CARGO_PKG_VERSION"),
         build_sha: env!("MITOS_BUILD_SHA"),
-        auth: "Bearer MITOS_AUTH_TOKEN = full (any method); MITOS_READONLY_TOKEN = GET-only; /metrics + /health are open",
+        auth: "Bearer MITOS_AUTH_TOKEN = full (any method); MITOS_READONLY_TOKEN = GET-only; \
+               a namespace token has no admin access except POST .../recapture; \
+               /metrics + /health are open",
         endpoints: ADMIN_ENDPOINTS
             .iter()
             .map(|&(method, path, auth, description)| EndpointDoc {
@@ -853,9 +1469,12 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
     let ids = state.storage.list_modules()?;
     let mut modules = Vec::with_capacity(ids.len());
     for id in ids {
-        let last_trap_secs_ago = std::fs::metadata(state.storage.last_trap_path(&id))
-            .and_then(|m| m.modified())
+        let last_trap_secs_ago = state
+            .storage
+            .last_trap_path(&id)
             .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
             .and_then(|mtime| now.duration_since(mtime).ok())
             .map(|d| d.as_secs());
         let companions = state.storage.count_companions(&id);
@@ -882,8 +1501,27 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
             bootstrap_in_progress: bootstrapping.contains(&id),
             last_result,
             last_trap_secs_ago,
+            lifecycle: lifecycle_of(&state, &id),
         });
     }
+
+    // Auth posture. Names, tiers and counts — nothing derived from a token.
+    let registry = state.auth.registry();
+    let namespaces = registry
+        .namespaces()
+        .iter()
+        .map(|def| StatusNamespace {
+            name: def.name.to_string(),
+            tier: def.profile.tier,
+            clients: match &def.clients {
+                ClientSet::Only(clients) => clients.len(),
+                // The implicit legacy namespace owns every client there is,
+                // so there is no roster to count.
+                ClientSet::Any => 0,
+            },
+            operator_token_as_client: registry.operator_token_as_client(),
+        })
+        .collect();
 
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -892,6 +1530,9 @@ async fn status(State(state): State<AdminState>) -> Result<Json<StatusResponse>,
         tip,
         archive_horizon_slot,
         modules,
+        auth_mode: state.auth.mode(),
+        namespaces,
+        unowned_clients: state.auth.unowned_clients(&state.storage),
     }))
 }
 
@@ -1027,9 +1668,12 @@ async fn metrics(State(state): State<AdminState>) -> Response {
 
     let mut mods = Vec::with_capacity(ids.len());
     for id in &ids {
-        let last_trap_age = std::fs::metadata(state.storage.last_trap_path(id))
-            .and_then(|m| m.modified())
+        let last_trap_age = state
+            .storage
+            .last_trap_path(id)
             .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|m| m.modified().ok())
             .and_then(|mt| SystemTime::now().duration_since(mt).ok())
             .map(|d| d.as_secs());
         let stats = companion_emission_stats(&state, id);
@@ -1477,7 +2121,9 @@ async fn list_modules(
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(m) = state.storage.read_manifest(&id)? {
-            out.push((&m).into());
+            let mut summary = ModuleSummary::from(&m);
+            summary.lifecycle = lifecycle_of(&state, &id);
+            out.push(summary);
         }
     }
     Ok(Json(out))
@@ -1488,7 +2134,11 @@ async fn get_module(
     Path(id): Path<String>,
 ) -> Result<Response, HandlerError> {
     match state.storage.read_manifest(&id)? {
-        Some(m) => Ok(Json(ModuleSummary::from(&m)).into_response()),
+        Some(m) => {
+            let mut summary = ModuleSummary::from(&m);
+            summary.lifecycle = lifecycle_of(&state, &id);
+            Ok(Json(summary).into_response())
+        }
         None => Ok((StatusCode::NOT_FOUND, "module not registered").into_response()),
     }
 }
@@ -1568,34 +2218,46 @@ async fn upload_module(
     // Independent wasmtime validation: even if the manifest claims
     // valid shape, we re-load the bytes to confirm wasmtime
     // accepts the component. Cheap, catches tampered manifests.
-    validate_with_wasmtime(&wasm_bytes)?;
+    crate::inspect::validate_component(&wasm_bytes)
+        .map_err(|e| HandlerError::Wasmtime(e.to_string()))?;
 
-    // Write artifact + manifest + symlink atomically.
-    state.storage.activate(&manifest, &wasm_bytes)?;
-
-    // If config was supplied, write it alongside. Atomic via
-    // write-then-rename. Absence is meaningful — the host
-    // distinguishes "no config" (call `init(&[])`) from "empty
-    // CBOR config" (call `init(b'')`).
-    if let Some(cfg) = config_bytes.as_ref() {
-        state.storage.write_config(&id, cfg)?;
-    }
-
-    tracing::info!(
-        module = %manifest.module.id,
-        sha = %manifest.module.sha256,
-        size = manifest.module.size_bytes,
-        "module uploaded + activated",
-    );
-
-    // If a host is wired in, start (or replace) the running
-    // instance so the new sha actually takes effect. In
-    // artifact-only mode (test harness, read-only deployments)
-    // skip this step — the artifact is on disk, that's all.
-    if let Some(host) = &state.host {
-        host.replace(&id)
-            .await
-            .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    // Activate, then start ONLY IF the instance expects a follower.
+    //
+    // v2 called `host.replace` unconditionally here, which was the third way
+    // an operator's stop got undone — deploy a new sha and a module somebody
+    // had deliberately stopped came back. The artifact still lands on disk
+    // either way; what the lifecycle decides is whether it RUNS.
+    //
+    // Config absence is meaningful — the host distinguishes "no config"
+    // (`init(&[])`) from "empty CBOR config" (`init(b'')`) — so it is only
+    // written when the field was present.
+    match state.lifecycle.as_ref() {
+        Some(lifecycle) => {
+            let action = lifecycle
+                .upload(&manifest, &wasm_bytes, config_bytes.as_deref())
+                .await?;
+            tracing::info!(
+                module = %manifest.module.id,
+                sha = %manifest.module.sha256,
+                size = manifest.module.size_bytes,
+                ?action,
+                "module uploaded + activated",
+            );
+        }
+        // Artifact-only mode (test harness, read-only deployments): the
+        // artifact is on disk, and there is no follower to start.
+        None => {
+            state.storage.activate(&manifest, &wasm_bytes)?;
+            if let Some(cfg) = config_bytes.as_ref() {
+                state.storage.write_config(&id, cfg)?;
+            }
+            tracing::info!(
+                module = %manifest.module.id,
+                sha = %manifest.module.sha256,
+                size = manifest.module.size_bytes,
+                "module uploaded + activated (artifact-only)",
+            );
+        }
     }
 
     Ok(Json(UploadResponse {
@@ -1611,18 +2273,67 @@ async fn delete_module(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    if let Some(host) = &state.host {
-        host.stop(&id)
-            .await
-            .map_err(|e| HandlerError::Wasmtime(format!("host.stop: {e}")))?;
-    }
-    // V1.5 doesn't yet remove the artifact directory — that's a
-    // safer default while we still don't have rollback CLI
-    // surface; operators can `rm -rf` if they really want it
-    // gone. The lifecycle effect (stop + drop slot) is what
-    // matters for "delete."
+    // `Operator(Stop)` rather than `host.stop`. The difference is that the
+    // intent is PERSISTED, so the next restart, the watchdog and the next
+    // upload all leave it alone — in v2 each of those undid this within a
+    // tick, a deploy, or a reboot.
+    operator(&state, &id, OperatorCommand::Stop).await?;
+    // The artifact directory stays: a stop is not a retirement, and rollback
+    // wants the state. `POST …/evict` is the destructive one.
     tracing::info!(module = %id, "module stopped via DELETE");
     Ok((StatusCode::NO_CONTENT, ()).into_response())
+}
+
+/// Feed one operator command to the lifecycle and return its effects.
+async fn operator(
+    state: &AdminState,
+    id: &str,
+    command: OperatorCommand,
+) -> Result<Vec<Effect>, HandlerError> {
+    let lifecycle = state
+        .lifecycle
+        .as_ref()
+        .ok_or(HandlerError::LifecycleUnavailable)?;
+    Ok(lifecycle.apply(id, Event::Operator(command)).await?)
+}
+
+/// `POST /_admin/modules/{id}/start` — undo a stop. Also un-pins, so a
+/// started instance with no clients drains like any other.
+async fn start_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+    operator(&state, &id, OperatorCommand::Start).await?;
+    Ok((StatusCode::OK, "started").into_response())
+}
+
+/// `POST /_admin/modules/{id}/pin` — "run this with no subscribers, and
+/// neither alert nor eject." For a module whose consumers are coming.
+async fn pin_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+    operator(&state, &id, OperatorCommand::Pin).await?;
+    Ok((StatusCode::OK, "pinned").into_response())
+}
+
+/// `POST /_admin/modules/{id}/unpin` — hand it back to its clients. With
+/// none attached it starts draining under its governing policy.
+async fn unpin_module(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Response, HandlerError> {
+    if state.storage.read_manifest(&id)?.is_none() {
+        return Err(HandlerError::ModuleNotFound(id));
+    }
+    operator(&state, &id, OperatorCommand::Unpin).await?;
+    Ok((StatusCode::OK, "unpinned").into_response())
 }
 
 /// Query params for `POST /_admin/modules/{id}/evict`.
@@ -1670,104 +2381,59 @@ async fn evict_module(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let Some(host) = &state.host else {
-        return Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no host wired in this admin router",
-        )
-            .into_response());
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        return Err(HandlerError::LifecycleUnavailable);
     };
 
-    // Safety check: refuse if any companion record exists for
-    // this module, unless the operator passed `?force=true`. The
-    // expectation is consumer-side cleanup retires its companion
-    // record first (via the consumer's own admin surface) so
-    // there's nothing to enumerate by the time evict runs.
-    //
-    // Companions live under the two-level layout
-    // `<storage>/<id>/companions/<client_id>/<companion_key>.cbor`
-    // (see `docs/design/MULTI_CLIENT_COMPANIONS.md`). The reported
-    // identifiers are `client_id:companion_key` so an operator can
-    // distinguish two consumers that share a key.
-    if !query.force {
-        let companions_dir = state.storage.module_dir_for_companions(&id);
-        if companions_dir.exists() {
-            let mut entries: Vec<String> = Vec::new();
-            let read_dir = std::fs::read_dir(&companions_dir).map_err(|e| {
-                HandlerError::Storage(StorageError::Io(std::io::Error::other(format!(
-                    "read companions dir {}: {e}",
-                    companions_dir.display()
-                ))))
-            })?;
-            for client_entry in read_dir.flatten() {
-                let file_type = match client_entry.file_type() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let client_id = match client_entry.file_name().to_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
-                // Skip the `.unreachable/` quarantine dir.
-                if client_id.starts_with('.') {
-                    continue;
-                }
-                let client_dir = client_entry.path();
-                let inner = match std::fs::read_dir(&client_dir) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                for inner_entry in inner.flatten() {
-                    if let Some(key) = inner_entry
-                        .file_name()
-                        .to_str()
-                        .and_then(|s| s.strip_suffix(".cbor"))
-                    {
-                        entries.push(format!("{client_id}:{key}"));
-                    }
-                }
-            }
-            if !entries.is_empty() {
-                return Ok((
-                    StatusCode::CONFLICT,
-                    Json(EvictConflictBody {
-                        error: "companions still registered",
-                        companion_keys: entries,
-                        hint: "retire consumers + remove their companion records, or pass ?force=true to override",
-                    }),
-                )
-                    .into_response());
-            }
+    // Reconcile FIRST, so the safety check below is asked of an attached set
+    // that matches the disk. Without this, a client whose registration was
+    // removed while the host was down would still be counted as attached and
+    // an evict would 409 on a module nobody is using.
+    lifecycle.reconcile(&id).await?;
+
+    let mode = if query.force {
+        EvictMode::Force
+    } else {
+        EvictMode::RefuseIfAttached
+    };
+
+    // The lifecycle owns the safety check now: `Rejected::StillAttached` IS
+    // "companions still registered", asked of the attached set rather than a
+    // directory walk. Keeping both would mean two answers to one question.
+    let attached = lifecycle
+        .instance(&id)?
+        .map(|i| crate::lifecycle::attached_labels(&i))
+        .unwrap_or_default();
+    match lifecycle
+        .apply(&id, Event::Operator(OperatorCommand::Evict(mode)))
+        .await
+    {
+        Ok(_) => {}
+        Err(LifecycleError::Rejected(Rejected::StillAttached(_))) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(EvictConflictBody {
+                    error: "clients still attached",
+                    companion_keys: attached,
+                    hint: "retire consumers + remove their companion records, or pass ?force=true to override",
+                }),
+            )
+                .into_response());
         }
+        Err(e) => return Err(e.into()),
     }
 
-    // Drive the host-side retirement: stop slot, drop dialer
-    // state, close DB handles. Returns the companion keys we
-    // just cancelled (could be non-empty under `?force=true`).
-    let cancelled_companions = host
-        .evict_module(&id)
-        .await
-        .map_err(|e| HandlerError::Wasmtime(format!("host.evict_module: {e}")))?;
-
-    if query.force && !cancelled_companions.is_empty() {
+    if query.force && !attached.is_empty() {
         tracing::warn!(
             module = %id,
-            companions = ?cancelled_companions,
-            "evict --force reaped in-memory companions despite registered records",
+            clients = ?attached,
+            "evict --force retired an instance with clients still attached",
         );
     }
 
-    // Filesystem step — caller's surface; storage knows the
-    // paths. Idempotent on missing dir (already-half-retired
-    // module).
-    state.storage.remove_module_dir(&id)?;
-
     tracing::info!(
         module = %id,
-        cancelled = cancelled_companions.len(),
+        attached = attached.len(),
         force = query.force,
         "module evicted (slot stopped, dialer state cleared, artifact removed)",
     );
@@ -1775,7 +2441,7 @@ async fn evict_module(
         StatusCode::OK,
         Json(EvictResponse {
             module: id,
-            cancelled_companions,
+            cancelled_companions: attached,
             artifact_removed: true,
         }),
     )
@@ -1841,6 +2507,18 @@ async fn delete_companion(
         ))))
     })?;
 
+    // The client's LAST record being gone is a detach. Best-effort: the 60s
+    // tick reconciles again, and `reconcile` is a diff so nothing is lost.
+    if let Some(lifecycle) = state.lifecycle.as_ref()
+        && let Err(e) = lifecycle.reconcile(&id).await
+    {
+        tracing::warn!(
+            module = %id,
+            error = %e,
+            "lifecycle reconcile after delete-companion failed; the next tick retries",
+        );
+    }
+
     tracing::info!(
         module = %id,
         client_id = %client_id,
@@ -1864,16 +2542,33 @@ async fn restart_module(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let Some(host) = &state.host else {
+    if state.host.is_none() {
         return Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             "no host wired in this admin router",
         )
             .into_response());
-    };
-    host.replace(&id)
-        .await
-        .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    }
+    // `Operator(Start)` first, because restart on a STOPPED module must mean
+    // "start it", and that has to change the persisted intent or the watchdog
+    // would stop it again. If the instance was already running, `Start`
+    // produces no `StartFollower` — and then a restart means what it always
+    // meant: cycle the follower in place.
+    //
+    // Through the lifecycle, not the host: it takes the module lock, so a
+    // restart cannot start a follower inside an upload's quiesce, and it
+    // addresses the instance by key like everything else that starts one.
+    let effects = operator(&state, &id, OperatorCommand::Start).await?;
+    if !effects.contains(&Effect::StartFollower) {
+        let lifecycle = state
+            .lifecycle
+            .as_ref()
+            .ok_or(HandlerError::LifecycleUnavailable)?;
+        lifecycle
+            .cycle_follower(&id)
+            .await
+            .map_err(|e| HandlerError::Wasmtime(format!("host.replace: {e}")))?;
+    }
     tracing::info!(module = %id, "module restarted");
     Ok((StatusCode::OK, "restarted").into_response())
 }
@@ -1934,6 +2629,16 @@ async fn recapture_module(
             "no host wired in this admin router".to_owned(),
         ));
     };
+
+    // A recapture on an instance that is not supposed to be running would
+    // START it — recapture's whole job is to wipe the bootstrap flags and
+    // restart. That is a fourth way an operator's stop gets undone, so it is
+    // a 409 instead.
+    if let Some(lifecycle) = state.lifecycle.as_ref()
+        && lifecycle.expects_follower(&id)? == BootAction::LeaveStopped
+    {
+        return Err(HandlerError::NotRunnable(id));
+    }
 
     // `companion=<key>` — scoped resync, not the coordinated
     // module-wide rebuild. Resolve the companion's persisted
@@ -2098,7 +2803,7 @@ async fn last_trap(
     if state.storage.read_manifest(&id)?.is_none() {
         return Ok((StatusCode::NOT_FOUND, "module not registered").into_response());
     }
-    let path = state.storage.last_trap_path(&id);
+    let path = state.storage.last_trap_path(&id)?;
     match std::fs::read_to_string(&path) {
         Ok(body) => Ok((
             StatusCode::OK,
@@ -2545,56 +3250,1030 @@ async fn replay_emission(
     .into_response())
 }
 
-/// Independent wasmtime-side validation. Confirms the component
-/// parses and the world declared by the manifest is what wasmtime
-/// sees in the binary's metadata. Dry-instantiation + version-export
-/// round-trip is future work — the actual host's `start()` path
-/// catches those on first activation; the cost of doing it here too
-/// hasn't earned its keep.
-fn validate_with_wasmtime(wasm_bytes: &[u8]) -> Result<(), HandlerError> {
-    // Build a minimal engine just for parse-validation. Cheap to
-    // construct; doesn't need the platform's full Config.
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|e| HandlerError::Wasmtime(format!("engine: {e}")))?;
-    let _component = wasmtime::component::Component::from_binary(&engine, wasm_bytes)
-        .map_err(|e| HandlerError::Wasmtime(format!("component: {e}")))?;
-    Ok(())
-}
-
+/// The admin router's auth, proven through the REAL router.
+///
+/// The four unit tests that used to live here exercised a private
+/// `authorize(full, readonly, method, provided)`. That function is gone and
+/// its rule moved to `mitos_lifecycle::access`, where a decision-table test
+/// already covers it — so these prove the thing the pure crate cannot: that
+/// every route actually ASKS, and asks with the right attempt.
 #[cfg(test)]
 mod tests {
-    use super::authorize;
-    use axum::http::Method;
+    use super::*;
+    use crate::auth::testing::{DEV, FULL, PROD, READONLY, configured_authenticator};
+    use axum::body::Body;
+    use axum::http::{Method, Request as HttpRequest, StatusCode};
+    use mitos_lifecycle::access::OperatorTokenAsClient;
+    use tower::ServiceExt;
 
-    const FULL: &str = "full-secret";
-    const RO: &str = "ro-secret";
+    /// Every mutating admin route, by method and path. Iterated rather than
+    /// hand-picked: a route added without a thought about who may reach it
+    /// should fail here, not in production.
+    const MUTATING_ROUTES: &[(Method, &str)] = &[
+        (Method::POST, "/_admin/modules/m"),
+        (Method::DELETE, "/_admin/modules/m"),
+        (Method::POST, "/_admin/modules/m/restart"),
+        (Method::POST, "/_admin/modules/m/start"),
+        (Method::POST, "/_admin/modules/m/pin"),
+        (Method::POST, "/_admin/modules/m/unpin"),
+        (Method::POST, "/_admin/modules/m/evict"),
+        (Method::DELETE, "/_admin/modules/m/companions/c/k"),
+        (Method::DELETE, "/_admin/modules/m/emissions"),
+        (Method::POST, "/_admin/modules/m/emissions/1/replay"),
+    ];
 
+    /// Every `GET` on the admin router. Together with `MUTATING_ROUTES` and
+    /// the recapture sub-router this is the router's whole surface — if you
+    /// add a route, add it here, because "who may reach it" is not something
+    /// to find out in production.
+    const READ_ROUTES: &[&str] = &[
+        "/_admin",
+        "/_admin/status",
+        "/_admin/events",
+        "/_admin/modules",
+        "/_admin/catch-up",
+        "/_admin/modules/m",
+        "/_admin/modules/m/companions",
+        "/_admin/modules/m/rows",
+        "/_admin/modules/m/instances",
+        "/_admin/modules/m/last-trap",
+        "/_admin/modules/m/emissions",
+        "/_admin/utxos",
+        "/_admin/blocks/1",
+        "/_admin/blocks/by-tx/aa",
+    ];
+
+    /// The tripwire for the two lists above. axum exposes no route table, so
+    /// the lists are hand-maintained — and a route added to the router but not
+    /// to a list is silently absent from every "who may reach it" test. This
+    /// reads `admin_router_inner`'s own SOURCE and fails when the router has a
+    /// route, or a handler method, that the lists do not account for.
+    ///
+    /// It is a tripwire, not a parser: it counts `get(` / `post(` /
+    /// `delete(` calls and route-path literals in that one function. If it
+    /// fails after you touched the router, the fix is almost always to add the
+    /// new route to `MUTATING_ROUTES` or `READ_ROUTES`.
     #[test]
-    fn full_token_authorizes_any_method() {
-        for m in [Method::GET, Method::POST, Method::DELETE] {
-            assert!(authorize(FULL, Some(RO), &m, Some(FULL)));
+    fn the_route_lists_cover_the_whole_router() {
+        let source = include_str!("admin.rs");
+        let start = source
+            .find("fn admin_router_inner(")
+            .expect("admin_router_inner exists");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("function has an end");
+        let code: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Every path template in the router, made concrete the way the lists
+        // spell it.
+        let mut templates = Vec::new();
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find("\"/") {
+            let tail = &rest[at + 1..];
+            let close = tail.find('"').expect("string literal closes");
+            templates.push(&tail[..close]);
+            rest = &tail[close + 1..];
+        }
+        let concrete = |template: &str| {
+            template
+                .replace("{id}", "m")
+                .replace("{client_id}", "c")
+                .replace("{companion_key}", "k")
+                .replace("{emission_id}", "1")
+                .replace("{slot}", "1")
+                .replace("{tx_hash}", "aa")
+        };
+        // The two routes deliberately outside both lists, each with its own
+        // test: recapture (`RecaptureModule`) and the open `/metrics`.
+        let elsewhere = ["/_admin/modules/m/recapture", "/metrics"];
+        for template in &templates {
+            let path = concrete(template);
+            assert!(
+                !path.contains('{'),
+                "route `{template}` has a path parameter this test cannot make concrete — teach \
+                 `concrete` about it"
+            );
+            let listed = READ_ROUTES.contains(&path.as_str())
+                || MUTATING_ROUTES.iter().any(|(_, p)| *p == path)
+                || elsewhere.contains(&path.as_str());
+            assert!(
+                listed,
+                "`{template}` is on the admin router but in neither route list, so no test \
+                 checks who may reach it"
+            );
+        }
+
+        // …and every METHOD, because a `.post(..)` added to an existing path
+        // adds no new template.
+        let count = |needle: &str| code.matches(needle).count();
+        assert_eq!(
+            count("get("),
+            READ_ROUTES.len() + 1,
+            "GET handlers on the router vs READ_ROUTES (+1 for the open /metrics)"
+        );
+        assert_eq!(
+            count("post(") + count("delete("),
+            MUTATING_ROUTES.len() + 1,
+            "POST/DELETE handlers on the router vs MUTATING_ROUTES (+1 for recapture)"
+        );
+    }
+
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("mitos-admin-auth-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn router_at(dir: &std::path::Path, mode: OperatorTokenAsClient) -> axum::Router {
+        admin_router(
+            ModuleStorage::new(dir),
+            Arc::new(configured_authenticator(mode)),
+        )
+    }
+
+    async fn call(
+        router: &axum::Router,
+        method: Method,
+        path: &str,
+        token: Option<&str>,
+    ) -> StatusCode {
+        let mut req = HttpRequest::builder().method(method).uri(path);
+        if let Some(token) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A router with a FAKE host and a real lifecycle over `dir`, plus the
+    /// pieces a companion router needs to share the same manager.
+    struct Wired {
+        router: axum::Router,
+        storage: ModuleStorage,
+        host: crate::host_v2::testing::FakeHost,
+        lifecycle: Arc<crate::lifecycle::LifecycleManager>,
+        events: crate::events::EventRing,
+        auth: Arc<Authenticator>,
+    }
+
+    fn wired(dir: &std::path::Path) -> Wired {
+        let storage = ModuleStorage::new(dir);
+        let host = crate::host_v2::testing::FakeHost::new(storage.clone());
+        let handle: Arc<dyn crate::host_v2::ModuleHostHandle> = Arc::new(host.clone());
+        let auth = Arc::new(configured_authenticator(
+            OperatorTokenAsClient::AllowWithWarning,
+        ));
+        let events = crate::events::EventRing::new();
+        let lifecycle = Arc::new(crate::lifecycle::LifecycleManager::new(
+            storage.clone(),
+            handle.clone(),
+            auth.clone(),
+            events.clone(),
+            crate::lifecycle::system_clock(),
+        ));
+        let moves = crate::moves::MoveManager::new(
+            storage.clone(),
+            Arc::new(crate::fetch::ArtifactPuller::new(
+                storage.clone(),
+                Arc::new(crate::fetch::testing::FakeFetcher::new()),
+            )),
+            auth.clone(),
+            lifecycle.clone(),
+            events.clone(),
+            crate::lifecycle::system_clock(),
+        );
+        let router = admin_router_with_host(
+            storage.clone(),
+            handle,
+            Vec::new(),
+            None,
+            SystemTime::now(),
+            events.clone(),
+            auth.clone(),
+            lifecycle.clone(),
+            moves,
+        );
+        Wired {
+            router,
+            storage,
+            host,
+            lifecycle,
+            events,
+            auth,
         }
     }
 
-    #[test]
-    fn readonly_token_authorizes_only_get() {
-        assert!(authorize(FULL, Some(RO), &Method::GET, Some(RO)));
-        assert!(!authorize(FULL, Some(RO), &Method::POST, Some(RO)));
-        assert!(!authorize(FULL, Some(RO), &Method::DELETE, Some(RO)));
+    /// `POST …/evict` with the lifecycle wired: the safety check is now the
+    /// attached set, not a directory walk.
+    #[tokio::test]
+    async fn evict_refuses_while_attached_and_force_overrides() {
+        let dir = tempdir("evict-attached");
+        let w = wired(&dir);
+        let wasm = b"evict test wasm";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        crate::lifecycle::testing::write_registration(
+            &w.storage,
+            "m",
+            crate::auth::testing::PROD_CLIENT,
+            "policy_a",
+        );
+        w.lifecycle.boot().await;
+
+        assert_eq!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/evict",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
+        assert!(!w.host.evicted("m"));
+
+        assert_eq!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/evict?force=true",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert!(w.host.evicted("m"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn wrong_or_missing_token_rejected() {
-        assert!(!authorize(FULL, Some(RO), &Method::GET, Some("nope")));
-        assert!(!authorize(FULL, Some(RO), &Method::GET, None));
-        assert!(!authorize(FULL, Some(RO), &Method::POST, None));
+    /// Recapture wipes the bootstrap flags and RESTARTS the module, so on a
+    /// stopped instance it would be a fourth way an operator's stop gets
+    /// undone.
+    #[tokio::test]
+    async fn recapture_on_a_stopped_module_is_409() {
+        let dir = tempdir("recapture-stopped");
+        let w = wired(&dir);
+        let wasm = b"recapture stopped wasm";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        w.lifecycle.boot().await;
+
+        // Running: it gets past the lifecycle guard.
+        assert_ne!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
+
+        assert_eq!(
+            call(&w.router, Method::DELETE, "/_admin/modules/m", Some(FULL)).await,
+            StatusCode::NO_CONTENT,
+        );
+        assert_eq!(
+            call(
+                &w.router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::CONFLICT,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn readonly_unset_means_only_full_works() {
-        assert!(!authorize(FULL, None, &Method::GET, Some(RO)));
-        assert!(authorize(FULL, None, &Method::GET, Some(FULL)));
+    /// Subscribe → attached; the last companion record deleted → detached.
+    /// Through the REAL routers, sharing one manager, because the hooks that
+    /// call `reconcile` live in the handlers.
+    #[tokio::test]
+    async fn a_subscribe_attaches_and_the_last_delete_detaches() {
+        use crate::auth::testing::{PROD, PROD_CLIENT};
+
+        let dir = tempdir("attach-detach");
+        let w = wired(&dir);
+        let wasm = b"attach detach wasm";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        w.lifecycle.boot().await;
+        assert!(
+            w.lifecycle
+                .instance("m")
+                .unwrap()
+                .unwrap()
+                .attached
+                .is_empty(),
+            "nothing is attached before anyone subscribes",
+        );
+
+        let companions = crate::companions::companion_router(
+            w.storage.clone(),
+            w.auth.clone(),
+            None,
+            None,
+            w.events.clone(),
+            Some(w.lifecycle.clone()),
+            None,
+        );
+        let request = mitos_protocol::SubscribeRequest {
+            targets: vec![mitos_protocol::SubscribeTarget::Module { name: "m".into() }],
+            companion_key: "policy_a".into(),
+            client_id: PROD_CLIENT.into(),
+            resume_from: None,
+            interests: vec![],
+            dial_back: None,
+            announced: Vec::new(),
+        };
+        let mut body = Vec::new();
+        ciborium::ser::into_writer(&request, &mut body).unwrap();
+        let response = companions
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/subscribe")
+                    .header("content-type", "application/cbor")
+                    .header(header::AUTHORIZATION, format!("Bearer {PROD}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let attached =
+            crate::lifecycle::attached_labels(&w.lifecycle.instance("m").unwrap().unwrap());
+        assert_eq!(attached, vec!["prod/ownership.cnft.dev"]);
+
+        // …and the admin delete of that client's last record detaches it.
+        assert_eq!(
+            call(
+                &w.router,
+                Method::DELETE,
+                &format!("/_admin/modules/m/companions/{PROD_CLIENT}/policy_a"),
+                Some(FULL),
+            )
+            .await,
+            StatusCode::NO_CONTENT,
+        );
+        assert!(
+            w.lifecycle
+                .instance("m")
+                .unwrap()
+                .unwrap()
+                .attached
+                .is_empty(),
+            "deleting the last companion record did not detach the client",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_namespace_token_gets_403_on_every_admin_route() {
+        let dir = tempdir("namespace-403");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        for token in [PROD, DEV] {
+            for path in READ_ROUTES {
+                assert_eq!(
+                    call(&router, Method::GET, path, Some(token)).await,
+                    StatusCode::FORBIDDEN,
+                    "GET {path} with a namespace token",
+                );
+            }
+            for (method, path) in MUTATING_ROUTES {
+                assert_eq!(
+                    call(&router, method.clone(), path, Some(token)).await,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} with a namespace token — even a PROD worker's token \
+                     must not be able to evict a module",
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `readonly_token_authorizes_only_get` rule, now proven where the
+    /// method-to-access mapping actually lives.
+    #[tokio::test]
+    async fn the_readonly_token_reads_and_does_not_write() {
+        let dir = tempdir("readonly");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(READONLY)).await,
+            StatusCode::OK,
+        );
+        for (method, path) in MUTATING_ROUTES {
+            assert_eq!(
+                call(&router, method.clone(), path, Some(READONLY)).await,
+                StatusCode::FORBIDDEN,
+                "{method} {path} with the read-only token",
+            );
+        }
+        // …and the full token still reaches both.
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(FULL)).await,
+            StatusCode::OK,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_is_401_and_a_wrong_principal_is_403() {
+        let dir = tempdir("401-vs-403");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        // 401 — "who are you".
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", None).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some("not-a-token")).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        // 403 — "not you". A stale token and the wrong namespace's token are
+        // different incidents; the status code is how they are told apart.
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(PROD)).await,
+            StatusCode::FORBIDDEN,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_stays_open() {
+        let dir = tempdir("metrics-open");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+        assert_eq!(
+            call(&router, Method::GET, "/metrics", None).await,
+            StatusCode::OK,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `holder-map`'s production cron recaptures `holder-distribution` with
+    /// the secret it subscribes with. Under `Admin(Mutate)` — which every
+    /// namespace token is refused — that cron would 403 the day its secret is
+    /// rotated, which is the whole reason recapture has its own attempt.
+    #[tokio::test]
+    async fn a_prod_token_may_recapture_and_a_dev_token_may_not() {
+        let dir = tempdir("recapture-attempt");
+        let storage = ModuleStorage::new(&dir);
+        let wasm = b"recapture-attempt wasm";
+        let manifest = crate::companions::testing::manifest_for("m", wasm);
+        storage.activate(&manifest, wasm).unwrap();
+        let router = admin_router(
+            storage,
+            Arc::new(configured_authenticator(
+                OperatorTokenAsClient::AllowWithWarning,
+            )),
+        );
+
+        // A prod namespace token gets PAST authorization and into the
+        // handler, which then fails on "no host wired in this admin router".
+        // That is `holder-map`'s production cron continuing to work after its
+        // secret becomes a namespace token — and because this router has
+        // `host: None`, the recapture provably never ran.
+        let reached = call(
+            &router,
+            Method::POST,
+            "/_admin/modules/m/recapture",
+            Some(PROD),
+        )
+        .await;
+        assert_ne!(
+            reached,
+            StatusCode::FORBIDDEN,
+            "a prod namespace token must reach recapture",
+        );
+        assert_ne!(reached, StatusCode::NOT_FOUND, "the module is registered");
+
+        // A dev token may NOT: recapture is whole-module today, so it would
+        // make production's companions drop their state. Refused BEFORE the
+        // handler, so nothing was invoked.
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(DEV)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The route must go through `RecaptureModule`, not `Admin(Mutate)` — the
+    /// same prod token that reaches recapture is still refused on evict.
+    #[tokio::test]
+    async fn recapture_is_not_reachable_as_admin_mutate() {
+        let dir = tempdir("recapture-vs-evict");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+        assert_eq!(
+            call(&router, Method::POST, "/_admin/modules/m/evict", Some(PROD)).await,
+            StatusCode::FORBIDDEN,
+        );
+        assert_ne!(
+            call(
+                &router,
+                Method::POST,
+                "/_admin/modules/m/recapture",
+                Some(PROD)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `GET …/instances`, the whole point of it: two directories, one of
+    /// which `current.toml` points at.
+    #[tokio::test]
+    async fn the_instances_route_lists_both_and_marks_the_current_one() {
+        let dir = tempdir("instances-list");
+        let w = wired(&dir);
+
+        let live = b"the live artifact";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", live), live)
+            .unwrap();
+        let current = w.storage.current_instance("m").unwrap().unwrap();
+
+        // A second instance, made the only way one can be outside `activate`
+        // — `put_artifact` then the marker. Creating instances is WO-08's.
+        let other_wasm = b"a second artifact";
+        let other_manifest = crate::companions::testing::manifest_for("m", other_wasm);
+        w.storage.put_artifact(&other_manifest, other_wasm).unwrap();
+        let other = mitos_lifecycle::ids::InstanceKey {
+            module: mitos_lifecycle::ids::ModuleId::parse("m").unwrap(),
+            wasm: mitos_lifecycle::ids::Sha256Hex::parse(&crate::manifest::sha256_hex(other_wasm))
+                .unwrap(),
+            config: None,
+        };
+        w.storage.write_instance_marker(&other).unwrap();
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/modules/m/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<InstanceSummary> = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            listed.len(),
+            2,
+            "both instance directories should be listed"
+        );
+        let by_dir = |key: &mitos_lifecycle::ids::InstanceKey| {
+            listed
+                .iter()
+                .find(|i| i.dir == key.dir_name())
+                .unwrap_or_else(|| panic!("{} missing from the listing", key.dir_name()))
+        };
+        assert_eq!(by_dir(&current).role, InstanceRole::Current);
+        assert_eq!(by_dir(&other).role, InstanceRole::Other);
+        // The full digest, not the truncated directory name — the point of
+        // carrying `wasm` as its own field.
+        assert_eq!(by_dir(&other).wasm, other.wasm.to_string());
+        assert_eq!(by_dir(&other).config, None);
+        // `FakeHost` has no slots, and neither instance has ever run.
+        assert_eq!(by_dir(&current).slot, SlotState::Stopped);
+        assert_eq!(by_dir(&current).cursor, None);
+
+        // An unregistered module is a 404, not an empty list — the operator
+        // asking about a typo must not read it as "no instances".
+        assert_eq!(
+            call(
+                &w.router,
+                Method::GET,
+                "/_admin/modules/nope/instances",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What an operator actually needs from this route once a module can
+    /// have more than one instance: what each one IS, what is WANTED of it,
+    /// and who is holding it open — or that nothing is governing it at all.
+    #[tokio::test]
+    async fn the_instances_route_reports_each_instances_lifecycle() {
+        let dir = tempdir("instances-lifecycle");
+        let w = wired(&dir);
+        let live = b"the live artifact";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", live), live)
+            .unwrap();
+        crate::lifecycle::testing::write_registration(
+            &w.storage,
+            "m",
+            crate::auth::testing::PROD_CLIENT,
+            "policy_a",
+        );
+
+        // A sibling with a directory and no record: `Unmanaged`. Adopting it
+        // would conclude Active + Pinned and it would follow the chain for
+        // ever, so the route's job is to make it VISIBLE instead.
+        let other_wasm = b"a second artifact";
+        let other_manifest = crate::companions::testing::manifest_for("m", other_wasm);
+        w.storage.put_artifact(&other_manifest, other_wasm).unwrap();
+        let other = mitos_lifecycle::ids::InstanceKey {
+            module: mitos_lifecycle::ids::ModuleId::parse("m").unwrap(),
+            wasm: mitos_lifecycle::ids::Sha256Hex::parse(&crate::manifest::sha256_hex(other_wasm))
+                .unwrap(),
+            config: None,
+        };
+        w.storage.write_instance_marker(&other).unwrap();
+
+        w.lifecycle.boot().await;
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/modules/m/instances")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<InstanceSummary> = serde_json::from_slice(&body).unwrap();
+
+        let current = w.storage.current_instance("m").unwrap().unwrap();
+        let find = |key: &mitos_lifecycle::ids::InstanceKey| {
+            listed
+                .iter()
+                .find(|i| i.dir == key.dir_name())
+                .unwrap_or_else(|| panic!("{} missing", key.dir_name()))
+        };
+        match &find(&current).lifecycle {
+            InstanceLifecycle::Managed(status) => {
+                assert_eq!(status.phase, Phase::Active);
+                assert_eq!(status.desired, DesiredState::Running);
+                assert_eq!(status.attached, vec!["prod/ownership.cnft.dev"]);
+            }
+            other => panic!("the current instance is not managed: {other:?}"),
+        }
+        assert!(
+            matches!(find(&other).lifecycle, InstanceLifecycle::Unmanaged),
+            "a record-less sibling was reported as governed",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `GET /_admin/catch-up` with nothing catching up. The shape is what an
+    /// operator polls while they wait, so "nothing is happening" has to be a
+    /// readable answer and not a 404.
+    #[tokio::test]
+    async fn the_catch_up_route_answers_when_the_queue_is_empty() {
+        let dir = tempdir("catch-up-empty");
+        let w = wired(&dir);
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/catch-up")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let view: CatchUpView = serde_json::from_slice(&body).unwrap();
+        assert!(view.holder.is_none());
+        assert!(view.waiting.is_empty());
+
+        // …and it is a READ route: a namespace token must not reach it, and
+        // the readonly operator must.
+        assert_eq!(
+            call(&w.router, Method::GET, "/_admin/catch-up", Some(READONLY)).await,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            call(&w.router, Method::GET, "/_admin/catch-up", Some(PROD)).await,
+            StatusCode::FORBIDDEN,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A row with no move is `Idle` in the queue and has no catch-up gap to
+    /// report. The populated shapes are exercised where the slot actually
+    /// moves — `moves.rs`'s slot tests.
+    #[tokio::test]
+    async fn a_row_with_no_move_stands_nowhere_in_the_queue() {
+        let dir = tempdir("rows-slot");
+        let w = wired(&dir);
+        let wasm = b"rows fixture";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+        let key = w.storage.current_instance("m").unwrap().unwrap();
+        w.storage
+            .write_row(
+                "m",
+                &mitos_lifecycle::client_move::ClientRow::adopt(
+                    mitos_lifecycle::ids::ClientKey {
+                        namespace: mitos_lifecycle::ids::Namespace::parse("prod").unwrap(),
+                        client: mitos_lifecycle::ids::ClientId::parse(
+                            crate::auth::testing::PROD_CLIENT,
+                        )
+                        .unwrap(),
+                    },
+                    mitos_lifecycle::ids::ModuleId::parse("m").unwrap(),
+                    mitos_lifecycle::client_move::Placement {
+                        instance: key,
+                        revision: Revision(1),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let response = w
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/modules/m/rows")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<RowSummary> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].pending.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// It is a READ surface. Nothing about the module directory may differ
+    /// after a request — no instance directory conjured by a path helper, no
+    /// cursor file created by opening one, no row adopted on the way past.
+    #[tokio::test]
+    async fn reading_instances_writes_nothing() {
+        let dir = tempdir("instances-read-only");
+        let w = wired(&dir);
+        let wasm = b"read-only artifact";
+        w.storage
+            .activate(&crate::companions::testing::manifest_for("m", wasm), wasm)
+            .unwrap();
+
+        /// Every path under a directory, sorted — the whole subtree, so a
+        /// file created three levels down still shows up.
+        fn tree(root: &std::path::Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(next) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&next) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path.clone());
+                    }
+                    out.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            out.sort();
+            out
+        }
+
+        let before = tree(&dir);
+        assert_eq!(
+            call(
+                &w.router,
+                Method::GET,
+                "/_admin/modules/m/instances",
+                Some(FULL)
+            )
+            .await,
+            StatusCode::OK,
+        );
+        assert_eq!(tree(&dir), before, "the instances route wrote to disk");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn status_never_leaks_a_token() {
+        let dir = tempdir("status-leak");
+        let router = router_at(&dir, OperatorTokenAsClient::AllowWithWarning);
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/_admin/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        for secret in [FULL, READONLY, PROD, DEV] {
+            assert!(
+                !body.contains(secret),
+                "status response contains a configured token",
+            );
+        }
+        // The env var NAMES are fine; their values are not. Neither appears
+        // in the response at all today, and neither should.
+        assert!(!body.contains("MITOS_TOKEN_PROD"));
+
+        let status: StatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.auth_mode, AuthMode::Namespaces);
+        assert_eq!(status.namespaces.len(), 2);
+        assert!(
+            status.namespaces.iter().any(|n| n.tier == Tier::Production),
+            "the prod namespace's tier must be reported",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unowned_registrations_are_reported_and_left_alone() {
+        let dir = tempdir("unowned");
+        let storage = ModuleStorage::new(&dir);
+
+        // A registration for a client no namespace lists, beside one for a
+        // client that is listed.
+        let wasm = b"unowned-test wasm";
+        let manifest = crate::companions::testing::manifest_for("mod-a", wasm);
+        storage.activate(&manifest, wasm).unwrap();
+        for client in ["ownership.cnft.dev", "preview-1234.cnft.dev"] {
+            let client_dir = storage.module_dir_for_companions("mod-a").join(client);
+            std::fs::create_dir_all(&client_dir).unwrap();
+            std::fs::write(client_dir.join("customer_42.cbor"), b"sub").unwrap();
+        }
+        let before = std::fs::read(
+            storage
+                .module_dir_for_companions("mod-a")
+                .join("preview-1234.cnft.dev")
+                .join("customer_42.cbor"),
+        )
+        .unwrap();
+
+        let router = admin_router(
+            storage.clone(),
+            Arc::new(configured_authenticator(
+                OperatorTokenAsClient::AllowWithWarning,
+            )),
+        );
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/_admin/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {FULL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status.unowned_clients, vec!["preview-1234.cnft.dev"]);
+        // Reported, NOT removed. This order takes nothing away.
+        assert_eq!(
+            std::fs::read(
+                storage
+                    .module_dir_for_companions("mod-a")
+                    .join("preview-1234.cnft.dev")
+                    .join("customer_42.cbor")
+            )
+            .unwrap(),
+            before,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_mode_is_unchanged_v2() {
+        let dir = tempdir("legacy");
+        let router = admin_router(
+            ModuleStorage::new(&dir),
+            Arc::new(crate::auth::Authenticator::legacy(
+                Some(FULL.to_owned()),
+                Some(READONLY.to_owned()),
+            )),
+        );
+
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(FULL)).await,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", Some(READONLY)).await,
+            StatusCode::OK,
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                "/_admin/modules/m/evict",
+                Some(READONLY)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", None).await,
+            StatusCode::UNAUTHORIZED,
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn open_mode_allows_an_unauthenticated_request() {
+        let dir = tempdir("open-mode");
+        let router = admin_router(
+            ModuleStorage::new(&dir),
+            Arc::new(crate::auth::Authenticator::legacy(None, None)),
+        );
+        assert_eq!(
+            call(&router, Method::GET, "/_admin/status", None).await,
+            StatusCode::OK,
+            "a host with no MITOS_AUTH_TOKEN runs open, exactly as v2 did",
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

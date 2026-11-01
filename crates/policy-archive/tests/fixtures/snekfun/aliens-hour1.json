@@ -1,0 +1,95 @@
+{
+  "source": "https://charts.snek.fun/v1/charts/history?base=16657df32ad8eaa8f8c628586ac6b8ba3771226c12bd69b582738fb7.416c69656e73&quote=.&from=1771128940&to=1771713914&resolution=hour1",
+  "fetched": "2026-10-25",
+  "selection": "A SAMPLE of the 162 hourly bars the window returns: the launch bar, the last two bars of the pause, the first bar that moves, and a spread across the rush and into graduation. The values are verbatim; only the selection is ours, and the repeated `pair` object is omitted from each bar because it is identical in all of them.",
+  "bars": [
+    {
+      "time": 1771131600,
+      "low": 2.545182,
+      "high": 2.95141820303,
+      "open": 2.545182,
+      "close": 2.545182,
+      "volume": 397156498
+    },
+    {
+      "time": 1771527600,
+      "low": 2.545182,
+      "high": 2.545182,
+      "open": 2.545182,
+      "close": 2.545182,
+      "volume": 0
+    },
+    {
+      "time": 1771531200,
+      "low": 2.545182,
+      "high": 2.545182,
+      "open": 2.545182,
+      "close": 2.545182,
+      "volume": 0
+    },
+    {
+      "time": 1771534800,
+      "low": 2.545182,
+      "high": 4.2502373685866,
+      "open": 2.545182,
+      "close": 3.6839165369699,
+      "volume": 544581013
+    },
+    {
+      "time": 1771538400,
+      "low": 3.6839165369699,
+      "high": 8.7923746769807,
+      "open": 3.6839165369699,
+      "close": 5.2871433480159,
+      "volume": 1796443561
+    },
+    {
+      "time": 1771542000,
+      "low": 5.2871433480159,
+      "high": 10.383086131769,
+      "open": 5.2871433480159,
+      "close": 10.082965162113,
+      "volume": 1470243999
+    },
+    {
+      "time": 1771603200,
+      "low": 10.027598697432,
+      "high": 13.550597276002,
+      "open": 12.94987184963,
+      "close": 10.325075099745,
+      "volume": 771759471
+    },
+    {
+      "time": 1771624800,
+      "low": 26.80643497227,
+      "high": 51.137356021821,
+      "open": 26.80643497227,
+      "close": 51.137356021821,
+      "volume": 16656005931
+    },
+    {
+      "time": 1771628400,
+      "low": 35.696564220478,
+      "high": 51.137356021821,
+      "open": 51.137356021821,
+      "close": 43.744885141829,
+      "volume": 19279863647
+    },
+    {
+      "time": 1771707600,
+      "low": 46.857535139756,
+      "high": 48.402390562933,
+      "open": 47.98033125919,
+      "close": 48.402390562933,
+      "volume": 855423167
+    },
+    {
+      "time": 1771711200,
+      "low": 48.402390562933,
+      "high": 49.924300073178,
+      "open": 48.402390562933,
+      "close": 49.924300073178,
+      "volume": 500000000
+    }
+  ]
+}

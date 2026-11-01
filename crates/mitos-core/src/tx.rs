@@ -25,15 +25,27 @@ use dolos::adapters::DomainAdapter;
 use dolos_core::{ChainError, Domain, DomainError, MempoolError, SubmitExt};
 use mitos_protocol::submit::{SUBMIT_MIME, SubmitTxRequest, SubmitTxResponse};
 
-use crate::auth::{AuthToken, require_auth};
+use std::sync::Arc;
 
-/// Build the tx-submission router, gated by the shared-secret auth token. Merged
-/// into the host `app` in [`crate::bundle::Bundle::run`].
-pub fn tx_router(domain: DomainAdapter, auth: AuthToken) -> Router {
+use crate::auth::{Authenticator, authenticate, require_submit_tx};
+
+/// Build the tx-submission router. Merged into the host `app` in
+/// [`crate::bundle::Bundle::run`].
+///
+/// `Attempt::SubmitTx` rather than an admin attempt: the route names no
+/// client, and its callers are the six workers that link `services/tx-submit`
+/// as a library. Each holds `MITOS_AUTH_TOKEN` through a `wrangler.toml`
+/// binding with no Rust reference of its own, so each keeps working once that
+/// secret holds a namespace token — a namespace principal may submit.
+pub fn tx_router(domain: DomainAdapter, auth: Arc<Authenticator>) -> Router {
     Router::new()
         .route("/api/tx/submit", post(submit_handler))
         .with_state(domain)
-        .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            auth.clone(),
+            require_submit_tx,
+        ))
+        .layer(axum::middleware::from_fn_with_state(auth, authenticate))
 }
 
 async fn submit_handler(State(domain): State<DomainAdapter>, body: Bytes) -> Response {

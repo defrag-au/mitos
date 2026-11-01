@@ -32,9 +32,22 @@ members = [
     "crates/mitos-launchpad-decode",
     "crates/mitos-marketplace-decode",
     "crates/chain-sieve",
+    # The shared block/tx decode, extracted from `tools/mitos-chain-walk` on
+    # 2026-09-22. Five crates and every walker consume it, and it is the seam a
+    # hand-rolled era-specialised decoder replaces — so it is addressable on its
+    # own before that work starts. `mitos-chain-walk` re-exports it as `decode`.
+    "crates/chain-decode",
     "crates/market-ledger-wire",
     "crates/token-ledger-wire",
     "crates/policy-archive",
+    # policy-archive's rows → the chain-neutral event vocabulary the holder-behaviour
+    # store speaks. A separate crate because the vocabulary is shared with the EVM
+    # feed: this is the half that knows Cardano, and only this half does.
+    "crates/chain-events-cardano",
+    # A token's history as compact binary chunks with stable party numbers:
+    # written on cardano-infra, read by the flow explorer's macroquad arena.
+    # No dependencies, so it links anywhere.
+    "crates/token-tape",
     # The published catalogue of what collections EXIST — pure types + postcard,
     # written on cardano-infra and read by a Worker and an egui WASM palette.
     "crates/collection-catalogue",
@@ -42,8 +55,50 @@ members = [
     # catalogue's. Only the generic half moved; the ORDER each artifact
     # publishes in stays with the artifact.
     "crates/cf-publish",
+    # Validates an unpacked Mithril snapshot, and publishes it to R2. The rule is
+    # Mithril's, and it is published rather than inferred: Mithril keeps appending
+    # to the highest-numbered immutable file until the next one seals, and
+    # `pallas-hardano` / `chain-sieve` drop that file on READ — correct for a
+    # running node, wrong for a snapshot, whose top file the aggregator already
+    # signed. So the boundary comes from `/artifact/cardano-database/digests`, and a
+    # local part is publishable when that map names it and canonical when its
+    # SHA-256 matches. Same set goes to R2 that readers serve.
+    "crates/mithril-snapshot",
+    # Reads a Mithril snapshot's immutable files over HTTP range requests, so a
+    # reader can consume the R2 mirror with no local copy of the database. Split
+    # from `mithril-snapshot` because that crate validates and PUBLISHES and so
+    # links `mithril-client` + `tokio`, which an indexer must not inherit.
+    "crates/mithril-source",
     "crates/none-match-indexer",
     "crates/tx-index",
+    # The live UTxO set as an immutable artifact — rows, three narrow orderings
+    # over them, and the reader that serves them. Extracted from
+    # `tools/fold-probe` on 2026-09-23, when mitos became the second consumer:
+    # the probe WRITES the book and the data plane reads it, and a binary crate
+    # cannot be depended on. `docs/design/LIVE_BOOK.md` is the spec.
+    "crates/live-book",
+    # The fold plane's contract: an `Aggregate` over one deterministic walk, a registry
+    # that runs them, and the artifact envelope every aggregate describes itself with.
+    # `docs/design/FOLD_PLANE.md` is the spec. Pure: no I/O, no chain types, no wasm.
+    "crates/mitos-fold",
+    # The native walker for the fold plane: a chunk window, decoded once into an owned
+    # `DecodedBlock`, handed to a `mitos-fold` registry. A sibling crate rather than a
+    # feature of the contract, so the contract stays dependency-free and linkable by a
+    # worker, a test and a game.
+    "crates/mitos-fold-walk",
+    # The first production aggregate on the fold plane: one policy's holders from a
+    # DecodedBlock, grouped by stake credential and classified by mitos-cohort.
+    "crates/mitos-holder-table",
+    # Readiness-driven dispatch for ranged reads: the wants a reader discovers as
+    # bytes arrive, planned into the fewest in-flight requests instead of awaited
+    # one phase at a time. Pure — no I/O, no async, no clock — so the browser, a
+    # Worker and a scripted test drive the same core. Depend on `live-book` for the
+    # planning half; it does not reimplement it.
+    "crates/fetch-driver",
+    # Structured timing for the operations mitos does repeatedly: a closed
+    # vocabulary of operation names, bounded-memory percentiles, and a report that
+    # two runs can be diffed. Zero dependencies, so every tool can link it.
+    "crates/mitos-meter",
     # The mint-keyed companion to tx-index. A separate crate, but NOT a
     # separate extraction pass — it is pure over blocks tx-index already
     # decoded, which is what keeps it at the measured +1.8% rather than +100%.
@@ -53,6 +108,14 @@ members = [
     # second copy of a client whose row shapes have already drifted under us
     # is how the two quietly disagree.
     "crates/mitos-koios",
+    # Platform v3's state machines (docs/strategy/MITOS_PLATFORM_V3.md §5) as
+    # pure reducers — no tokio, no wasmtime, no redb. Every lifecycle DECISION
+    # lives here; `mitos-platform` only executes the effects it returns.
+    "crates/mitos-lifecycle",
+    # Node description (`mitos.toml`) + the derived dolos config + the
+    # signed-catalogue types. Pure: serde/toml/thiserror, no I/O, no dolos
+    # types. PLAN-I Phase 2; `mitos-core` adapts `DerivedDolos` to RootConfig.
+    "crates/mitos-config",
     "bundles/default",
     "tools/capture-block",
     "tools/diff-collection-ownership",
@@ -62,15 +125,34 @@ members = [
     "tools/mitos-run",
     "tools/mitos-chain-walk",
     "tools/market-ledger",
+    # Resolves a policy's first mint through Koios and fetches the Mithril
+    # immutable-file window its history needs. A TUI over the same core a
+    # script drives, because the answer is a range of chunks, not a token.
+    "tools/mithril-fetch",
     "tools/project-ledger",
     # Artifacts derived from the policy index — the collection catalogue.
     # A READER of the index, never a walker: the daily `tx-index build
     # --policy-index-dir` already pays the extraction pass.
     "tools/policy-ledger",
+    # The Cardano half of the chain-events ingest, proven against a sealed
+    # archive: every movement row becomes one event, and the events fold back
+    # to the same holders the archive reconciles to.
+    "tools/policy-events",
+    # The stream, on a terminal: reads `--events` NDJSON from a pipe or a file
+    # and draws what arrived, per block, with the rows worth a second look.
+    "tools/event-firehose",
+    # N producers, one timeline: reads `chain-events` NDJSON from any number of sources,
+    # filters by collection, and emits the union in chain order.
+    "tools/event-merge",
     "tools/token-ledger",
     "tools/wallet-sieve",
     "tools/wallet-trace",
     "tools/tx-index",
+    # Measures what a UTxO fold over the chunk log costs — decode/apply split,
+    # same-chunk spend rate, live-set size, peak anon RSS. A probe, not a
+    # service: it answers a question rather than serving one. See
+    # docs/design/MITHRIL_PHONEBOOK.md.
+    "tools/fold-probe",
     # Reads the chunk store, writes nothing: measures what a block-lottery
     # threshold would have selected over certified history.
     "tools/slotling-backtest",
@@ -139,10 +221,15 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "f24eb7977a0627f53579182c2e8a7440e4630dd9" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f", features = ["cip14", "cip25"] }
+address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+# The chain-neutral event vocabulary. `be4544a2` predates the crate, so this resolves
+# through the `[patch]` block at the bottom while the branch that carries it is local —
+# bump this `rev` and re-comment that block together, never one without the other.
+chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -179,6 +266,12 @@ memmap2 = "0.9"
 # it hands each chunk's pages back rather than evict the other services that
 # share the box's cache. Linux only, behind a cfg.
 libc = "0.2"
+# Copy-on-write file clone where the filesystem has one, a byte copy where it
+# does not. A client move copies a parent instance's `kv.redb` — 1.3 GB on the
+# largest module today — with that parent's follower STOPPED, so the copy IS
+# the downtime. Identical to `std::fs::copy` on the current box's ext4; a
+# metadata-only clone on the next one's XFS, which is chosen for exactly this.
+reflink-copy = "0.1"
 
 # Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
 # compiles sqlite from source (on-box build, no system dep).
@@ -208,9 +301,10 @@ strip = "symbols"
 
 # --- Patch overrides ---
 #
-# CURRENTLY ACTIVE (2026-08-16) — consuming the sibling tree at
-# `../shared-crates`.
-# **RE-COMMENT THE WHOLE BLOCK BEFORE COMMIT** so CI uses the git revs.
+# **ACTIVE (2026-10-29)** — developing against the sibling tree at `../shared-crates`,
+# because `chain-events` is not on the pinned rev yet. The commented state is what CI and
+# the arm box see: **re-comment the WHOLE BLOCK BEFORE COMMIT**, and bump the
+# `chain-events` rev in the same commit so the two cannot drift.
 #
 # Toggle the block as a UNIT, never line by line: a selective edit either
 # duplicates a key (if a line ends up both active and commented) or breaks an
@@ -234,9 +328,8 @@ strip = "symbols"
 # cardano-assets = { path = "../shared-crates/cardano-assets" }
 # pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
 # chain-ledger = { path = "../shared-crates/chain-ledger" }
-# address-registry re-added 2026-08-21: project-ledger's classify consumes it
-# again (workspace.dependencies entry above), so it belongs in the block.
 # address-registry = { path = "../shared-crates/address-registry" }
+# chain-events = { path = "../shared-crates/chain/chain-events" }
 
 # `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which
 # returns None for an output stored in an earlier era — and a resolved UTxO

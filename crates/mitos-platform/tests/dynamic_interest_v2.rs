@@ -99,7 +99,8 @@ async fn dynamic_interest_changes_filter_mid_stream() {
             rx: rx_holder.clone(),
         }
     });
-    let kv_factory: KvFactory = Arc::new(|_id: &str| state_kv::ModuleKv::new_in_memory());
+    let kv_factory: KvFactory =
+        Arc::new(|_key: &mitos_lifecycle::ids::InstanceKey| state_kv::ModuleKv::new_in_memory());
     let emitter_factory: EmitterFactory = Arc::new(emit::EventSink::new);
 
     let host = ModuleHostV2::new(

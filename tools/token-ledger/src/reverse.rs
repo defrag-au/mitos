@@ -229,6 +229,11 @@ pub struct Outcome {
     pub unresolved: u64,
     /// Bytes of `pending.bin` — the carried state, measured.
     pub pending_bytes: u64,
+    /// What this pass learned about the policy's USER units. Merged into the
+    /// manifest's profile rather than replacing it: a pass sees one window,
+    /// and the volatile tail is the only thing that sees a freshly launched
+    /// token at all. Plumbing units are already excluded here — see `Scan`.
+    pub profile: policy_archive::Profile,
 }
 
 /// Run one reverse pass. The CLI face: logs progress and prints a summary.
@@ -385,6 +390,7 @@ pub fn run_reporting(args: ReverseArgs, hooks: Hooks<'_>) -> Result<Outcome> {
             by_index: 0,
             unresolved: carried as u64,
             pending_bytes: 0,
+            profile: policy_archive::Profile::default(),
         });
     }
 
@@ -653,9 +659,11 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         written_unix: sealed_unix,
     });
     // LAST. A reader that opens the manifest sees a pass whose files exist.
+    //
+    // The KV bundle is NOT written here: it is derived, only `publish` reads
+    // it, and `publish` rebuilds it from the manifest it flips. Writing it here
+    // re-read every footer for a blob the next publish regenerates anyway.
     archive::store_manifest(dir, manifest)?;
-    // And the bundle the push puts in KV, from the files that manifest names.
-    archive::store_bundle(dir, manifest)?;
 
     // ROLLUP, once enough passes have piled up: every reader pays a footer
     // per file, and a satellite publishing to R2 wants one object per
@@ -691,6 +699,7 @@ fn land(l: Landing<'_>) -> Result<Outcome> {
         by_index: walked.by_index,
         unresolved: pending_file.spenders.len() as u64,
         pending_bytes,
+        profile: walked.profile,
     })
 }
 
@@ -732,24 +741,27 @@ fn probe_first_mint(policy_hex: &str, index_dir: Option<&Path>) -> Option<u64> {
 /// built over, and a policy first minted after that is exactly the case a
 /// stale index would otherwise answer wrongly.
 fn probe_via_index(policy_hex: &str, dir: &Path) -> Option<u64> {
-    let path = policy_index::base_path(dir);
-    let base = match policy_index::Base::open(&path) {
-        Ok(b) => b,
+    let floors = match policy_index::Floors::open(dir) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            tracing::warn!(dir = %dir.display(), "probe: no policy index; trying koios");
+            return None;
+        }
         Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "probe: no policy index; trying koios");
+            tracing::warn!(error = %e, dir = %dir.display(), "probe: unreadable policy index; trying koios");
             return None;
         }
     };
     let policy = hex::decode(policy_hex).ok()?;
     let prefix = policy_index::policy_prefix(&policy);
-    let chunk = base.first_chunk_of(prefix)?;
+    let chunk = floors.first_chunk_of(prefix)?;
     let slot = u64::from(chunk) * crate::registry::CHUNK_SLOTS;
-    let (from, to) = base.covers();
+    let (from, to) = floors.covers();
     tracing::info!(
         slot,
         chunk,
         index_covers = format!("{from}..={to}"),
-        source = "policy-index/first_chunk",
+        source = floors.source(),
         "probe: first mint"
     );
     Some(slot)
@@ -888,6 +900,9 @@ pub struct PassTx {
     pub hash: Hash<32>,
     pub slot: u64,
     pub block_time: u64,
+    /// The transaction's position in its block, 0-based. The tiebreak `slot`
+    /// cannot provide — see `Movement::tx_index`.
+    pub tx_index: u32,
     /// Per unit: 0 / +mint / −burn.
     pub net_mint: Vec<(Vec<u8>, i64)>,
     /// `(unit, address, amount)` — its outputs.
@@ -915,6 +930,7 @@ impl PassTx {
                     .iter()
                     .find(|(n, _)| n == unit)
                     .map_or(0, |(_, a)| *a),
+                tx_index: self.tx_index,
             })
             .collect();
         for (unit, amount) in &self.net_mint {
@@ -927,6 +943,7 @@ impl PassTx {
                     address: String::new(),
                     amount: 0,
                     net_mint: *amount,
+                    tx_index: self.tx_index,
                 });
             }
         }
@@ -1077,6 +1094,13 @@ impl Pending {
                         address: address.to_string(),
                         amount: -qty,
                         net_mint,
+                        // A correction row for a transaction in an earlier
+                        // pass. It is attached to that transaction by hash and
+                        // never ordered by this field, so `0` here means
+                        // UNKNOWN, not position zero: the transaction's own
+                        // rows carry the position, and both `fold_rows` and the
+                        // segment merge keep the known one.
+                        tx_index: 0,
                     },
                 });
             }
@@ -1519,7 +1543,10 @@ impl Scan<'_> {
             let block_time = slot_to_unix(slot);
 
             let txs: Vec<_> = blk.txs();
-            for tx in txs.iter().rev() {
+            // REVERSE within the block, because the descent is newest-first. The
+            // INDEX is still the chain's own, so a row can be ordered by it
+            // later — the iteration order is about resolution, not identity.
+            for (tx_index, tx) in txs.iter().enumerate().rev() {
                 // PHASE-2 FAILURE. The BLOCK declares this transaction
                 // invalid, so the ledger never created its outputs and never
                 // consumed its inputs — only its collateral was taken. Its
@@ -1578,9 +1605,16 @@ impl Scan<'_> {
                     // a movement and nothing more; there is no state on it to
                     // observe, and recording every one would multiply the file
                     // by the holder count for no reader.
-                    // Every unit sighting feeds the profile, script-held or
-                    // not — what a policy IS does not depend on where it sits.
+                    // Every USER unit sighting feeds the profile, script-held
+                    // or not — what a policy IS does not depend on where it
+                    // sits. Plumbing is excluded: a launchpad pool's state NFT
+                    // is a CIP-67 reference twin with quantity 1, and counting
+                    // it would make a fungible token's profile `mixed`, which
+                    // the site reads as "no single scale" and refuses a cap.
                     for (name, qty) in &units {
+                        if !crate::archive::is_user_unit(name) {
+                            continue;
+                        }
                         let was = self.fungible_units.contains(name);
                         let first = self.units_seen.insert(name.clone());
                         self.profile.observe(first, was, *qty);
@@ -1676,6 +1710,7 @@ impl Scan<'_> {
                     hash: dtx.tx_hash,
                     slot,
                     block_time,
+                    tx_index: tx_index as u32,
                     net_mint: net_mint.into_iter().collect(),
                     deltas,
                 };
@@ -1828,6 +1863,7 @@ pub fn scan_blocks(
         by_index: scan.resolved_by_index,
         unresolved: scan.pending.len() as u64,
         pending_bytes: 0,
+        profile: scan.profile,
     })
 }
 
@@ -1965,6 +2001,7 @@ mod tests {
             hash: h(b),
             slot: 1_000 + b as u64,
             block_time: 1_700_000_000 + b as u64,
+            tx_index: b as u32,
             net_mint: Vec::new(),
             deltas: deltas
                 .into_iter()

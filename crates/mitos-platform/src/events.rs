@@ -84,6 +84,74 @@ pub enum EventKind {
     /// The watchdog found a module with registered companions but no
     /// live follower and restarted it (see `watchdog.rs`).
     WatchdogRestart { outcome: String },
+    /// A client action (subscribe, interest mutation) was authorised with the
+    /// OPERATOR's full token rather than the client's namespace token.
+    ///
+    /// This is the rollout's instrument: every worker holds the operator
+    /// token today, so `operator_token_as_client` starts at
+    /// `allow-with-warning` and each worker's secret is rotated to its
+    /// namespace token one at a time. A client drops out of this feed once it
+    /// has been rotated; when the feed is empty the mode can be flipped to
+    /// `refuse`. It is here rather than only in the journal precisely because
+    /// "who is left" must be a query.
+    ///
+    /// Debounced per client — see `companions::OperatorAsClientDebounce`.
+    OperatorTokenUsedAsClient { client_id: String },
+    /// The instance lifecycle wants an operator to look at this module. The
+    /// only alert today is "every client vanished and the governing policy is
+    /// `AlertOnly`" — in production a vanished client is far more likely an
+    /// outage on the client's side than a decision, so the follower keeps
+    /// running and a human decides. The transport is this ring and a log line;
+    /// D11 adds a webhook.
+    InstanceAlert {
+        alert: mitos_lifecycle::instance::InstanceAlert,
+    },
+    /// A lifecycle effect failed. The record is NOT rolled back — it is what
+    /// should be true, and the watchdog is what closes the gap — so this is
+    /// the only place a failed start or reap is visible as a query rather
+    /// than a journal grep.
+    LifecycleEffectFailed { effect: String, error: String },
+    /// A client's announced move could not proceed: the artifact was
+    /// unreachable or refused, a rollback was not permitted, or the fork cap
+    /// was reached.
+    ///
+    /// Never fatal to the subscribe — the client stays registered and served
+    /// by the instance it is on — so this ring is where an operator finds out
+    /// that a worker's new build is NOT the one running.
+    MoveFailed { client_id: String, reason: String },
+    /// An instance was reaped while its emissions store still held `Queued`
+    /// rows — companions were owed those and will never receive them.
+    ///
+    /// Not an error: a reap is a decision the machine reached, and refusing
+    /// it would leave an instance that can never be retired. But it is the
+    /// ONLY trace that delivery was cut short, until WO-09 owns what a
+    /// departing instance still owes.
+    InstanceReapedWithQueuedRows { instance: String, queued: usize },
+    /// A client move created a staging instance by copying its parent's
+    /// state, with the PARENT'S FOLLOWER STOPPED for the duration.
+    ///
+    /// `millis` is that downtime, and it is the reason this is a first-class
+    /// event rather than a log line: the largest `kv.redb` on the box is
+    /// 1.3 GB, and "a dev worker's announcement paused prod's follower for N
+    /// seconds" is a question an operator asks after the fact.
+    StagingCopy {
+        instance: String,
+        parent: String,
+        bytes: u64,
+        millis: u64,
+    },
+    /// A client's switch stopped BOTH of its followers — the live one and the
+    /// one it is moving to — so the row could be committed with neither
+    /// running. `millis` is how long they were down: milliseconds of work,
+    /// plus however long each took to finish its block in flight.
+    ///
+    /// On the ring for the same reason as `StagingCopy`: it is a pause of a
+    /// production follower, and an operator asks about those after the fact.
+    QuiescePair {
+        live: String,
+        staging: String,
+        millis: u64,
+    },
 }
 
 impl EventKind {
@@ -102,6 +170,13 @@ impl EventKind {
             EventKind::Trap { .. } => "trap",
             EventKind::FollowerExited { .. } => "follower_exited",
             EventKind::WatchdogRestart { .. } => "watchdog_restart",
+            EventKind::OperatorTokenUsedAsClient { .. } => "operator_token_used_as_client",
+            EventKind::InstanceAlert { .. } => "instance_alert",
+            EventKind::LifecycleEffectFailed { .. } => "lifecycle_effect_failed",
+            EventKind::MoveFailed { .. } => "move_failed",
+            EventKind::InstanceReapedWithQueuedRows { .. } => "instance_reaped_with_queued_rows",
+            EventKind::StagingCopy { .. } => "staging_copy",
+            EventKind::QuiescePair { .. } => "quiesce_pair",
         }
     }
 }

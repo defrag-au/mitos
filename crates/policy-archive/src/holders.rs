@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::schema::Movement;
 
 /// One party's holding.
@@ -36,8 +38,12 @@ pub struct Holder {
     /// which genuinely has no stake part. Those cannot be merged with anything
     /// and must not be merged with each other.
     pub key: String,
-    /// One address this party used — enough to resolve a handle or open an
-    /// explorer, and NOT a claim that it is the only one.
+    /// The lexicographically smallest address this party used — enough to
+    /// resolve a handle or open an explorer, and NOT a claim that it is the
+    /// only one. Chosen rather than "the first seen" so a party's
+    /// representative is the same in every fold, however the rows are ordered;
+    /// [`crate::summary`] folds the same history and must name the same
+    /// address, or the two tables label one party two ways.
     pub address: String,
     /// Units held. For a fungible policy this is the balance; for an NFT
     /// collection it is **how many items**, which is the useful reading of the
@@ -62,10 +68,58 @@ pub struct Holder {
 /// counted by [`Fold::negative`] rather than silently discarded, because a
 /// table that quietly drops the evidence of its own incompleteness is how an
 /// incomplete table gets trusted.
-pub fn fold(movements: impl Iterator<Item = Movement>) -> Fold {
-    let mut by_key: HashMap<String, Holder> = HashMap::new();
-    let mut seen_addresses: HashMap<String, Vec<String>> = HashMap::new();
-    let mut rows = 0u64;
+pub fn fold<'a>(movements: impl Iterator<Item = &'a Movement>) -> Fold {
+    fold_onto(movements, &Carry::default())
+}
+
+/// The UNFILTERED balance state — what a fold needs to resume.
+///
+/// ⚠️ Not [`Fold`]. `Fold` publishes only the rows that ended POSITIVE: a
+/// party at zero at the boundary is not a holder, and dropping it there would
+/// make it start again from nothing when it receives above the boundary.
+/// A negative balance is likewise an archive defect worth carrying forward,
+/// not erasing at a seam.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Carry {
+    /// Party key → running state.
+    ///
+    /// The address LIST is kept rather than a count, because
+    /// [`Holder::addresses`] is a count of DISTINCT addresses: a number alone
+    /// cannot tell a new address from a wallet reusing one it already had, and
+    /// repeat use above the boundary is the ordinary case.
+    pub parties: HashMap<String, Party>,
+    /// Movement rows folded, including the ones that netted to nothing.
+    pub rows: u64,
+}
+
+/// One party's running state, before [`Fold`] decides what to publish.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Party {
+    /// One address this party used — the one a reader is shown.
+    pub address: String,
+    pub amount: i64,
+    pub movements: u32,
+    pub addresses: Vec<String>,
+}
+
+/// The carried state after folding these movements, without publishing.
+pub fn carry<'a>(movements: impl Iterator<Item = &'a Movement>) -> Carry {
+    accumulate(Carry::default(), movements)
+}
+
+/// Fold movements ONTO a carried balance table, and publish the result.
+pub fn fold_onto<'a>(movements: impl Iterator<Item = &'a Movement>, carry: &Carry) -> Fold {
+    finalise(accumulate(carry.clone(), movements))
+}
+
+fn accumulate<'a>(mut carry: Carry, movements: impl Iterator<Item = &'a Movement>) -> Carry {
+    use std::collections::HashMap;
+
+    let Carry { parties, rows } = &mut carry;
+    // Address → key, worked out once per address rather than once per row. The
+    // key is a bech32 decode, and a wallet's history is thousands of rows of
+    // the same few addresses; repeating that decode was most of the fold.
+    let mut keys: HashMap<&'a str, String> = HashMap::new();
 
     for m in movements {
         // A placeholder stands in for a `(tx, unit)` attributed to nobody. It
@@ -73,40 +127,59 @@ pub fn fold(movements: impl Iterator<Item = Movement>) -> Fold {
         if m.is_placeholder() || m.address.is_empty() {
             continue;
         }
-        rows += 1;
-        // Stake-keyed, so one wallet is one row however many payment addresses
-        // it rotates through. An enterprise address has no stake part and keys
-        // by itself.
-        let key = crate::trade::address_parts(&m.address)
-            .and_then(|(_, stake)| stake)
-            .unwrap_or_else(|| m.address.clone());
-        let e = by_key.entry(key.clone()).or_insert_with(|| Holder {
-            key: key.clone(),
+        *rows += 1;
+        let key = keys
+            .entry(m.address.as_str())
+            .or_insert_with(|| key_of(&m.address));
+        let e = parties.entry(key.clone()).or_insert_with(|| Party {
             address: m.address.clone(),
             amount: 0,
             movements: 0,
-            addresses: 0,
+            addresses: Vec::new(),
         });
         e.amount += m.amount;
         e.movements += 1;
-        let addrs = seen_addresses.entry(key).or_default();
-        if !addrs.contains(&m.address) {
-            addrs.push(m.address.clone());
+        if !e.addresses.contains(&m.address) {
+            e.addresses.push(m.address.clone());
         }
     }
 
+    carry
+}
+
+/// The key one party is folded under: its stake part, so one wallet is one
+/// row however many payment addresses it rotates through. An enterprise
+/// address has no stake part and keys by itself. Shared with
+/// [`crate::summary`], whose checkpoints must name the same parties.
+pub fn key_of(address: &str) -> String {
+    crate::trade::account_key(address)
+}
+
+fn finalise(carry: Carry) -> Fold {
+    let Carry { parties, rows } = carry;
     let mut negative = 0usize;
-    let mut holders: Vec<Holder> = by_key
-        .into_values()
-        .filter(|h| {
-            if h.amount < 0 {
+    let mut holders: Vec<Holder> = parties
+        .into_iter()
+        .filter(|(_, p)| {
+            if p.amount < 0 {
                 negative += 1;
             }
-            h.amount > 0
+            p.amount > 0
         })
-        .map(|mut h| {
-            h.addresses = seen_addresses.get(&h.key).map_or(1, |a| a.len() as u32);
-            h
+        .map(|(key, p)| {
+            let address = p
+                .addresses
+                .iter()
+                .min()
+                .cloned()
+                .unwrap_or_else(|| p.address.clone());
+            Holder {
+                key,
+                address,
+                amount: p.amount,
+                movements: p.movements,
+                addresses: p.addresses.len() as u32,
+            }
         })
         .collect();
     // Deterministic: by amount, then by key, so equal balances do not shuffle
@@ -150,6 +223,87 @@ impl Fold {
     }
 }
 
+/// Publish a carried table without folding anything more.
+///
+/// The other half of [`Carry`]: a reader that finds a written artefact but no
+/// rows above its boundary still has to hand back a [`Fold`].
+pub fn publish(carry: &Carry) -> Fold {
+    finalise(carry.clone())
+}
+
+/// On-disk name of the DERIVED balance table, beside `series.bin`.
+///
+/// ⚠️ An ARTEFACT, not truth. It is folded from the archive and can be deleted
+/// at any time; a reader that cannot use it must fall back to [`fold`], never
+/// to an empty table.
+pub const HOLDERS: &str = "holders.bin";
+
+/// Bumped when [`Carry`], [`Party`] or [`Fold`] changes shape. Same rule as
+/// [`crate::SERIES_FORMAT`]: a stale file and a broken one are different
+/// answers, so the byte is checked before anything is deserialized.
+///
+/// ⚠️ **2 makes [`HoldersFile::settled_to`] the IMMUTABLE boundary.** Version 1
+/// was written from a fold that could include the volatile tail while naming a
+/// boundary above it, so its carry held rows a later tail fold folded AGAIN.
+/// The tail is replaced whole, so those rows cannot be trusted to still exist;
+/// every version-1 file is refused and rebuilt rather than read.
+///
+/// ⚠️ **3 excludes PLUMBING units.** A version-2 carry was folded over every
+/// unit in the archive, so a CIP-68 reference twin or a CIP-27 royalty token
+/// sat in the table as a holding. MEASURED 2026-10-29 on the Ada Handle policy:
+/// 46,167 reference twins added 46,168 to `held` on top of the 266,985 the
+/// supply route reports. The supply route has always excluded them; the holder
+/// table now does too, so the two can be compared.
+pub const HOLDERS_FORMAT: u8 = 3;
+
+/// What `holders.bin` holds: the balance state, and the archive it describes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HoldersFile {
+    pub format: u8,
+    /// The archive's IMMUTABLE coverage ceiling when this was folded — see
+    /// [`crate::series::SeriesFile::immutable_to`] for why that key and not
+    /// `updated_unix`.
+    pub immutable_to: u64,
+    /// The slot the table is complete through. Movements above it are folded
+    /// on read; see [`crate::series::Carry::settled_to`].
+    pub settled_to: u64,
+    pub carry: Carry,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HoldersError {
+    #[error(
+        "holders is format {found}, this build reads {expected} — a stale copy, \
+         not a broken one"
+    )]
+    Version { found: u8, expected: u8 },
+    #[error("holders is empty")]
+    Empty,
+    #[error("decoding the holders: {0}")]
+    Decode(#[from] postcard::Error),
+}
+
+impl HoldersFile {
+    pub fn encode(&self) -> Result<Vec<u8>, HoldersError> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// Version-checked decode, on byte zero before anything else is trusted.
+    pub fn decode(bytes: &[u8]) -> Result<Self, HoldersError> {
+        match bytes.first() {
+            Some(&HOLDERS_FORMAT) => {}
+            Some(&found) => {
+                return Err(HoldersError::Version {
+                    found,
+                    expected: HOLDERS_FORMAT,
+                });
+            }
+            None => return Err(HoldersError::Empty),
+        }
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +317,7 @@ mod tests {
             address: addr.into(),
             amount,
             net_mint: 0,
+            tx_index: 0,
         }
     }
 
@@ -174,7 +329,7 @@ mod tests {
         // Same 28-byte stake part, different payment parts.
         let a = "addr1q9xy2xk7s8wvkq0w7qr4t6u9e3xj5m8n2p4r6t8v0w2y4a6c8e0g2j4l6n8q0s2u4w6y8a0c2e4g6j8l0n2q4s6u8w0yjqamn8h";
         let b = "addr1q8ab2xk7s8wvkq0w7qr4t6u9e3xj5m8n2p4r6t8v0w2y4a6c8e0g2j4l6n8q0s2u4w6y8a0c2e4g6j8l0n2q4s6u8w0yjqamn8h";
-        let f = fold([mv(a, 100), mv(b, 300)].into_iter());
+        let f = fold([mv(a, 100), mv(b, 300)].iter());
         // They may or may not share a stake part depending on the synthetic
         // bytes; what must hold is that the fold is driven by the stake part
         // and never by the raw string.
@@ -183,12 +338,18 @@ mod tests {
             assert_eq!(f.holders.len(), 1, "one wallet, one row");
             assert_eq!(f.holders[0].amount, 400);
             assert_eq!(f.holders[0].addresses, 2);
+            // The representative is chosen, not "the first seen": the summary
+            // folds the same history in a different order and must name the
+            // same address.
+            assert_eq!(f.holders[0].address, a.min(b));
+            let reversed = fold([mv(b, 300), mv(a, 100)].iter());
+            assert_eq!(reversed.holders[0].address, f.holders[0].address);
         }
     }
 
     #[test]
     fn a_party_that_sent_everything_back_is_not_a_holder() {
-        let f = fold([mv("addr_a", 100), mv("addr_a", -100), mv("addr_b", 50)].into_iter());
+        let f = fold([mv("addr_a", 100), mv("addr_a", -100), mv("addr_b", 50)].iter());
         assert_eq!(f.holders.len(), 1);
         assert_eq!(f.holders[0].address, "addr_b");
         assert_eq!(f.held, 50);
@@ -198,7 +359,7 @@ mod tests {
     /// rather than being an arithmetic curiosity to round away.
     #[test]
     fn a_negative_balance_is_counted_as_missing_coverage() {
-        let f = fold([mv("addr_a", -100), mv("addr_b", 50)].into_iter());
+        let f = fold([mv("addr_a", -100), mv("addr_b", 50)].iter());
         assert_eq!(f.negative, 1, "the impossible row is REPORTED");
         assert_eq!(f.holders.len(), 1, "and not listed as a holder");
         assert_eq!(f.held, 50);
@@ -208,14 +369,14 @@ mod tests {
     fn placeholders_are_not_parties() {
         let mut p = mv("", 0);
         p.net_mint = 1_000;
-        let f = fold([p, mv("addr_a", 1_000)].into_iter());
+        let f = fold([p, mv("addr_a", 1_000)].iter());
         assert_eq!(f.holders.len(), 1);
         assert_eq!(f.rows, 1, "the placeholder is not a folded row either");
     }
 
     #[test]
     fn holders_are_ordered_largest_first_and_deterministically() {
-        let f = fold([mv("addr_b", 100), mv("addr_a", 100), mv("addr_c", 900)].into_iter());
+        let f = fold([mv("addr_b", 100), mv("addr_a", 100), mv("addr_c", 900)].iter());
         let keys: Vec<&str> = f.holders.iter().map(|h| h.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -227,8 +388,63 @@ mod tests {
     /// ⚠️ `None`, not 0, when there is no supply to take a share of.
     #[test]
     fn concentration_is_undefined_without_a_supply() {
-        let f = fold([mv("addr_a", 100)].into_iter());
+        let f = fold([mv("addr_a", 100)].iter());
         assert_eq!(f.concentration(1, 0), None);
         assert_eq!(f.concentration(1, 200), Some(50.0));
+    }
+
+    /// ⚠️ THE TEST THE CARRY EXISTS FOR.
+    ///
+    /// Folding in two must equal folding in one — including the party that sits
+    /// at ZERO at the seam, which is the row [`Fold`] drops and [`Carry`] must
+    /// not.
+    #[test]
+    fn a_fold_split_at_a_boundary_equals_a_fold_in_one() {
+        let rows = [
+            mv("addr_a", 100),
+            mv("addr_b", 50),
+            // addr_a sends everything: zero at the seam, so it is not a holder
+            // there and must still come back as the SAME party above it.
+            mv("addr_a", -100),
+            mv("addr_a", 30),
+            mv("addr_c", -10),
+            mv("addr_b", 25),
+        ];
+        let whole = fold(rows.iter());
+
+        let seam = carry(rows[..3].iter());
+        let split = fold_onto(rows[3..].iter(), &seam);
+
+        assert_eq!(split, whole);
+        assert!(
+            split
+                .holders
+                .iter()
+                .any(|h| h.key == "addr_a" && h.amount == 30),
+            "the party at zero at the seam must come back with its balance, \
+             not as a new party"
+        );
+        assert_eq!(split.rows, whole.rows, "rows counts every folded movement");
+    }
+
+    #[test]
+    fn the_holders_file_round_trips_and_refuses_another_build() {
+        let file = HoldersFile {
+            format: HOLDERS_FORMAT,
+            immutable_to: 201_160_800,
+            settled_to: 201_160_800,
+            carry: carry([mv("addr_a", 100)].iter()),
+        };
+        let bytes = file.encode().unwrap();
+        assert_eq!(bytes[0], HOLDERS_FORMAT);
+        assert_eq!(HoldersFile::decode(&bytes).unwrap(), file);
+
+        let mut future = bytes.clone();
+        future[0] = HOLDERS_FORMAT + 1;
+        assert!(matches!(
+            HoldersFile::decode(&future),
+            Err(HoldersError::Version { .. })
+        ));
+        assert!(matches!(HoldersFile::decode(&[]), Err(HoldersError::Empty)));
     }
 }

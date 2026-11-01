@@ -294,6 +294,70 @@ mitos_platform::dialer: dial loop started target=jpg-store-offer
   companion=jpg-store-offer
 ```
 
+## Announcing a build, and the hand-off you will not notice
+
+A worker can say which build of the module it was compiled against, by
+filling `SubscribeRequest::announced` with one `AnnouncedModule` per
+target (the wasm sha, the manifest sha, and the manifest's revision).
+The subscribe response carries one `AnnounceOutcome` per entry. A worker
+that announces nothing encodes byte-identically to one from before the
+field existed, and is served exactly as it always was.
+
+An announcement the host accepts does **not** change what that worker is
+being served yet. The host fetches the artifact, builds a second
+*instance* of the module from the running one's state, lets it follow the
+chain until it has caught up, and only then switches the announcing
+client over to it. Every other client of that module stays on the
+instance it is on for as long as it wants to. That is the whole point of
+announcing: one client's deploy is not a module-wide upgrade.
+
+**From the worker's side the switch is invisible, and that is a
+guarantee, not an accident.** Across a hand-off every block reaches the
+client exactly once:
+
+- **No gap.** The new instance replays from its own cursor, which is at
+  or below the one the old instance had reached.
+- **No repeat.** The new instance is told the slot its predecessor had
+  delivered up to and withholds everything at or below it. A rollback
+  *below* that line lowers it again, because the blocks that replace an
+  abandoned fork are new blocks nobody has delivered.
+- **Nothing queued is dropped.** By default the switch waits until the
+  client has read everything the old instance still owed it. A module
+  whose `[[lifecycle.upgrade]]` ledger declares `purge-emissions` for
+  the revision being crossed says the old wire shape is not worth
+  delivering, and those undelivered events are discarded instead.
+
+Your `apply_event` must be idempotent anyway — the dialer can re-deliver
+on a transport retry (see `docs/design/EVENT_DELIVERY_RESILIENCE.md`) —
+and that is also the fallback here if the host's own hand-off record
+cannot be read: it delivers rather than refusing to start, and says so
+loudly in the journal.
+
+Two things a worker should know about the timing:
+
+- A module whose upgrade ledger asks for a `recapture` or a `resync`
+  cannot be moved yet. The announcement is accepted, the move is
+  planned, and it then **waits** — visibly — rather than switching
+  without running the refill. The client keeps being served by the
+  instance it is on throughout.
+- The host carries one catch-up at a time across the whole box, and
+  production namespaces go ahead of development ones. A dev worker's
+  announcement can therefore sit queued behind a production one.
+
+To watch a deploy land, on the operator side:
+
+```
+# Every client of the module, and the phase its move is parked at:
+# queued → preparing → catching-up → (committed, i.e. no pending move).
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$MITOS/_admin/modules/jpg-store-offer/rows" | jq
+
+# Every instance, which one current.toml names, and the hand-off
+# watermark each one is holding per client.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$MITOS/_admin/modules/jpg-store-offer/instances" | jq
+```
+
 ## Rollbacks (chain reorgs)
 
 Cardano rolls back near the tip — routinely by a block or two, and

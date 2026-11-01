@@ -122,7 +122,13 @@ impl ModuleRegistryV2 {
         emitter: emit::EventSink,
         budget: ResourceBudget,
     ) -> PlatformResult<ModuleInstanceV2> {
-        let host_state = HostStateV2::new(self.module_id.clone(), data_plane, kv, emitter);
+        let host_state = HostStateV2::new(
+            self.module_id.clone(),
+            data_plane,
+            kv,
+            emitter,
+            crate::host_fns_v2::fold_data::artifact_for(&self.module_id),
+        );
         let mut store = Store::new(&self.engine, host_state);
 
         store.set_fuel(budget.fuel_per_call)?;

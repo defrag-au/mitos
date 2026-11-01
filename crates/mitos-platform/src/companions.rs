@@ -43,19 +43,21 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 
+use mitos_lifecycle::access::{Attempt, Denied, Granted, Principal};
+use mitos_lifecycle::ids::ClientId;
 use mitos_protocol::{
-    HTTP_DELIVERY_MIME, InterestOp, SUBSCRIBE_MIME, SubscribeRequest, SubscribeResponse,
-    SubscribeTarget, decode_interest_mutation,
+    AnnounceOutcome, AnnounceResult, HTTP_DELIVERY_MIME, InterestOp, SUBSCRIBE_MIME,
+    SubscribeRequest, SubscribeResponse, SubscribeTarget, decode_interest_mutation,
 };
 
 use crate::indexer_bridge::IndexerBridgeHandle;
 
-use crate::admin::AuthToken;
+use crate::auth::Authenticator;
 use crate::dialer::CompanionDialer;
 use crate::storage::ModuleStorage;
 
@@ -68,10 +70,12 @@ use crate::storage::ModuleStorage;
 /// callers always pass `Some(...)`.
 pub fn companion_router(
     storage: ModuleStorage,
-    auth: AuthToken,
+    auth: Arc<Authenticator>,
     dialer: Option<CompanionDialer>,
     indexer_bridge: Option<IndexerBridgeHandle>,
     events: crate::events::EventRing,
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    moves: Option<Arc<crate::moves::MoveManager>>,
 ) -> axum::Router {
     let state = CompanionState {
         storage: Arc::new(storage),
@@ -79,6 +83,10 @@ pub fn companion_router(
         indexer_bridge,
         events,
         resync_recently: ResyncDebounce::default(),
+        auth: auth.clone(),
+        operator_as_client_recently: OperatorAsClientDebounce::default(),
+        lifecycle,
+        moves,
     };
     axum::Router::new()
         .route("/api/companions/subscribe", post(subscribe_handler))
@@ -87,7 +95,14 @@ pub fn companion_router(
             post(interest_mutation_handler),
         )
         .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(auth, require_auth))
+        // Authentication only. Neither of these routes has a single
+        // `Attempt` a layer could build: both name a CLIENT, and for the
+        // interest route the clients are not known until the registrations
+        // are read off disk. Each handler asks `authorize` itself.
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::authenticate,
+        ))
 }
 
 #[derive(Clone)]
@@ -105,6 +120,76 @@ struct CompanionState {
     /// Per-(module, companion_key) debounce for subscribe-time
     /// auto-resync — see `subscribe_handler`.
     resync_recently: ResyncDebounce,
+    /// The host's authenticator. The router's layer proved WHO is calling;
+    /// these handlers are where it is decided whether that principal may act
+    /// as the client the request names.
+    auth: Arc<Authenticator>,
+    /// Per-client debounce for `OperatorTokenUsedAsClient` — see
+    /// `record_operator_token_used_as_client`.
+    operator_as_client_recently: OperatorAsClientDebounce,
+    /// The instance lifecycle. Told to reconcile after a registration is
+    /// written or removed, so an attach or detach lands on the record
+    /// immediately rather than waiting for the 60s tick. `None` in tests that
+    /// exercise persistence alone, and in artifact-only routers.
+    lifecycle: Option<Arc<crate::lifecycle::LifecycleManager>>,
+    /// Client rows and artifact pulls. `None` means the host does not accept
+    /// announcements at all, and every one is refused saying so.
+    moves: Option<Arc<crate::moves::MoveManager>>,
+}
+
+/// Tell the lifecycle the registrations changed.
+///
+/// Best-effort on purpose: a failure here is logged and the request still
+/// succeeds, because the 60s tick reconciles again. This is a hint that saves
+/// a minute, not the mechanism — `Instance::reconcile` diffs the disk, so a
+/// call that never happens is corrected rather than lost.
+async fn nudge_lifecycle(state: &CompanionState, module: &str) {
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        return;
+    };
+    if let Err(e) = lifecycle.reconcile(module).await {
+        tracing::warn!(
+            module = %module,
+            error = %e,
+            "lifecycle reconcile after a registration change failed; the next tick retries",
+        );
+    }
+}
+
+/// Debounce for the `operator_token_used_as_client` event.
+///
+/// ~91 companion DOs re-subscribe at once after a host restart, and while the
+/// rollout is on `allow-with-warning` every one of them is still carrying the
+/// operator token. Without this the event ring — 512 entries — would be
+/// flushed of everything else by a single restart, which is precisely when an
+/// operator most wants to read it. One event per client per window is all the
+/// signal there is: the question the event answers is "which workers are still
+/// on the old token", not "how many times did they ask".
+#[derive(Clone, Default)]
+struct OperatorAsClientDebounce(
+    Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+);
+
+impl OperatorAsClientDebounce {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// True when an event may be recorded for this client. Records the grant,
+    /// so the next call inside the window is refused. Degrades open (allow)
+    /// on lock poisoning — a duplicated warning beats a lost one.
+    fn allow(&self, client_id: &str) -> bool {
+        let Ok(mut map) = self.0.lock() else {
+            return true;
+        };
+        let now = std::time::Instant::now();
+        match map.get(client_id) {
+            Some(last) if now.duration_since(*last) < Self::WINDOW => false,
+            _ => {
+                map.insert(client_id.to_owned(), now);
+                map.retain(|_, t| now.duration_since(*t) < Self::WINDOW);
+                true
+            }
+        }
+    }
 }
 
 /// Debounce guard for subscribe-time auto-resync. A companion that
@@ -144,37 +229,38 @@ impl ResyncDebounce {
     }
 }
 
-// Local re-implementation of the admin auth middleware so the
-// companion router can stand alone without leaking admin-internal
-// items. Same shape; same behaviour.
-async fn require_auth(
-    State(token): State<AuthToken>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> std::result::Result<Response, StatusCode> {
-    if let Some(expected) = token.as_deref() {
-        let provided = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "));
-        match provided {
-            Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => {}
-            _ => return Err(StatusCode::UNAUTHORIZED),
+/// Authorize `principal` to act as `client_id`, and record the rollout
+/// warning when the operator token is what is being used.
+///
+/// Both companion routes funnel through this so the `Granted` cases are
+/// handled in exactly one place — `OperatorTokenUsedAsClient` is easy to
+/// pattern-match past, and the whole rollout depends on it being seen.
+fn authorize_as_client(
+    state: &CompanionState,
+    principal: &Principal,
+    client_id: &ClientId,
+    module_for_event: &str,
+) -> std::result::Result<(), Denied> {
+    match state.auth.authorize(principal, Attempt::ActAs(client_id))? {
+        Granted::Plain => Ok(()),
+        Granted::OperatorTokenUsedAsClient => {
+            if state.operator_as_client_recently.allow(client_id.as_str()) {
+                tracing::warn!(
+                    client_id = %client_id,
+                    "client action authorised with the OPERATOR token; rotate this worker's \
+                     MITOS_AUTH_TOKEN secret to its namespace token before switching \
+                     operator_token_as_client to `refuse`",
+                );
+                state.events.record(
+                    module_for_event,
+                    crate::events::EventKind::OperatorTokenUsedAsClient {
+                        client_id: client_id.to_string(),
+                    },
+                );
+            }
+            Ok(())
         }
     }
-    Ok(next.run(req).await)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -204,6 +290,10 @@ enum SubscribeError {
     /// "Indexer visibility".
     #[error("indexer is internal (not subscribable from companions): {0}")]
     InternalIndexer(String),
+    /// The caller is authenticated but may not act as the client it named.
+    /// 403, not 401: the token IS somebody, just not this client's namespace.
+    #[error("{0}")]
+    Denied(Denied),
 }
 
 #[derive(serde::Serialize)]
@@ -221,6 +311,7 @@ impl IntoResponse for SubscribeError {
             | Self::InvalidClientId(_) => StatusCode::BAD_REQUEST,
             Self::UnknownModule(_) | Self::UnknownIndexer(_) => StatusCode::NOT_FOUND,
             Self::InternalIndexer(_) => StatusCode::BAD_REQUEST,
+            Self::Denied(_) => StatusCode::FORBIDDEN,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let code = match &self {
@@ -232,6 +323,7 @@ impl IntoResponse for SubscribeError {
             Self::UnknownModule(_) => "unknown_module",
             Self::UnknownIndexer(_) => "unknown_indexer",
             Self::InternalIndexer(_) => "internal_indexer",
+            Self::Denied(_) => "denied",
         };
         let body = ErrorBody {
             error: self.to_string(),
@@ -255,6 +347,19 @@ enum InterestMutationError {
     ReplaceNotSupported,
     #[error("storage io: {0}")]
     Io(String),
+    /// Registrations exist under this companion key, but the caller may act
+    /// as NONE of their clients. 403 rather than the 404 an unknown key
+    /// gets: the difference between "there is nothing here" and "there is
+    /// something here that is not yours" is the whole point of the route's
+    /// per-record check.
+    #[error("{0}")]
+    Denied(Denied),
+    /// Same 403, for the case where every registration was skipped without
+    /// producing a `Denied` — a persisted client id that no longer parses
+    /// belongs to no namespace, so there is nobody it could have been
+    /// refused AS.
+    #[error("no registration under `{0}` names a client you may act as")]
+    NoneGranted(String),
 }
 
 impl IntoResponse for InterestMutationError {
@@ -265,6 +370,7 @@ impl IntoResponse for InterestMutationError {
             }
             Self::ReplaceNotSupported => StatusCode::BAD_REQUEST,
             Self::UnknownCompanion(_) => StatusCode::NOT_FOUND,
+            Self::Denied(_) | Self::NoneGranted(_) => StatusCode::FORBIDDEN,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let code = match &self {
@@ -273,6 +379,7 @@ impl IntoResponse for InterestMutationError {
             Self::EmptyItems => "empty_items",
             Self::ReplaceNotSupported => "replace_not_supported",
             Self::UnknownCompanion(_) => "unknown_companion",
+            Self::Denied(_) | Self::NoneGranted(_) => "denied",
             Self::Io(_) => "storage_io",
         };
         let body = ErrorBody {
@@ -310,6 +417,7 @@ impl IntoResponse for InterestMutationError {
 /// subscribed to — the handler does that discovery internally.
 async fn interest_mutation_handler(
     State(state): State<CompanionState>,
+    Extension(principal): Extension<Principal>,
     axum::extract::Path(companion_key): axum::extract::Path<String>,
     body: axum::body::Bytes,
 ) -> std::result::Result<Response, InterestMutationError> {
@@ -332,6 +440,50 @@ async fn interest_mutation_handler(
     if registrations.is_empty() {
         return Err(InterestMutationError::UnknownCompanion(companion_key));
     }
+
+    // The route names a companion_key and NO client — and `dev` and `prod`
+    // workers share companion keys, because the key is the policy-id DO name.
+    // So a mutation is authorized per REGISTRATION, and only the granted ones
+    // are touched: the rest must be byte-identical afterwards. That is the
+    // whole point of this order.
+    let mut denial: Option<Denied> = None;
+    let mut granted = Vec::with_capacity(registrations.len());
+    for (module, path, req) in registrations {
+        // A persisted client id that no longer parses belongs to no
+        // namespace, so nobody may act as it. Skip it rather than fail the
+        // request — it is somebody else's record either way.
+        let Ok(client) = ClientId::parse(&req.client_id) else {
+            tracing::warn!(
+                companion_key = %companion_key,
+                module = %module,
+                client_id = %req.client_id,
+                "interest mutation: registration has an unparseable client id; leaving it alone",
+            );
+            continue;
+        };
+        match authorize_as_client(&state, &principal, &client, &module) {
+            Ok(()) => granted.push((module, path, req)),
+            Err(e) => {
+                tracing::warn!(
+                    companion_key = %companion_key,
+                    module = %module,
+                    client_id = %client,
+                    denied = %e,
+                    "interest mutation: leaving this registration untouched",
+                );
+                denial.get_or_insert(e);
+            }
+        }
+    }
+    if granted.is_empty() {
+        // Registrations exist, just none this caller may touch. 403, not the
+        // 404 an unknown key gets.
+        return Err(match denial {
+            Some(denied) => InterestMutationError::Denied(denied),
+            None => InterestMutationError::NoneGranted(companion_key),
+        });
+    }
+    let registrations = granted;
 
     // Apply the mutation to each persisted registration. Errors
     // here are 500s — we've already accepted the request as
@@ -362,6 +514,15 @@ async fn interest_mutation_handler(
                 .map_err(|e| InterestMutationError::Io(format!("encode {module}: {e}")))?;
             write_atomic(&path, &buf).map_err(|e| InterestMutationError::Io(e.to_string()))?;
         }
+    }
+
+    // A mutation that emptied a record DELETED it above, which is a detach.
+    // Reconcile the affected modules once each rather than per registration:
+    // it is a diff, so one call covers every change to that module.
+    let touched: std::collections::BTreeSet<&str> =
+        registrations.iter().map(|(m, _, _)| m.as_str()).collect();
+    for module in &touched {
+        nudge_lifecycle(&state, module).await;
     }
 
     // Propagate to each running follower's in-memory filter so
@@ -603,6 +764,7 @@ fn validate_companion_key_for_mutation(
 
 async fn subscribe_handler(
     State(state): State<CompanionState>,
+    Extension(principal): Extension<Principal>,
     body: axum::body::Bytes,
 ) -> std::result::Result<Response, SubscribeError> {
     let request =
@@ -616,6 +778,24 @@ async fn subscribe_handler(
             "subscribe request has no targets".into(),
         ));
     }
+
+    // `client_id` arrives in the request BODY, so until this check it was
+    // self-asserted: any token holder could subscribe as
+    // `ownership.cnft.dev`. Authorize before anything is persisted or handed
+    // to the dialer — a refusal must leave no registration on disk and no
+    // dial loop running.
+    let client_id = ClientId::parse(&request.client_id)
+        .map_err(|e| SubscribeError::InvalidClientId(e.to_string()))?;
+    let module_for_event = request
+        .targets
+        .iter()
+        .find_map(|t| match t {
+            SubscribeTarget::Module { name } => Some(name.as_str()),
+            SubscribeTarget::Indexer { .. } => None,
+        })
+        .unwrap_or("-");
+    authorize_as_client(&state, &principal, &client_id, module_for_event)
+        .map_err(SubscribeError::Denied)?;
 
     // Validate + persist each target (modules write CBOR to disk;
     // indexers validate against the bridge). No dial-spawning yet —
@@ -633,6 +813,11 @@ async fn subscribe_handler(
                 if next_emission_id == 0 {
                     next_emission_id = id;
                 }
+                // The registration is now on disk, so the client can attach.
+                // On an instance an operator STOPPED this records the client
+                // and does NOT start it — the attach is remembered and served
+                // the moment the operator starts it.
+                nudge_lifecycle(&state, name).await;
                 state.events.record(
                     name.as_str(),
                     crate::events::EventKind::CompanionSubscribed {
@@ -718,9 +903,17 @@ async fn subscribe_handler(
             }
         }
     }
+    // Announcements are handled LAST, after the registration is on disk and
+    // `reconcile` has run — so a client that is about to be adopted onto its
+    // instance already is one. An announcement NEVER fails the subscribe: a
+    // refusal is reported here and the companion stays registered and served
+    // by the instance it is on.
+    let announced = process_announcements(&state, &principal, &client_id, &request).await;
+
     let response = SubscribeResponse {
         status: "subscribed".to_string(),
         next_emission_id,
+        announced,
     };
     let body = response
         .encode()
@@ -730,6 +923,74 @@ async fn subscribe_handler(
         .header(header::CONTENT_TYPE, SUBSCRIBE_MIME)
         .body(Body::from(body))
         .expect("response builder"))
+}
+
+/// One outcome per announcement on the request.
+///
+/// An entry for a module this request does not TARGET is refused: a client
+/// announcing a build of something it is not subscribing to has nothing the
+/// host can act on, and accepting it would let one subscribe drive a move for
+/// any module on the box.
+async fn process_announcements(
+    state: &CompanionState,
+    principal: &Principal,
+    client_id: &ClientId,
+    request: &SubscribeRequest,
+) -> Vec<AnnounceOutcome> {
+    if request.announced.is_empty() {
+        return Vec::new();
+    }
+    let Some(moves) = state.moves.as_ref() else {
+        return request
+            .announced
+            .iter()
+            .map(|a| AnnounceOutcome {
+                module: a.module.clone(),
+                result: AnnounceResult::Refused {
+                    reason: "this host does not accept announcements".to_owned(),
+                },
+            })
+            .collect();
+    };
+
+    let targeted: std::collections::BTreeSet<&str> = request
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            SubscribeTarget::Module { name } => Some(name.as_str()),
+            SubscribeTarget::Indexer { .. } => None,
+        })
+        .collect();
+
+    let mut outcomes = Vec::with_capacity(request.announced.len());
+    for announced in &request.announced {
+        let result = if !targeted.contains(announced.module.as_str()) {
+            AnnounceResult::Refused {
+                reason: format!(
+                    "this subscribe does not target module `{}`",
+                    announced.module
+                ),
+            }
+        } else {
+            moves
+                .announce(client_id, &announced.module, announced)
+                .await
+        };
+        if let AnnounceResult::Refused { reason } = &result {
+            tracing::warn!(
+                client_id = %client_id,
+                module = %announced.module,
+                ?principal,
+                %reason,
+                "announcement refused; the companion is still registered and served",
+            );
+        }
+        outcomes.push(AnnounceOutcome {
+            module: announced.module.clone(),
+            result,
+        });
+    }
+    outcomes
 }
 
 /// Validate + persist a wasm-module target. Does NOT hand to the
@@ -898,6 +1159,25 @@ struct LegacyDialBackOverride {
     url: Option<String>,
 }
 
+/// Whether a module still has legacy FLAT registrations — `<key>.cbor` files
+/// directly under `companions/` rather than under a `<client_id>/` directory.
+///
+/// Lifecycle adoption counts client DIRECTORIES, and what it concludes is
+/// written down and sticky. So it asks this first: adopting while flat files
+/// remain would record a subscribed module as client-less ⇒ `Pinned` ⇒ never
+/// retiring when its clients later move. The migration below normally clears
+/// them, but it can FAIL, and "it was called" is not "it worked". Uses exactly
+/// the migration's own test for what a flat record is.
+pub(crate) fn has_flat_companions(storage: &ModuleStorage, module_id: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(storage.module_dir_for_companions(module_id)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("cbor")
+    })
+}
+
 /// One-time migration of pre-fix flat companion files into the
 /// two-level layout. Idempotent — re-running on an already-migrated
 /// module is a no-op (no flat files left to find).
@@ -1064,6 +1344,8 @@ fn migrate_one(legacy_bytes: &[u8], client_id: &str) -> Result<Vec<u8>, String> 
         resume_from: m.resume_from,
         interests: m.interests,
         dial_back: m.dial_back,
+        // A legacy flat record predates announcements entirely.
+        announced: Vec::new(),
     };
     req.encode().map_err(|e| format!("re-encode: {e}"))
 }
@@ -1124,24 +1406,17 @@ fn validate_companion_key(key: &str) -> std::result::Result<(), SubscribeError> 
 /// sentinels) and any string starting with a dot (so the dotfile-
 /// reserved `.unreachable` directory remains distinguishable from a
 /// legitimate `client_id`).
+///
+/// The rules are [`ClientId::parse`]'s, and this DELEGATES to it rather than
+/// restating them. It used to validate the TRIMMED id while
+/// `client_companions_dir` built a path from the RAW one, so a padded id
+/// passed validation and produced a directory that never round-tripped. Two
+/// validators that agree today are two that can disagree tomorrow; the id
+/// that becomes a path and the id that is authorized must be one check.
 fn validate_client_id(client_id: &str) -> std::result::Result<(), SubscribeError> {
-    let trimmed = client_id.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        return Err(SubscribeError::InvalidClientId(format!(
-            "len {} not in 1..=128 (after trim)",
-            trimmed.len()
-        )));
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-    {
-        return Err(SubscribeError::InvalidClientId(trimmed.to_string()));
-    }
-    if trimmed == "." || trimmed == ".." || trimmed.starts_with('.') {
-        return Err(SubscribeError::InvalidClientId(trimmed.to_string()));
-    }
-    Ok(())
+    ClientId::parse(client_id)
+        .map(|_| ())
+        .map_err(|e| SubscribeError::InvalidClientId(e.to_string()))
 }
 
 /// On-disk directory holding all companion registrations for a single
@@ -1152,21 +1427,76 @@ fn client_companions_dir(storage: &ModuleStorage, module_id: &str, client_id: &s
     storage.module_dir_for_companions(module_id).join(client_id)
 }
 
+/// Fixtures shared with `admin`'s router tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::manifest::{
+        AbiSection, BuildSection, InterestSection, Manifest, ModuleSection, TrapPolicySection,
+        host_wit_sha, sha256_hex,
+    };
+
+    /// A manifest that `ModuleStorage::activate` will accept for `wasm`.
+    /// Registration is what `current.toml` means now, and only `activate`
+    /// writes one — so a test that needs a registered module goes through it
+    /// rather than hand-writing files.
+    pub(crate) fn manifest_for(module_id: &str, wasm: &[u8]) -> Manifest {
+        Manifest {
+            module: ModuleSection {
+                id: module_id.to_owned(),
+                sha256: sha256_hex(wasm),
+                size_bytes: wasm.len() as u64,
+            },
+            abi: AbiSection {
+                version_major: 2,
+                version_minor: 0,
+                wit_package: "mitos:platform-v2".to_owned(),
+                wit_world: "mitos-module-v2".to_owned(),
+                wit_sha: Some(host_wit_sha().to_owned()),
+            },
+            trap_policy: TrapPolicySection {
+                strategy: "replay".to_owned(),
+                max_retries: 3,
+                backoff_cap_ms: 1000,
+            },
+            build: BuildSection {
+                rust_version: "0.0".to_owned(),
+                target: "wasm32-wasip2".to_owned(),
+                profile: "release".to_owned(),
+                build_id: "1970-01-01T00:00:00Z".to_owned(),
+                git_sha: None,
+                crate_version: "0.0.0".to_owned(),
+            },
+            interest: InterestSection::default(),
+            lifecycle: Default::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::manifest_for;
     use super::*;
+    use crate::auth::testing::{
+        DEV, DEV_CLIENT, FULL, PROD, PROD_CLIENT, READONLY, configured_authenticator,
+    };
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
+    use mitos_lifecycle::access::OperatorTokenAsClient;
     use mitos_protocol::{ChainPoint, DialBackOverride, SubscribeTarget};
     use tower::ServiceExt;
 
+    /// The legacy (v2) posture: one implicit namespace, open mode. Every
+    /// pre-existing test in this module runs against it unchanged, which is
+    /// the proof that legacy mode is byte-for-byte v2.
     fn build_router_with(storage: ModuleStorage) -> axum::Router {
         companion_router(
             storage,
-            AuthToken(None),
+            Arc::new(crate::auth::Authenticator::legacy(None, None)),
             None,
             None,
             crate::events::EventRing::new(),
+            None,
+            None,
         )
     }
 
@@ -1191,6 +1521,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let body = cbor(&req);
         let response = router
@@ -1222,6 +1553,7 @@ mod tests {
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let body = cbor(&req);
         let response = router
@@ -1368,6 +1700,7 @@ mod tests {
             resume_from: Some(ChainPoint::Specific(123, "abcd".into())),
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let bytes = cbor(&req);
         let decoded: SubscribeRequest = ciborium::de::from_reader(&bytes[..]).unwrap();
@@ -1447,39 +1780,14 @@ mod tests {
         let storage = ModuleStorage::new(tmp.path());
 
         // Hand-install a fake manifest so the subscribe handler's
-        // "module must be registered" check passes. Writing the
-        // manifest file directly is fine — `read_manifest` reads
-        // from disk every call.
+        // "module must be registered" check passes. Goes through
+        // `activate` rather than hand-writing files: registration is what
+        // `current.toml` means now, and only `activate` writes one.
         let module_id = "ownership-indexer";
-        let module_dir = tmp.path().join(module_id);
-        std::fs::create_dir_all(&module_dir).unwrap();
-        let manifest_toml = format!(
-            r#"
-[module]
-id = "{module_id}"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
-size_bytes = 0
-
-[abi]
-version_major = 2
-version_minor = 0
-wit_package = "mitos:platform-v2"
-wit_world = "mitos-module-v2"
-
-[trap_policy]
-strategy = "replay"
-max_retries = 3
-backoff_cap_ms = 1000
-
-[build]
-rust_version = "0.0"
-target = "wasm32-wasip2"
-profile = "release"
-build_id = "1970-01-01T00:00:00Z"
-crate_version = "0.0.0"
-"#
-        );
-        std::fs::write(module_dir.join("manifest.toml"), manifest_toml).unwrap();
+        let wasm = b"fake wasm for the registration check";
+        storage
+            .activate(&manifest_for(module_id, wasm), wasm)
+            .unwrap();
 
         let router = build_router_with(storage.clone());
 
@@ -1501,6 +1809,7 @@ crate_version = "0.0.0"
                     auth_header: None,
                     auth_value: None,
                 }),
+                announced: Vec::new(),
             },
             SubscribeRequest {
                 targets: vec![SubscribeTarget::Module {
@@ -1517,6 +1826,7 @@ crate_version = "0.0.0"
                     auth_header: None,
                     auth_value: None,
                 }),
+                announced: Vec::new(),
             },
         ];
         for req in requests.drain(..) {
@@ -1608,6 +1918,7 @@ crate_version = "0.0.0"
             resume_from: None,
             interests: vec![],
             dial_back: None,
+            announced: Vec::new(),
         };
         let body = cbor(&req);
         let response = tokio::runtime::Runtime::new().unwrap().block_on(
@@ -1789,6 +2100,7 @@ crate_version = "0.0.0"
                 resume_from: None,
                 interests,
                 dial_back: None,
+                announced: Vec::new(),
             };
             std::fs::write(dir.join(format!("{key}.cbor")), req.encode().unwrap()).unwrap();
         };
@@ -1826,5 +2138,330 @@ crate_version = "0.0.0"
         )
         .unwrap();
         assert!(load_module_interest_union(&storage, module_id).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Namespaces, through the REAL router. The pure crate already tests
+    // `authorize`; what these prove is that these two routes actually ASK —
+    // and, for the interest route, that a refusal leaves the other client's
+    // bytes alone.
+    // -------------------------------------------------------------------
+
+    const MODULE: &str = "ownership-indexer";
+
+    /// A configured two-namespace host with `MODULE` registered.
+    fn namespaced_router(
+        storage: &ModuleStorage,
+        mode: OperatorTokenAsClient,
+    ) -> (axum::Router, crate::events::EventRing) {
+        let wasm = b"namespaced test wasm";
+        storage.activate(&manifest_for(MODULE, wasm), wasm).unwrap();
+        let events = crate::events::EventRing::new();
+        let router = companion_router(
+            storage.clone(),
+            Arc::new(configured_authenticator(mode)),
+            None,
+            None,
+            events.clone(),
+            None,
+            None,
+        );
+        (router, events)
+    }
+
+    /// Two registrations must differ in CONTENT for "the prod bytes did not
+    /// move" to mean anything — `Interest::any()` twice would dedupe and the
+    /// mutation would be a no-op for both.
+    fn policy_interest(policy: &str) -> mitos_protocol::Interest {
+        mitos_protocol::Interest {
+            asset: mitos_protocol::AssetSelector::Policy(
+                cardano_assets::PolicyId::new(policy).unwrap(),
+            ),
+            ..mitos_protocol::Interest::any()
+        }
+    }
+
+    fn add_mutation(policy: &str) -> Vec<u8> {
+        mitos_protocol::encode_interest_mutation(&mitos_protocol::InterestMutationBody {
+            op: InterestOp::Add,
+            items: vec![policy_interest(policy)],
+        })
+        .unwrap()
+    }
+
+    fn subscribe_request(client_id: &str) -> SubscribeRequest {
+        SubscribeRequest {
+            targets: vec![SubscribeTarget::Module {
+                name: MODULE.into(),
+            }],
+            companion_key: "shared_policy_id".into(),
+            client_id: client_id.into(),
+            resume_from: None,
+            interests: vec![],
+            dial_back: None,
+            announced: Vec::new(),
+        }
+    }
+
+    async fn post_subscribe(
+        router: &axum::Router,
+        token: Option<&str>,
+        request: &SubscribeRequest,
+    ) -> StatusCode {
+        let mut req = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/companions/subscribe")
+            .header("content-type", "application/cbor");
+        if let Some(token) = token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::from(cbor(request))).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_dev_token_cannot_subscribe_as_a_prod_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) =
+            namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+
+        let status = post_subscribe(&router, Some(DEV), &subscribe_request(PROD_CLIENT)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A refusal must leave NOTHING behind: no registration on disk, and
+        // (the router was built with `dialer: None`) no dial loop to start.
+        // A directory for the client would be the visible half of a dial the
+        // host would resume on the next boot.
+        assert!(
+            !client_companions_dir(&storage, MODULE, PROD_CLIENT).exists(),
+            "a refused subscribe wrote a registration",
+        );
+        assert_eq!(
+            std::fs::read_dir(storage.module_dir_for_companions(MODULE))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dev_token_subscribes_as_its_own_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) =
+            namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+
+        let status = post_subscribe(&router, Some(DEV), &subscribe_request(DEV_CLIENT)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            client_companions_dir(&storage, MODULE, DEV_CLIENT)
+                .join("shared_policy_id.cbor")
+                .is_file(),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_is_401_and_a_wrong_namespace_is_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) =
+            namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+
+        assert_eq!(
+            post_subscribe(&router, None, &subscribe_request(DEV_CLIENT)).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(
+            post_subscribe(&router, Some("who-even"), &subscribe_request(DEV_CLIENT)).await,
+            StatusCode::UNAUTHORIZED,
+        );
+        assert_eq!(
+            post_subscribe(&router, Some(PROD), &subscribe_request(DEV_CLIENT)).await,
+            StatusCode::FORBIDDEN,
+        );
+        // A client no namespace lists is refused, not adopted — even for the
+        // operator.
+        assert_eq!(
+            post_subscribe(
+                &router,
+                Some(FULL),
+                &subscribe_request("preview-1234.cnft.dev")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_token_as_a_client_is_granted_and_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, events) = namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+
+        // ~91 companion DOs re-subscribe at once after a host restart. The
+        // event must survive that as ONE entry, or a single restart flushes
+        // the 512-entry ring of everything else.
+        for _ in 0..91 {
+            assert_eq!(
+                post_subscribe(&router, Some(FULL), &subscribe_request(PROD_CLIENT)).await,
+                StatusCode::OK,
+            );
+        }
+
+        let recorded = events.snapshot(0, None, Some("operator_token_used_as_client"), 512);
+        assert_eq!(
+            recorded.len(),
+            1,
+            "91 subscribes from one client must produce ONE event, not 91",
+        );
+        match &recorded[0].kind {
+            crate::events::EventKind::OperatorTokenUsedAsClient { client_id } => {
+                assert_eq!(client_id, PROD_CLIENT);
+            }
+            other => panic!("wrong event recorded: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuse_mode_turns_that_into_403() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) = namespaced_router(&storage, OperatorTokenAsClient::Refuse);
+
+        assert_eq!(
+            post_subscribe(&router, Some(FULL), &subscribe_request(PROD_CLIENT)).await,
+            StatusCode::FORBIDDEN,
+        );
+        // Refusing it as a CLIENT credential never touches the namespace
+        // tokens the rotation moved everyone onto.
+        assert_eq!(
+            post_subscribe(&router, Some(PROD), &subscribe_request(PROD_CLIENT)).await,
+            StatusCode::OK,
+        );
+    }
+
+    /// Register the SAME companion_key under a prod and a dev client, mutate
+    /// with the dev token, and assert the prod record's BYTES did not move.
+    /// `dev` and `prod` workers share companion keys — the key is the
+    /// policy-id DO name — so this is the concrete exposure the order exists
+    /// to close.
+    #[tokio::test]
+    async fn a_dev_token_cannot_rewrite_a_prod_clients_interest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) =
+            namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+
+        let policy = "a".repeat(56);
+        let mut prod_req = subscribe_request(PROD_CLIENT);
+        prod_req.interests = vec![policy_interest(&policy)];
+        let mut dev_req = subscribe_request(DEV_CLIENT);
+        dev_req.interests = vec![policy_interest(&policy)];
+        assert_eq!(
+            post_subscribe(&router, Some(PROD), &prod_req).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_subscribe(&router, Some(DEV), &dev_req).await,
+            StatusCode::OK
+        );
+
+        let prod_path =
+            client_companions_dir(&storage, MODULE, PROD_CLIENT).join("shared_policy_id.cbor");
+        let dev_path =
+            client_companions_dir(&storage, MODULE, DEV_CLIENT).join("shared_policy_id.cbor");
+        let prod_before = std::fs::read(&prod_path).unwrap();
+        let dev_before = std::fs::read(&dev_path).unwrap();
+
+        let mutation = add_mutation(&"b".repeat(56));
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/companions/shared_policy_id/interest")
+                    .header("content-type", "application/cbor")
+                    .header(header::AUTHORIZATION, format!("Bearer {DEV}"))
+                    .body(Body::from(mutation))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            std::fs::read(&prod_path).unwrap(),
+            prod_before,
+            "the prod registration's bytes must be untouched",
+        );
+        assert_ne!(
+            std::fs::read(&dev_path).unwrap(),
+            dev_before,
+            "the dev registration must have been mutated",
+        );
+    }
+
+    #[tokio::test]
+    async fn interest_mutation_with_nothing_granted_is_403_not_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) =
+            namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+
+        let mut prod_req = subscribe_request(PROD_CLIENT);
+        prod_req.interests = vec![policy_interest(&"a".repeat(56))];
+        assert_eq!(
+            post_subscribe(&router, Some(PROD), &prod_req).await,
+            StatusCode::OK
+        );
+
+        let mutation = add_mutation(&"b".repeat(56));
+        let status = |token: &'static str, uri: &'static str| {
+            let router = router.clone();
+            let mutation = mutation.clone();
+            async move {
+                router
+                    .oneshot(
+                        HttpRequest::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/cbor")
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .body(Body::from(mutation))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        // Registrations exist, none this caller may touch → 403.
+        assert_eq!(
+            status(DEV, "/api/companions/shared_policy_id/interest").await,
+            StatusCode::FORBIDDEN,
+        );
+        // No registrations at all → the existing 404, unchanged.
+        assert_eq!(
+            status(DEV, "/api/companions/nothing_here/interest").await,
+            StatusCode::NOT_FOUND,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_readonly_token_may_not_act_as_a_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ModuleStorage::new(tmp.path());
+        let (router, _events) =
+            namespaced_router(&storage, OperatorTokenAsClient::AllowWithWarning);
+        assert_eq!(
+            post_subscribe(&router, Some(READONLY), &subscribe_request(PROD_CLIENT)).await,
+            StatusCode::FORBIDDEN,
+        );
     }
 }

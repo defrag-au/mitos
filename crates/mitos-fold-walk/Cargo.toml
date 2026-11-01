@@ -1,0 +1,17 @@
+[package]
+name = "mitos-fold-walk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The native walker for the fold plane: a Mithril chunk window → decoded blocks → a `mitos-fold` registry. No artifact writer, no publish, no wasm."
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+mitos-fold = { path = "../mitos-fold" }
+chain-decode = { path = "../chain-decode" }
+anyhow = { workspace = true }
+pallas-codec = { workspace = true }
+pallas-traverse = { workspace = true }

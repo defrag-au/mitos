@@ -253,7 +253,8 @@ async fn route_interest_add_policy_triggers_bootstrap_emissions() {
             rx: rx_holder.clone(),
         }
     });
-    let kv_factory: KvFactory = Arc::new(|_id: &str| state_kv::ModuleKv::new_in_memory());
+    let kv_factory: KvFactory =
+        Arc::new(|_key: &mitos_lifecycle::ids::InstanceKey| state_kv::ModuleKv::new_in_memory());
     let emitter_factory: EmitterFactory = Arc::new(emit::EventSink::new);
 
     let host = ModuleHostV2::new(

@@ -31,7 +31,7 @@
 //! that is not there, and a second writer must fail loudly rather than win
 //! quietly.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -307,6 +307,29 @@ impl Client {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(anyhow::Error::from(e).context(format!("head {key}"))),
         }
+    }
+
+    /// Key → size for everything under `prefix`, in ONE list.
+    ///
+    /// For a caller that has to ask "does R2 already hold these N files?" — an
+    /// archive publishing a manifest that names eighty of them, say. Asking
+    /// [`size_of`](Self::size_of) once per file made that question cost one
+    /// round trip per file, which is fine at three files and ruinous at a
+    /// hundred: a policy archive with 114 segments spent 17.8 s on a publish
+    /// that uploaded 26 KB.
+    ///
+    /// ⚠️ **A key absent from the result is not in R2**, so a caller must
+    /// upload rather than skip. That direction is what makes a listing safe to
+    /// skip on: immutable objects never reuse a name, so a matching size is
+    /// identity, and a missing entry only ever costs an upload.
+    pub async fn sizes_under(&self, prefix: &ObjPath) -> Result<BTreeMap<ObjPath, u64>> {
+        let mut sizes = BTreeMap::new();
+        let mut listed = self.store.list(Some(prefix));
+        while let Some(meta) = listed.next().await {
+            let meta = meta.context("list")?;
+            sizes.insert(meta.location, meta.size);
+        }
+        Ok(sizes)
     }
 
     /// An unconditional put.

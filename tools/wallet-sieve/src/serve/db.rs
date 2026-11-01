@@ -855,13 +855,15 @@ pub fn count_flows(conn: &Connection, canonical: &str) -> Result<u64> {
     )?)
 }
 
-/// Every cached wallet: (canonical, display) — the batch-refresh roster.
-pub fn list_wallets(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT target, display FROM wallet")?;
+/// Every cached wallet with the last time a client asked for it:
+/// (canonical, display, last_seen_unix). `None` means nobody has asked since
+/// the column was added — dormant, which is different from "asked long ago".
+pub fn list_wallets(conn: &Connection) -> Result<Vec<(String, String, Option<u64>)>> {
+    let mut stmt = conn.prepare("SELECT target, display, last_seen_unix FROM wallet")?;
     let mut out = Vec::new();
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
-        out.push((r.get(0)?, r.get(1)?));
+        out.push((r.get(0)?, r.get(1)?, r.get(2)?));
     }
     Ok(out)
 }
@@ -1121,6 +1123,30 @@ mod cache_tests {
             )
             .expect("insert flow");
         }
+    }
+
+    /// The refresh watcher filters on `last_seen_unix`, so the roster has to
+    /// carry it. `None` is a wallet nobody has asked for — dormant, not recent.
+    #[test]
+    fn the_wallet_roster_carries_when_it_was_last_asked_for() {
+        let conn = cache();
+        add_wallet(&conn, "recent", 1, Some(NOW - 60));
+        add_wallet(&conn, "stale", 1, Some(NOW - 7 * 24 * HOUR));
+        add_wallet(&conn, "never", 1, None);
+        let mut roster = list_wallets(&conn).expect("roster");
+        roster.sort();
+        assert_eq!(
+            roster,
+            vec![
+                ("never".to_string(), "never".to_string(), None),
+                ("recent".to_string(), "recent".to_string(), Some(NOW - 60)),
+                (
+                    "stale".to_string(),
+                    "stale".to_string(),
+                    Some(NOW - 7 * 24 * HOUR)
+                ),
+            ]
+        );
     }
 
     /// One flow row at `slot`, unlabelled and never offered to market-ledger.

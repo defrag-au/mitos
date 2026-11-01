@@ -33,3 +33,6 @@ community-modules/**/build/
 # Agent scratch — draft PR text, captures, one-off analysis. Same convention
 # as shared-crates, so scratch written here cannot be committed by accident.
 .tmp/
+
+# Packed host tarballs from scripts/pack-release.sh
+/dist/

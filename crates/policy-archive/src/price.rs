@@ -35,12 +35,14 @@
 //!    NOT monotonic, so the rule is to withhold a thin pool's quote, never to
 //!    correct it.
 
+use serde::{Deserialize, Serialize};
+
 use crate::observation::Observation;
 use crate::view::{PolicyView, Projection};
 
 /// A unit, as the observation rows spell it. ADA is the empty policy with the
 /// empty name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Unit {
     pub policy: Vec<u8>,
     pub name: Vec<u8>,
@@ -133,7 +135,9 @@ pub struct Spot {
     /// so a caller can see there is liquidity it is not counting.
     pub unresolved: Vec<PairDepth>,
     /// Reserves held under a pricing model this crate does not evaluate —
-    /// a launchpad bonding curve, whose price is not `x·y = k`.
+    /// snek.fun's bonding curve, whose price is not `x·y = k`. A curve whose
+    /// model IS evaluable (LumpFun v5, constant-product over effective
+    /// reserves) lands in [`Spot::ada`] instead, through [`Bucket::Priced`].
     ///
     /// Separate from [`Spot::unresolved`] because the two are different
     /// problems: an unresolved pair needs ANOTHER ARCHIVE, this needs a

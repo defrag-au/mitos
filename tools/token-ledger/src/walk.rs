@@ -14,9 +14,11 @@
 //! answer.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
+use chain_events::{ChainRef, Coverage};
 use pallas_addresses::{Address, StakeAddress};
 use pallas_traverse::MultiEraBlock;
 
@@ -35,16 +37,35 @@ use mitos_pool_observe as pools;
 #[derive(clap::Args, Debug)]
 pub struct WalkArgs {
     /// Data dir holding the immutable DB (expects `<data-dir>/immutable`).
-    #[arg(long)]
-    pub data_dir: PathBuf,
+    #[arg(long, required_unless_present = "profile")]
+    pub data_dir: Option<PathBuf>,
+
+    /// A collection profile: which collections, and where to read them from.
+    ///
+    /// Supersedes `--token`, `--policy` and `--db`. The file names the snapshot and the
+    /// collections, and each one is walked into `<db-dir>/<id>.db` — so a profile is the
+    /// whole wiring, and `event-firehose --profile` runs it.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["token", "policy", "db"])]
+    pub profile: Option<PathBuf>,
 
     /// Token registry TOML.
     #[arg(long, default_value = "tokens.toml")]
     pub tokens: PathBuf,
 
-    /// Which token in the registry to walk.
-    #[arg(long)]
-    pub token: String,
+    /// A registry name, a `<policy_hex>.<name_hex>` unit, or a bare policy id.
+    ///
+    /// `--policy` is the no-registry form and is what to reach for when the collection
+    /// is not in `tokens.toml`.
+    #[arg(long, required_unless_present_any = ["policy", "profile"], conflicts_with = "policy")]
+    pub token: Option<String>,
+
+    /// A bare 56-hex policy id; repeat for several collections. Bypasses the registry.
+    ///
+    /// Each policy is walked into its own ledger (`<policy>.db` unless `--db` names one
+    /// and there is exactly one `--policy`). A synthetic entry carries no `floor_slot`,
+    /// so pass `--from-slot` for a fast start.
+    #[arg(long = "policy", value_name = "POLICY")]
+    pub policy: Vec<String>,
 
     /// Ledger sqlite path (default: `<token>.db`).
     #[arg(long)]
@@ -77,6 +98,28 @@ pub struct WalkArgs {
     /// the difference between ~30 minutes and ~1 minute on a 2-year token.
     #[arg(long)]
     pub sieve: bool,
+
+    /// Write each walked collection's event stream to `<dir>/<name>.ndjson` instead of
+    /// stdout.
+    ///
+    /// A profile walks several collections, and their runs are NOT one ascending stream:
+    /// Perps begins where $PERP has been trading for ten months. A consumer that needs
+    /// chain order — `event-merge` — wants one file per collection, and it refuses a
+    /// concatenation because the second run starts before the first one ended.
+    #[arg(long, value_name = "DIR", requires = "events")]
+    pub events_out: Option<PathBuf>,
+
+    /// Write the policy's event stream to stdout as NDJSON while walking.
+    ///
+    /// The same rows the archive stores, translated by `chain-events-cardano`, so
+    /// ingesting the finished archive later upserts over this stream rather than
+    /// duplicating it. stdout is events and nothing else; logs and the walk's own report
+    /// go to stderr. A closed pipe stops the walk — continuing would walk for nobody.
+    ///
+    /// The stream's `coverage` is the walk's own verdict, never a flag: claiming
+    /// completeness is something only the walk can do.
+    #[arg(long)]
+    pub events: bool,
 }
 
 /// Bech32 stake address from a payment address's delegation part.
@@ -162,6 +205,68 @@ pub(crate) fn units_in_output(
     }
     units.retain(|_, q| *q != 0);
     units.into_iter().collect()
+}
+
+/// LumpFun v5: a pool the DEX recogniser cannot see.
+///
+/// The curve validator is parameterised per launch, so there is no shared
+/// credential to match — a pool is identified by the state NFT under the
+/// launched token's own policy. `mitos_pool_observe::recognise` is DEX-only,
+/// so without this arm the forward walk (and every artifact built from it)
+/// never observes a LumpFun curve, while the reverse archive does.
+///
+/// The reserves published are the EFFECTIVE ones [`LumpFunCurve::effective`]
+/// recovers: the token side already includes the curve's virtual offset, and
+/// the ADA side adds its own. A reader that prices `quote / base` gets the
+/// curve's spot, which is why this can join the spine's constant-product
+/// aggregates at all.
+///
+/// A curve with no first buy has no recoverable ADA offset and therefore no
+/// price. It is declined rather than recorded with a zero quote — the spine has
+/// no pricing model to carry "not yet", and a zero would price the token at
+/// zero. The launch is still in the archive, whose observation tier has that
+/// distinction (`bonding-curve`); only the forward spine waits for a buy.
+///
+/// [`LumpFunCurve::effective`]: mitos_launchpad_decode::LumpFunCurve::effective
+fn lumpfun_observation(
+    out: &DecodedOutput,
+    qty: i64,
+    watched_policy: &[u8],
+    watched_name: &[u8],
+    datum: Option<&[u8]>,
+) -> Option<pools::PoolObservation> {
+    use mitos_launchpad_decode as launchpad;
+    use pools::{KeyBasis, PoolObservation, ReserveSource, Side};
+
+    let state_nft = out
+        .assets
+        .iter()
+        .any(|a| a.policy == watched_policy && a.name == launchpad::LUMPFUN_STATE_NFT_NAME);
+    if !state_nft {
+        return None;
+    }
+    let curve = launchpad::decode_lumpfun_datum(datum?)?;
+    // A datum naming another unit is not this pool's; claiming it would let one
+    // launch's curve price another.
+    if curve.policy != watched_policy || curve.name != watched_name {
+        return None;
+    }
+    let (base, quote) = curve.effective(qty)?;
+
+    Some(PoolObservation {
+        dex: mitos_dex_decode::venue::LUMPFUN_V5,
+        address: out.address.clone(),
+        key_policy: watched_policy.to_vec(),
+        key_name: launchpad::LUMPFUN_STATE_NFT_NAME.to_vec(),
+        key_basis: KeyBasis::Datum,
+        base: Side::new(watched_policy.to_vec(), watched_name.to_vec(), base),
+        quote: Some(Side::ada(quote)),
+        // ⚠️ Deliberately absent — the 2% is charged on the ADA leg and paid
+        // on top, so netting it here would net it twice.
+        fee_bps: None,
+        total_lp: None,
+        reserve_source: ReserveSource::DatumPlusVirtual,
+    })
 }
 
 /// `(address, unit) → (stake, amount)`: one transaction's deltas, keyed the way
@@ -283,7 +388,117 @@ fn coverage_is_complete(coverage_from: Option<u64>, first_mint: Option<u64>) -> 
 }
 
 pub fn run(args: WalkArgs) -> Result<()> {
-    let token = registry::load_or_unit(&args.tokens, &args.token)?;
+    if let Some(path) = args.profile.clone() {
+        return run_profile(&args, &path);
+    }
+
+    if args.policy.len() > 1 && args.db.is_some() {
+        bail!(
+            "--db names one ledger; with several --policy each gets <policy>.db — run \
+             them separately to choose paths"
+        );
+    }
+
+    let tokens: Vec<registry::TokenEntry> = if args.policy.is_empty() {
+        let name = args
+            .token
+            .as_deref()
+            .expect("clap requires --token when --policy is absent");
+        vec![registry::load_or_unit(&args.tokens, name)?]
+    } else {
+        args.policy
+            .iter()
+            .map(|policy| registry::policy_entry(policy))
+            .collect::<Result<_>>()?
+    };
+
+    // A raw --policy names no registry, so no lock platform can be named either. An
+    // empty list keeps datums for any script we cannot name — the conservative default —
+    // rather than reading a file the caller did not point at.
+    let lock_creds: Vec<[u8; 28]> = if args.policy.is_empty() {
+        registry::load_lock_platforms(&args.tokens)?
+            .iter()
+            .map(registry::LockPlatform::cred_bytes)
+            .collect::<Result<_>>()?
+    } else {
+        Vec::new()
+    };
+
+    let data_dir = args
+        .data_dir
+        .clone()
+        .context("--data-dir is required without --profile")?;
+    if let Some(dir) = &args.events_out {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    for token in &tokens {
+        let out = args
+            .events_out
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.ndjson", token.name)));
+        run_one(&args, &data_dir, token, &lock_creds, out.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Runs one collection per `[[collection]]`, each into its own ledger.
+///
+/// Deliberately not `run` with a `--policy` list: `run` names one ledger for the whole
+/// invocation, and a profile's whole point is that each collection keeps its own — they
+/// have different units and different history.
+fn run_profile(args: &WalkArgs, path: &Path) -> Result<()> {
+    let profile = crate::profile::Profile::load(path)?;
+    let data_dir = profile
+        .data_dir()
+        .or_else(|| args.data_dir.clone())
+        .context("the profile has no [walk] data-dir")?;
+
+    let db_dir = profile.db_dir();
+    std::fs::create_dir_all(&db_dir)
+        .with_context(|| format!("creating the ledger directory {}", db_dir.display()))?;
+    if let Some(dir) = &args.events_out {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+
+    for collection in profile.collections() {
+        let mut token = registry::policy_entry(&collection.policy)?;
+        // The profile states the policy's first mint, which is exactly what the registry's
+        // `floor_slot` means to `coverage_is_complete`. A synthetic entry has none, so
+        // without this every profile walk stamps its events PARTIAL however early it
+        // started — the guard against blessing a shallow walk, firing on a complete one.
+        token.floor_slot = collection.first_mint_slot;
+        let one = WalkArgs {
+            data_dir: Some(data_dir.clone()),
+            tokens: args.tokens.clone(),
+            token: None,
+            policy: vec![collection.policy.clone()],
+            db: Some(profile.db_path(collection)),
+            from_slot: args.from_slot.or(profile.floor_of(collection)),
+            fresh: args.fresh,
+            buffer_every: args.buffer_every,
+            max_blocks: args.max_blocks.or(profile.max_blocks()),
+            sieve: args.sieve || profile.sieve(),
+            events: args.events,
+            events_out: None,
+            profile: None,
+        };
+        // A raw policy names no lock platform — the same as the `--policy` path above.
+        let out = args
+            .events_out
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.ndjson", collection.id)));
+        run_one(&one, &data_dir, &token, &[], out.as_deref())?;
+    }
+    Ok(())
+}
+
+fn run_one(
+    args: &WalkArgs,
+    data_dir: &Path,
+    token: &registry::TokenEntry,
+    lock_creds: &[[u8; 28]],
+    events_out: Option<&Path>,
+) -> Result<()> {
     let policy = token.policy_bytes()?;
     let asset_name = token.asset_name_bytes()?;
     // ONE decision about what counts, made here and carried through every
@@ -293,21 +508,13 @@ pub fn run(args: WalkArgs) -> Result<()> {
         None => Watched::Policy,
     };
 
-    let immutable_dir = args.data_dir.join("immutable");
+    let immutable_dir = data_dir.join("immutable");
     if !immutable_dir.is_dir() {
         bail!(
             "immutable DB not found at {} — point --data-dir at a bootstrapped snapshot",
             immutable_dir.display()
         );
     }
-
-    // Loaded before the walk: the datum-capture decision needs to know which
-    // scripts are already-named lock platforms, so it only keeps datums for
-    // the genuinely unnamed ones.
-    let lock_creds: Vec<[u8; 28]> = registry::load_lock_platforms(&args.tokens)?
-        .iter()
-        .map(registry::LockPlatform::cred_bytes)
-        .collect::<Result<_>>()?;
 
     let db_path = args
         .db
@@ -377,6 +584,32 @@ pub fn run(args: WalkArgs) -> Result<()> {
              unattributed rather than as conservation violations."
         );
     }
+
+    // The event tap, if asked for. Opened here rather than at startup so its coverage is
+    // the walk's own verdict — `buffer_complete` is the one thing that can say whether
+    // this run's history is whole, and a flag would let the stream claim completeness the
+    // walk does not have.
+    let mut tap = args
+        .events
+        .then(|| {
+            let out: Box<dyn std::io::Write> = match events_out {
+                Some(path) => Box::new(
+                    std::fs::File::create(path)
+                        .with_context(|| format!("creating {}", path.display()))?,
+                ),
+                None => Box::new(std::io::stdout()),
+            };
+            crate::events::Tap::open(
+                ChainRef::from_str("cardano:mainnet").expect("the chain this walker reads"),
+                &hex::encode(&policy),
+                match buffer_complete {
+                    true => Coverage::Complete,
+                    false => Coverage::Partial,
+                },
+                out,
+            )
+        })
+        .transpose()?;
 
     // Stamp the ledger with what it is about, so every read command is
     // self-describing instead of trusting a flag it could be given wrongly.
@@ -507,7 +740,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
         let mut rows: Vec<TxRow> = Vec::new();
 
-        for tx in blk.txs() {
+        for (position, tx) in blk.txs().iter().enumerate() {
             // PHASE-2 FAILURE — the same guard the reverse walk carries, for
             // the same reason. The two walks derive the same rows from the
             // same chunks and their outputs are compared against each other
@@ -532,7 +765,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 }
             }
 
-            let dtx = decode_tx(&tx);
+            let dtx = decode_tx(tx);
 
             // Inputs: whatever this tx spent that we were holding.
             //
@@ -563,7 +796,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             let mut pool_obs = Vec::new();
             let mut locks_created = Vec::new();
             for out in &dtx.outputs {
-                let units = units_in_output(&tx, out, &policy, &watched);
+                let units = units_in_output(tx, out, &policy, &watched);
                 if units.is_empty() {
                     continue;
                 }
@@ -583,6 +816,11 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 let mut pool_hit = false;
                 for (name, qty) in &units {
                     if let Some(obs) = pools::recognise(out, *qty, &policy, name, witness_datum) {
+                        pool_obs.push(obs);
+                        pool_hit = true;
+                    } else if let Some(obs) =
+                        lumpfun_observation(out, *qty, &policy, name, witness_datum)
+                    {
                         pool_obs.push(obs);
                         pool_hit = true;
                     }
@@ -623,7 +861,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 // evidence needed to understand it.
                 let worth_keeping = !pool_hit
                     && unlock_ts_ms.is_none()
-                    && cohort::classify(&out.address, &[], &lock_creds).cohort
+                    && cohort::classify(&out.address, &[], lock_creds).cohort
                         != cohort::Cohort::Wallet;
                 let datum_cbor = worth_keeping.then(|| datum.map(<[u8]>::to_vec)).flatten();
                 let datum_hash = out.datum_hash.as_ref().map(|h| h.as_ref().to_vec());
@@ -719,6 +957,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             touched += 1;
             rows.push(TxRow {
                 tx_hash: dtx.tx_hash,
+                tx_index: position as u32,
                 slot,
                 block_time,
                 net_mint: net_mint.into_iter().collect(),
@@ -743,6 +982,20 @@ pub fn run(args: WalkArgs) -> Result<()> {
         let persist_buffer = in_range.is_multiple_of(args.buffer_every);
         if !rows.is_empty() || persist_buffer {
             ledger.commit_block(&rows, slot, &blk.hash(), &buffer, persist_buffer)?;
+        }
+
+        // AFTER the ledger write, so the tap can never change what the walk records. A
+        // closed pipe stops the run rather than being swallowed: the walk would otherwise
+        // keep decoding the chain for a consumer that has gone.
+        if let Some(tap) = tap.as_mut() {
+            for row in &rows {
+                tap.emit(row)?;
+            }
+            tap.flush()?;
+            if tap.closed() {
+                tracing::info!("walk: the event stream closed; stopping");
+                break;
+            }
         }
 
         if in_range.is_multiple_of(500_000) {
@@ -803,7 +1056,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
 
     // Classify from the addresses just recorded. Derived, so it costs a pass
     // over the party table and never a re-walk.
-    let classified = ledger.classify_parties(&lock_creds)?;
+    let classified = ledger.classify_parties(lock_creds)?;
     tracing::info!(
         classified,
         lock_platforms = lock_creds.len(),
@@ -839,29 +1092,42 @@ pub fn run(args: WalkArgs) -> Result<()> {
     // FAILED on a walk that is behaving exactly as designed, and the one number
     // that means anything there is how much is still unattributed.
     let orphans = ledger.orphan_deltas()?;
-    println!("net minted (Σ tx.net_mint)   = {minted}");
-    println!("Σ all deltas                 = {delta_sum}");
-    println!("live in buffer (circulating) = {live}");
-    println!("orphan deltas                = {orphans}");
+    // A report, not data: stdout belongs to the event stream. `--events` pipes it and a
+    // human reads stderr, so the two never share a channel.
+    eprintln!("net minted (Σ tx.net_mint)   = {minted}");
+    eprintln!("Σ all deltas                 = {delta_sum}");
+    eprintln!("live in buffer (circulating) = {live}");
+    eprintln!("orphan deltas                = {orphans}");
     if !buffer_complete {
-        println!("unattributed movements       = {unattributed}");
-        println!(
+        eprintln!("unattributed movements       = {unattributed}");
+        eprintln!(
             "PARTIAL WALK — supply cannot balance from this floor; \
              lower it toward the policy's first mint to close the gap"
         );
     } else if minted as i128 != live || delta_sum != minted || orphans != 0 {
-        println!("*** RECONCILIATION FAILED — supply does not balance ***");
+        eprintln!("*** RECONCILIATION FAILED — supply does not balance ***");
     } else {
-        println!("reconciled: supply balances");
+        eprintln!("reconciled: supply balances");
     }
     if violations > 0 {
-        println!("*** {violations} conservation violations — see logs ***");
+        eprintln!("*** {violations} conservation violations — see logs ***");
     }
     if undecoded_locks > 0 {
         // Reported, never assumed liquid: a lock we could not read is not the
         // same as no lock, and the difference is supply the cascade would
         // otherwise hand to the float.
-        println!("*** {undecoded_locks} lock outputs whose datum did not decode ***");
+        eprintln!("*** {undecoded_locks} lock outputs whose datum did not decode ***");
+    }
+
+    if let Some(tap) = tap.as_ref() {
+        let counts = tap.counts();
+        tracing::info!(
+            transactions = counts.transactions,
+            events = counts.events,
+            unrepresentable = counts.unrepresentable,
+            closed = tap.closed(),
+            "walk: event stream finished"
+        );
     }
 
     Ok(())
@@ -1762,6 +2028,114 @@ mod tests {
         assert!(w.matches(A));
         assert!(w.matches(B));
         assert!(w.matches(b""));
+    }
+
+    // ── LumpFun: a pool with no shared credential ──────────────────────────
+
+    /// Dust Bunny (`$BUNNY`), the first LumpFun v5 launch.
+    const LUMPFUN_POLICY: &str = "a1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba293";
+    /// The pool UTxO in the sample fill `1f7e8e57…`, copied from chain.
+    const LUMPFUN_POOL: &str = "addr1wyj2cxrm7pkfz0sx6j6lgueg8035yrs4ry9xupcvcxlrg6cywmqny";
+    const LUMPFUN_HELD: i64 = 733_043_488;
+    /// The same state's inline datum, from Koios `datum_info`.
+    const LUMPFUN_DATUM: &str = "d87c9f581ca1b085f414fb7799d378e90e39d24c9e54c841a311d72b2f57cba2934542554e4e591a5caf6ac01a3329db221a001e84801a001e8480ff";
+
+    fn lumpfun_output(held: i64) -> DecodedOutput {
+        let policy = hex::decode(LUMPFUN_POLICY).unwrap();
+        DecodedOutput {
+            address: LUMPFUN_POOL.to_string(),
+            lovelace: 1_562_000_000,
+            assets: vec![
+                mitos_chain_walk::decode::Asset::nft(
+                    policy.clone(),
+                    mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec(),
+                ),
+                mitos_chain_walk::decode::Asset::new(policy, b"BUNNY".to_vec(), held as u64),
+            ],
+            index: 0,
+            datum_hash: None,
+            inline_datum: None,
+            min_utxo: 1_500_000,
+        }
+    }
+
+    /// THE GAP THIS ARM CLOSES. `pools::recognise` is DEX-only and a LumpFun
+    /// curve has no shared credential, so before this the forward walk never
+    /// observed one — while the reverse archive did. The reserves it publishes
+    /// are the EFFECTIVE ones, because that is what the curve prices against.
+    #[test]
+    fn the_forward_walk_observes_a_lumpfun_curve_over_effective_reserves() {
+        let out = lumpfun_output(LUMPFUN_HELD);
+        let datum = hex::decode(LUMPFUN_DATUM).unwrap();
+        let obs = lumpfun_observation(
+            &out,
+            LUMPFUN_HELD,
+            &hex::decode(LUMPFUN_POLICY).unwrap(),
+            b"BUNNY",
+            Some(&datum),
+        )
+        .expect("the forward walk must see this pool");
+
+        assert_eq!(obs.dex, mitos_dex_decode::venue::LUMPFUN_V5);
+        assert_eq!(obs.key_basis, pools::KeyBasis::Datum);
+        assert_eq!(
+            obs.key_name,
+            mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME.to_vec()
+        );
+        assert_eq!(
+            obs.base.reserve,
+            Some(858_381_090),
+            "the curve's virtual token side"
+        );
+        assert_eq!(
+            obs.quote_reserve(),
+            Some(6_555_000_130),
+            "1,555 ADA on the curve plus the recovered 5,000,000 ADA offset"
+        );
+        assert_eq!(obs.reserve_source, pools::ReserveSource::DatumPlusVirtual);
+        assert_eq!(
+            obs.fee_bps, None,
+            "the 2% is charged on the ADA leg, not netted by the curve"
+        );
+        assert!(obs.ada_paired());
+    }
+
+    /// No tokens sold yet means no `sold` quantity, so the ADA offset cannot be
+    /// recovered and the price is undefined. Declined rather than emitted with
+    /// a zero quote, which the spine would price as zero.
+    #[test]
+    fn the_forward_walk_declines_a_curve_with_no_price_yet() {
+        let out = lumpfun_output(mitos_launchpad_decode::LUMPFUN_SUPPLY);
+        let datum = hex::decode(LUMPFUN_DATUM).unwrap();
+        assert!(
+            lumpfun_observation(
+                &out,
+                mitos_launchpad_decode::LUMPFUN_SUPPLY,
+                &hex::decode(LUMPFUN_POLICY).unwrap(),
+                b"BUNNY",
+                Some(&datum),
+            )
+            .is_none()
+        );
+    }
+
+    /// The state NFT is a unit of the same policy and the observer is handed
+    /// every watched name, so a claim under the NFT's own name would record a
+    /// pool whose base reserve is 1.
+    #[test]
+    fn the_state_nft_unit_is_not_a_second_curve_sighting() {
+        let out = lumpfun_output(LUMPFUN_HELD);
+        let datum = hex::decode(LUMPFUN_DATUM).unwrap();
+        assert!(
+            lumpfun_observation(
+                &out,
+                LUMPFUN_HELD,
+                &hex::decode(LUMPFUN_POLICY).unwrap(),
+                &mitos_launchpad_decode::LUMPFUN_STATE_NFT_NAME,
+                Some(&datum),
+            )
+            .is_none()
+        );
     }
 
     /// A unit watch takes exactly its own name. The empty-named asset is a real

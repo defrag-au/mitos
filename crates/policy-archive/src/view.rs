@@ -42,6 +42,8 @@
 //! way a spine already does. Until then the box folds observations here and
 //! the browser gets a projection, never the fold.
 
+use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 
 use crate::observation::{Observation, pricing};
@@ -58,7 +60,7 @@ use crate::story::{Kind, PoolIdent, Story, StoryEvent};
 /// - **Instance key alone** merges every pool on a venue that publishes no key
 ///   at all, where `key_name` is empty for all of them, and merges pools across
 ///   venues that happen to reuse a key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PoolKey {
     /// The script address, bech32, as the rows spell it.
     pub address: String,
@@ -72,7 +74,7 @@ pub struct PoolKey {
 /// pool's UTxO is touched **while holding the asset**, so a pool that is
 /// drained stops being observed at the moment *before* it emptied and its final
 /// full reserves sit here for ever. That is what [`Bucket::Stale`] is for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pool {
     pub venue: String,
     /// Slot of the last sighting.
@@ -96,10 +98,11 @@ pub struct Pool {
 /// cost a wrong number on the page. See each variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Bucket {
-    /// Summed into the price: constant-product, seen recently, with a measured
-    /// pair and reserves on both sides.
+    /// Summed into the price: a priceable model, seen recently, with a measured
+    /// pair and reserves on both sides. [`pricing::is_priceable`] decides — a
+    /// plain constant product, or one over a curve's effective reserves.
     Priced,
-    /// Real reserves under a model this crate does not evaluate — a launchpad
+    /// Real reserves under a model this crate does not evaluate — snek.fun's
     /// bonding curve, whose rate is **not** `quote / base`. Needs a FORMULA.
     ///
     /// A row with an empty `pricing` lands here too: not known to be
@@ -180,9 +183,9 @@ impl Pool {
         if at.saturating_sub(self.slot) > p.stale_after {
             return Bucket::Stale;
         }
-        match self.pricing.as_str() {
-            pricing::CONSTANT_PRODUCT => Bucket::Priced,
-            _ => Bucket::OffModel,
+        match pricing::is_priceable(&self.pricing) {
+            true => Bucket::Priced,
+            false => Bucket::OffModel,
         }
     }
 }
@@ -192,7 +195,7 @@ impl Pool {
 /// Fold forward only. To answer for an EARLIER position, re-fold from a
 /// checkpoint — do not ask this one backwards, and [`PolicyView::spot`] will
 /// say so in a debug build if you do.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PolicyView {
     pools: HashMap<PoolKey, Pool>,
     ceiling: Option<u64>,
@@ -288,9 +291,14 @@ impl PolicyView {
             // ⚠️ A CURVE IS A POOL HERE. `story::build` splits bonding curves
             // into their own kind because they are the launch timeline — but
             // their reserves are real, and the observation fold counts them
-            // (as `Bucket::OffModel`, never priced). Skipping them here would
-            // make the two folds disagree on exactly the liquidity
-            // `Spot::unpriceable` and `Spot::stale` exist to report.
+            // (as `Bucket::OffModel` unless the model is evaluable). Skipping
+            // them here would make the two folds disagree on exactly the
+            // liquidity `Spot::unpriceable` and `Spot::stale` exist to report.
+            //
+            // A curve the crate CAN price (LumpFun v5) is a `PoolState` in the
+            // stream, not a `CurveState`: its effective reserves have to ride
+            // with the event, and `CurveState` carries only the raw balances.
+            // The launch timeline is selected by `pricing::is_curve` instead.
             Kind::CurveState {
                 pool,
                 lovelace,
@@ -671,6 +679,56 @@ mod tests {
         assert_eq!(pool.bucket(10, &p), Bucket::OffModel);
     }
 
+    /// A curve whose model IS evaluable is priced over its EFFECTIVE reserves,
+    /// while snek.fun's unpriceable one still is not. The two must not be
+    /// collapsed: one is a formula this crate can compute, the other is a
+    /// formula it deliberately refuses.
+    #[test]
+    fn a_priceable_curve_is_priced_over_its_effective_reserves() {
+        let mut d = decoded(
+            "lumpfun-v5",
+            b"POOL",
+            858_381_090,
+            Some(6_555_000_130),
+            true,
+        );
+        d.pricing = pricing::CONSTANT_PRODUCT_VIRTUAL.into();
+        let o = Observation {
+            slot: 10,
+            block_time: 10,
+            tx_hash: vec![1],
+            address: "addr_curve".into(),
+            lovelace: 1_562_000_000,
+            unit_name: b"BUNNY".to_vec(),
+            unit_amount: 733_043_488,
+            datum: None,
+            decoded: Some(d),
+        };
+        let view = PolicyView::from_observations(&[o]);
+        let spot = view.spot(10, &Projection::default());
+        let ada = spot.ada.expect("a priceable curve sets the ADA price");
+        assert_eq!(ada.base, 858_381_090);
+        assert_eq!(ada.quote, 6_555_000_130);
+        assert_eq!(ada.pools, 1);
+        assert!(spot.unpriceable.is_empty());
+        // 6,555,000,130 / 858,381,090 — LumpFun's own priceLovelace is 7,636,468
+        // when scaled by 1e6.
+        assert!((ada.rate().unwrap() - 7.636_468).abs() < 1e-5);
+    }
+
+    /// The two questions are different, and the helpers say so.
+    #[test]
+    fn curve_and_priceable_are_separate_questions() {
+        assert!(pricing::is_curve(pricing::BONDING_CURVE));
+        assert!(pricing::is_curve(pricing::CONSTANT_PRODUCT_VIRTUAL));
+        assert!(!pricing::is_curve(pricing::CONSTANT_PRODUCT));
+
+        assert!(pricing::is_priceable(pricing::CONSTANT_PRODUCT));
+        assert!(pricing::is_priceable(pricing::CONSTANT_PRODUCT_VIRTUAL));
+        assert!(!pricing::is_priceable(pricing::BONDING_CURVE));
+        assert!(!pricing::is_priceable(""), "unknown is not priceable");
+    }
+
     #[test]
     fn buckets_names_every_variant_even_at_zero() {
         let view = PolicyView::from_observations(&[obs(10, "a", b"K", 100, Some(1_000))]);
@@ -774,5 +832,37 @@ mod tests {
         // ⚠️ The ceiling moves for a candidate too: the archive HAS seen slot
         // 10, it just could not read what it saw.
         assert_eq!(view.ceiling(), Some(20));
+    }
+
+    /// ⚠️ THE PROPERTY AN INCREMENTAL VIEW DEPENDS ON.
+    ///
+    /// A reader refreshes a cached view by applying only the observations that
+    /// arrived ABOVE its ceiling. That is only sound if applying a suffix gives
+    /// the same view as folding the whole — including a pool whose newest
+    /// sighting is in the first batch, whose reserves must survive the second.
+    #[test]
+    fn applying_a_suffix_equals_folding_the_whole() {
+        let all = vec![
+            obs(10, "a", b"K", 100, Some(1_000)),
+            obs(20, "b", b"K", 50, Some(500)),
+            obs(30, "a", b"K", 90, Some(1_100)),
+            obs(40, "b", b"K", 40, Some(600)),
+            obs(50, "a", b"K", 80, Some(1_200)),
+        ];
+        let whole = PolicyView::from_observations(&all);
+
+        // Refresh after slot 20, the way `view_of` does: carry the view, apply
+        // only what sits above its ceiling.
+        let mut split = PolicyView::from_observations(&all[..2]);
+        let ceiling = split.ceiling().unwrap();
+        for o in all.iter().filter(|o| o.slot > ceiling) {
+            split.apply(o);
+        }
+
+        assert_eq!(split.ceiling(), whole.ceiling());
+        assert_eq!(split.claimed(), whole.claimed());
+        let at = whole.ceiling().unwrap();
+        let p = Projection::default();
+        assert_eq!(split.spot(at, &p), whole.spot(at, &p));
     }
 }

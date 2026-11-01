@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# rustc linker only. Forwards to cargo-zigbuild's zigcc after dropping
+# --fix-cortex-a53-843419 (zig 0.16 rejects it). C compiles keep using
+# cargo-zigbuild's own wrapper so we do not double-inject musl CRT.
+set -euo pipefail
+# The linker opens every object plus its own scratch files at once. macOS's
+# default soft limit (256 FDs) fails a 478-object link with EMFILE, which zig
+# reports as `ProcessFdQuotaExceeded`. Raise it for this process and the zig it
+# execs; the hard limit is what the OS permits.
+ulimit -S -n 65536 2>/dev/null || ulimit -S -n "$(ulimit -Hn)" 2>/dev/null || true
+shopt -s nullglob
+wrappers=(
+    "$HOME/Library/Caches/cargo-zigbuild/"*/wrappers/*/zigcc-aarch64-unknown-linux-musl*.sh
+)
+if [[ ${#wrappers[@]} -eq 0 ]]; then
+    echo "zigcc-link: no cargo-zigbuild zigcc wrapper yet; run cargo zigbuild once first" >&2
+    exit 127
+fi
+WRAP="${wrappers[$((${#wrappers[@]} - 1))]}"
+filtered=()
+for a in "$@"; do
+    case "$a" in
+        *fix-cortex-a53-843419*) continue ;;
+    esac
+    filtered+=("$a")
+done
+exec "$WRAP" "${filtered[@]}"

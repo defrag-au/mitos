@@ -37,7 +37,15 @@
 //!   policy/
 //!     segments/NNNNN.pseg     ← one per chunk, append-only
 //!     base.pidx               ← derived: directory + records + time perm + policies
+//!     runs.pidx               ← derived: the POLICY TABLE alone, 16 B a policy
 //! ```
+//!
+//! ⚠️ **`runs.pidx` is 0.8% of `base.pidx` and is the only part a floor probe
+//! reads.** It exists so admission does not depend on a 668 MiB file that is
+//! recompacted whole whenever a chunk lands — and so the volatile tail, which has
+//! no segments, can extend the table between compactions. `compact` writes both
+//! from one walk of the sorted records; a reader prefers the sidecar and falls
+//! back to the base. See [`runs`].
 //!
 //! # What it holds
 //!
@@ -71,6 +79,10 @@ pub mod format;
 /// Shared by `examples/profile` (the survey instrument) and the catalogue
 /// builder, so the two cannot derive different names from the same bytes.
 pub mod profile;
+/// The policy table ON ITS OWN — `prefix → first chunk`, 0.8% of `base.pidx`
+/// and the only part the floor probe reads. Insert-only, so a frequent writer
+/// can keep it current without recompacting 668 MiB.
+pub mod runs;
 pub mod segment;
 /// Re-derivation from the chunks — the half of `verify` that can catch a
 /// faithfully stored wrong answer.
@@ -78,11 +90,12 @@ pub mod verify;
 
 pub use base::{Base, base_path};
 pub use compact::{CompactStats, compact};
-pub use extract::{Mints, TxSpans};
+pub use extract::{Mints, TxSpans, mints_in_block};
 pub use format::{
     BaseHeader, DIR_BITS, PolicyRun, RECORD_BYTES, Record, SegmentHeader, bucket_of, name_prefix,
     policy_prefix,
 };
 pub use profile::{ChunkReader, Cip67Shape, PolicyEvidence, QtyShape, profile_policy};
+pub use runs::{FLOOR_BYTES, FloorRun, Floors, RUNS_FILE, Runs, add_floors, runs_path};
 pub use segment::{Segment, list_segments, segment_path, segments_dir, write_segment};
 pub use verify::{Failure, Fault, VerifyStats, verify_sample};

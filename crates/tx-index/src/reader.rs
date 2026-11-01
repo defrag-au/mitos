@@ -52,6 +52,11 @@ impl TxBody {
     pub fn outputs(&self) -> Result<Vec<ResolvedOutput>> {
         decode::outputs(self.era, &self.cbor)
     }
+
+    /// The outrefs this transaction spends, `(tx hash, output index)`.
+    pub fn inputs(&self) -> Result<Vec<([u8; 32], u32)>> {
+        decode::inputs(self.era, &self.cbor)
+    }
 }
 
 /// What an auxiliary-data lookup came back with.

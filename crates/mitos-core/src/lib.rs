@@ -6,7 +6,11 @@
 //! See `../../docs/design/CF_REPLICATION.md` for the subscription
 //! model behind the trait's associated `Scope` and `Change` types.
 
+mod adapt;
+mod atomic;
 mod auth;
+mod bootstrap;
+mod bootstrap_host;
 mod bundle;
 mod community_modules;
 mod coordinator;
@@ -17,6 +21,7 @@ mod handle;
 pub mod helpers;
 mod indexer;
 mod indexer_bridge;
+mod load;
 mod replicate;
 mod transport;
 mod tx;
@@ -24,7 +29,19 @@ mod tx;
 #[cfg(test)]
 mod tests;
 
-pub use auth::{AuthToken, require_auth};
+pub use adapt::{GenesisPaths, materialise_genesis, to_root_config};
+pub use atomic::{WritePlan, atomic_write, write_unless_edited};
+pub use auth::{
+    AuthToken, Authenticator, Resolution, authenticate, require_read_chain, require_submit_tx,
+};
+pub use bootstrap::{
+    BootstrapError, BootstrapPaths, DISK_HEADROOM_PERCENT, DataDir, Disk, Fetch, Importer, Refused,
+    SnapshotFetcher, Step, Store, classify_data_dir, inspect_store, needed_bytes, plan,
+    run as run_bootstrap, scratch_dir,
+};
+pub use bootstrap_host::{
+    DolosImporter, MithrilFetcher, UnixDisk, mithril_from_root, paths_for, store_tip_slot,
+};
 pub use bundle::{Bundle, print_config_summary};
 pub use coordinator::TxClaimCoordinator;
 pub use dispatcher::{run_dispatcher, run_synchronized_dispatcher};
@@ -33,6 +50,10 @@ pub use emitter::{EmittedRecord, Emitter};
 pub use handle::{IndexerAdapter, IndexerHandle};
 pub use indexer::{Indexer, SubscribeReply};
 pub use indexer_bridge::CoreIndexerBridge;
+pub use load::{
+    ConfigMode, LoadedMitos, default_mitos_toml_path, load_legacy_dolos_toml, load_mitos_toml,
+    select_mode,
+};
 pub use replicate::{
     ClientMessage, ServerMessage, chain_point_from_wire, chain_point_to_wire, decode_client,
     decode_server, encode_client, encode_server, replicate_router, subscribe_reply_to_wire,

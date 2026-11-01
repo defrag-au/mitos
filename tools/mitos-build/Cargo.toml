@@ -14,6 +14,10 @@ path = "src/main.rs"
 # uses, so anything that passes mitos-build also passes the
 # host's upload validator.
 mitos-platform = { path = "../../crates/mitos-platform" }
+# `LifecycleSection` (what the author declares), `BuiltModule` (what this
+# binary emits) and `LIFECYCLE_TABLE` (the one name the builder strips and the
+# host reads). One type for all three sides, so they cannot drift.
+mitos-lifecycle = { path = "../../crates/mitos-lifecycle" }
 
 clap = { workspace = true }
 anyhow = { workspace = true }
