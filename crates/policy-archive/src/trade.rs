@@ -273,10 +273,7 @@ pub fn address_parts(addr: &str) -> Option<(String, Option<String>)> {
     if n < 29 {
         return None;
     }
-    Some((
-        hex(&buf[1..29]),
-        (n >= 57).then(|| hex(&buf[29..57])),
-    ))
+    Some((hex(&buf[1..29]), (n >= 57).then(|| hex(&buf[29..57]))))
 }
 
 /// The account a Shelley address belongs to.

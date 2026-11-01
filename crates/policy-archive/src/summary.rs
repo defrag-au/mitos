@@ -489,11 +489,7 @@ impl Summary {
             .collect();
         // Biggest pool position first, then the key. `lp` is a HashMap, so
         // emitting these in arrival order would not be byte-stable.
-        missing.sort_by(|a, b| {
-            b.1.0
-                .cmp(&a.1.0)
-                .then_with(|| a.0.cmp(b.0))
-        });
+        missing.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
         self.top.extend(
             missing
                 .into_iter()

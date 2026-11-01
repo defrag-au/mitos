@@ -151,7 +151,11 @@ fn vesting(
 
     let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
     for (address, items) in pending {
-        let current = by_address.get(address.as_str()).copied().unwrap_or(0).max(0) as u64;
+        let current = by_address
+            .get(address.as_str())
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
         if current == 0 {
             // Every lock at this address has been claimed.
             continue;
