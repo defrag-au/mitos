@@ -14,6 +14,8 @@
             "quantity": 50
           }
         ],
+        "basis": "chain",
+        "cohort": "wallet",
         "id": {
           "stake": "0b5f5b3b6b48c35d8e92d2f31558f0d9c4b3ca3b2dd7e497fc614fef"
         },
@@ -28,6 +30,8 @@
             "quantity": 300
           }
         ],
+        "basis": "chain",
+        "cohort": "wallet",
         "id": {
           "stake": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3"
         },
@@ -42,6 +46,8 @@
             "quantity": 100
           }
         ],
+        "basis": "decoded",
+        "cohort": "pool",
         "id": {
           "stake": "f1feff38edd67922285e28845a207ddd28e4219baeb3b75e35c5e9af"
         },
@@ -56,6 +62,8 @@
             "quantity": 600
           }
         ],
+        "basis": "chain",
+        "cohort": "wallet",
         "id": {
           "stake": "fba681e69a8f8ed94511ef70744988afc5bc0dc2827ca1e8b53f7ed1"
         },
