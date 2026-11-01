@@ -469,7 +469,6 @@ pub struct PolicyArchive {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CorrectionScope {
     ImmutableOnly,
-    VolatileOnly,
     All,
 }
 
@@ -903,7 +902,6 @@ impl PolicyArchive {
             let wanted = match scope {
                 CorrectionScope::All => true,
                 CorrectionScope::ImmutableOnly => f.range == RangeKind::Immutable,
-                CorrectionScope::VolatileOnly => f.range != RangeKind::Immutable,
             };
             if !wanted {
                 continue;
@@ -1564,30 +1562,19 @@ impl History {
         Ok(self.immutable.as_deref().unwrap_or(&[]))
     }
 
-    /// Every movement, built from the IMMUTABLE decode already held plus
-    /// everything ABOVE it — the same rows [`Self::all_movements`] returns,
-    /// without re-reading the files the immutable fold just read.
+    /// Release the memoised IMMUTABLE decode.
     ///
-    /// ⚠️ The immutable half carries only IMMUTABLE corrections, because a
-    /// carry may see no other. A document folded from the whole archive must
-    /// see every resolution there is, so the volatile ones are attached here
-    /// rather than left behind: a row set that differed by one correction would
-    /// be a different summary, and nothing would say so.
+    /// The publisher folds the immutable half for the carried artifacts and then
+    /// the whole archive for the summary; keeping both decodes resident doubles
+    /// the largest allocation here for no answer.
     ///
-    /// Falls back to a full decode when no immutable fold ran first, so a caller
-    /// cannot get a short answer by calling this out of order.
-    pub fn take_all(&mut self, immutable_to: u64) -> Result<Vec<Movement>> {
-        let Some(mut rows) = self.immutable.take() else {
-            return Ok(self.all_movements()?.to_vec());
-        };
-        // The whole-archive memo, if a caller made one, is a second copy of
-        // these rows. Drop it now rather than hold both.
-        self.all = None;
-        let txs: HashSet<Vec<u8>> = rows.iter().map(|m| m.tx_hash.clone()).collect();
-        self.archive
-            .attach_corrections(&mut rows, &txs, CorrectionScope::VolatileOnly)?;
-        rows.extend(self.movements_above(immutable_to)?);
-        Ok(rows)
+    /// ⚠️ The obvious next step — continue from the immutable decode with only
+    /// the tail above it, instead of decoding twice — was tried and did NOT make
+    /// a fold faster: the cost is allocation in the fold itself, not the read.
+    /// It also changes the row set, because a correction is attached per page
+    /// today and would be attached per archive.
+    pub fn forget_immutable(&mut self) {
+        self.immutable = None;
     }
 
     /// Every movement ABOVE `slot`, decoded — the tail half of a carried fold.
@@ -1797,9 +1784,8 @@ pub fn tail_series(
 /// whole on every refresh, so a carry that includes it is a snapshot of rows
 /// the next refresh may not have; continuing it above its own boundary folds
 /// the replacement on top of the original. Readers fold the tail themselves,
-/// from the live files. A fold reads the archive ONCE: the carried half comes
-/// from the immutable decode, and the summary continues from that same decode
-/// through everything above it. It used to read the whole archive twice.
+/// from the live files. This reads the archive twice — the immutable half, then
+/// the whole archive for the summary — and saves every reader the history.
 /// [`write_derived_at`] with no scale. The archive tests fold through here;
 /// the scheduler and the `summary` command state the registry's decimals
 /// instead, so this wrapper is not in the shipped binary.
@@ -1834,13 +1820,18 @@ pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
     let held = immutable_holders_carry_from(&mut history)?;
     store_series(dir, key, &series)?;
     store_holders(dir, key, key, &held)?;
+    // The whole archive is folded next for the summary; the immutable decode
+    // is dead weight from here.
+    history.forget_immutable();
     // THE SUMMARY is of the whole archive, tail included: it is a published
     // document rather than a fold a reader resumes, so it takes the full
-    // series and every movement. ONE row set serves both — the immutable
-    // decode the carried artifacts just used, plus everything above it — so
-    // the archive is read once here rather than twice.
+    // series and every movement.
     let observations = read_observations(dir, &manifest)?;
-    let mut all = history.take_all(key)?;
+    // ⚠️ ONE row set serves the series and the summary. `all_movements` is the
+    // definition of the archive's rows; continuing from the immutable decode
+    // instead is faster in theory and was measured to be neither faster nor
+    // the same rows — see `History::forget_immutable`.
+    let mut all = history.all_movements()?.to_vec();
     let full = carry_of(&all, &observations);
     let complete = manifest.completeness() == Completeness::Complete;
     let policy = policy_of(dir);

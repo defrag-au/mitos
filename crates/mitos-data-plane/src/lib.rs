@@ -29,11 +29,14 @@
 
 pub mod block_events;
 pub mod dispatch;
+pub mod fold_artifact;
 pub mod impls;
 pub mod types;
 
 #[cfg(test)]
 mod tests;
+
+pub use fold_artifact::{FoldArtifact, FoldError, MAX_PAGE as MAX_FOLD_PAGE};
 
 pub use types::{
     AddressPattern, AssetEntry, AssetMintState, AssetPattern, ChainPoint, ChainTip,

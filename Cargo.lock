@@ -4015,6 +4015,7 @@ dependencies = [
  "dolos-core",
  "hex",
  "live-book",
+ "mitos-fold",
  "pallas",
  "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",

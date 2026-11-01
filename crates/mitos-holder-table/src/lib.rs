@@ -41,15 +41,19 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use chain_decode::{DecodedBlock, DecodedOutput};
 use mitos_cohort::Cohort;
-use mitos_fold::{Aggregate, AggregateResult, SchemaId, Stamp, View};
 use pallas_addresses::{Address, ShelleyDelegationPart};
+
+#[cfg(feature = "fold")]
+use chain_decode::{DecodedBlock, DecodedOutput};
+#[cfg(feature = "fold")]
+use mitos_fold::{Aggregate, AggregateResult, SchemaId, Stamp, View};
 
 /// An output reference: origin tx hash and output index, as a hashable key.
 ///
 /// `chain_decode::OutRef` carries a `Hash<32>`, which is not `Ord` — and a `BTreeMap`
 /// is what keeps the finished table's row order independent of the walk.
+#[cfg(feature = "fold")]
 type OutRefKey = ([u8; 32], u32);
 
 /// How a holder is identified.
@@ -130,6 +134,106 @@ impl HolderTable {
         self.holders.iter().map(|row| row.assets.len()).sum()
     }
 
+    /// The rows file's header, in order. A reader validates it rather than
+    /// assuming it: a column that moved is a format change, and every row below it
+    /// would be read under the wrong name.
+    pub const ROWS_HEADER: &'static str = "holder\taddress\tcohort\tasset_name_hex\tquantity";
+
+    /// Read a table back from its rows file.
+    ///
+    /// The inverse of [`HolderTable::to_rows`], and the reason `Cohort::parse` exists:
+    /// this is a **persisted** form, so the round trip has to hold or a table written by
+    /// one build cannot be read by the next.
+    ///
+    /// `policy` is supplied rather than parsed because the rows file is not where the
+    /// policy lives — it is an envelope extension, so a caller reads the manifest first
+    /// and hands the subject in. A reader that guessed it from the rows would attach the
+    /// holdings to whatever policy happened to be in the first line.
+    ///
+    /// Rows of one holder are written with one address and one cohort, so the row's own
+    /// values are taken and the holder's are not re-derived.
+    pub fn from_rows(policy: [u8; 28], text: &str) -> std::result::Result<HolderTable, RowError> {
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(header) if header == Self::ROWS_HEADER => {}
+            Some(header) => {
+                return Err(RowError {
+                    line: 1,
+                    reason: format!("the header is {header:?}"),
+                });
+            }
+            None => {
+                return Err(RowError {
+                    line: 1,
+                    reason: "the rows file is empty".to_owned(),
+                });
+            }
+        }
+
+        let mut holders: BTreeMap<HolderKey, ParsedRow> = BTreeMap::new();
+        for (index, line) in lines.enumerate() {
+            let number = index + 2;
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [holder, address, cohort, name, quantity] = fields.as_slice() else {
+                return Err(RowError {
+                    line: number,
+                    reason: format!("expected 5 columns, found {}", fields.len()),
+                });
+            };
+
+            let key = match hex_bytes(holder) {
+                Some(bytes) if bytes.len() == 28 => {
+                    let mut credential = [0u8; 28];
+                    credential.copy_from_slice(&bytes);
+                    HolderKey::Stake(credential)
+                }
+                _ => HolderKey::Enterprise((*holder).to_owned()),
+            };
+            let cohort = Cohort::parse(cohort).ok_or_else(|| RowError {
+                line: number,
+                reason: format!("unknown cohort {cohort:?}"),
+            })?;
+            let name = hex_bytes(name).ok_or_else(|| RowError {
+                line: number,
+                reason: format!("asset name is not hex: {name:?}"),
+            })?;
+            let quantity: u64 = quantity.parse().map_err(|_| RowError {
+                line: number,
+                reason: format!("quantity is not a number: {quantity:?}"),
+            })?;
+
+            let entry = holders.entry(key).or_insert_with(|| ParsedRow {
+                address: (*address).to_owned(),
+                cohort,
+                assets: BTreeMap::new(),
+            });
+            // The writer emits one address and one cohort per holder. A file where they
+            // disagree is not something to reconcile — the first is kept and the rest are
+            // the same values, so a difference here would be corruption this reader has no
+            // business repairing.
+            *entry.assets.entry(name).or_insert(0) += quantity;
+        }
+
+        let holders = holders
+            .into_iter()
+            .map(|(holder, row)| HolderRow {
+                holder,
+                address: row.address,
+                cohort: row.cohort,
+                assets: row
+                    .assets
+                    .into_iter()
+                    .map(|(name, quantity)| AssetBalance { name, quantity })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(HolderTable { policy, holders })
+    }
+
     /// Render the table as its rows file.
     ///
     /// **TSV, deliberately and temporarily.** The row encoding is the one part of this
@@ -189,6 +293,7 @@ impl HolderTable {
 }
 
 /// The aggregate state. One instance covers one policy for one walk.
+#[cfg(feature = "fold")]
 pub struct HolderTableAggregate {
     policy: [u8; 28],
     pools: Vec<String>,
@@ -198,6 +303,7 @@ pub struct HolderTableAggregate {
 }
 
 /// One live output that holds the policy.
+#[cfg(feature = "fold")]
 struct LiveOutput {
     holder: HolderKey,
     address: String,
@@ -207,11 +313,24 @@ struct LiveOutput {
     assets: Vec<(Vec<u8>, u64)>,
 }
 
+#[cfg(feature = "fold")]
 struct PendingRow {
     address: String,
     assets: BTreeMap<Vec<u8>, u64>,
 }
 
+/// A holder as the rows file carries it: **one address and one cohort per holder**, and the
+/// holder's assets by name.
+///
+/// Named rather than a tuple because it is the parsed shape of a persisted file — a reader
+/// that got the field order wrong would swap an address for a cohort and still compile.
+struct ParsedRow {
+    address: String,
+    cohort: Cohort,
+    assets: BTreeMap<Vec<u8>, u64>,
+}
+
+#[cfg(feature = "fold")]
 impl HolderTableAggregate {
     /// Build an aggregate for `policy`.
     ///
@@ -233,6 +352,7 @@ impl HolderTableAggregate {
     }
 }
 
+#[cfg(feature = "fold")]
 impl Aggregate<DecodedBlock> for HolderTableAggregate {
     type Artifact = HolderTable;
 
@@ -281,6 +401,7 @@ impl Aggregate<DecodedBlock> for HolderTableAggregate {
     }
 }
 
+#[cfg(feature = "fold")]
 impl HolderTableAggregate {
     /// The policy's assets in one output — empty when it holds none.
     ///
@@ -307,6 +428,23 @@ impl HolderTableAggregate {
     }
 }
 
+/// A rows file that does not read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowError {
+    /// 1-based line number, counting the header.
+    pub line: usize,
+    /// Why the line was refused.
+    pub reason: String,
+}
+
+impl std::fmt::Display for RowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}: {}", self.line, self.reason)
+    }
+}
+
+impl std::error::Error for RowError {}
+
 /// Lowercase hex, for the rows file's credential and asset-name columns.
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -318,10 +456,30 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode lowercase hex. `None` for an odd length or a non-hex digit.
+fn hex_bytes(value: &str) -> Option<Vec<u8>> {
+    let digits = value.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.as_chunks::<2>().0 {
+        out.push(nibble(pair[0])? << 4 | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
 /// A hash and an index as a hashable key.
 ///
 /// Generic over the hash's `AsRef` so the crate does not need `pallas-primitives` in its
 /// manifest for one conversion.
+#[cfg(feature = "fold")]
 fn outref_key(hash: impl AsRef<[u8]>, index: u32) -> OutRefKey {
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(hash.as_ref());
@@ -334,6 +492,7 @@ fn outref_key(hash: impl AsRef<[u8]>, index: u32) -> OutRefKey {
 /// their live set: the aggregate tracks it through the walk, the view enumerates
 /// `by_policy`. Keeping the fold in one function is what makes "the two shapes agree" a
 /// statement about the live set rather than about two copies of the same arithmetic.
+#[cfg(feature = "fold")]
 fn table_from(
     policy: [u8; 28],
     pools: &[String],
@@ -390,6 +549,7 @@ fn table_from(
 ///
 /// It cannot run until the book is finished, which is the whole reason it is a [`View`] and
 /// not an [`Aggregate`].
+#[cfg(feature = "fold")]
 pub struct HolderTableView {
     policy: [u8; 28],
     pools: Vec<String>,
@@ -399,6 +559,7 @@ pub struct HolderTableView {
     dropped: u64,
 }
 
+#[cfg(feature = "fold")]
 impl HolderTableView {
     /// Build a view for `policy`. The two registries are as [`HolderTableAggregate::new`].
     pub fn new(policy: [u8; 28], pools: Vec<String>, lock_creds: Vec<[u8; 28]>) -> Self {
@@ -447,6 +608,7 @@ impl HolderTableView {
     }
 }
 
+#[cfg(feature = "fold")]
 impl View<live_book::Base> for HolderTableView {
     type Artifact = HolderTable;
 
@@ -527,6 +689,7 @@ pub fn holder_key_bytes(address: &[u8]) -> Option<(HolderKey, String)> {
 }
 
 /// The holder identity of a bech32 Shelley address.
+#[cfg(feature = "fold")]
 fn holder_key(address: &str) -> Option<HolderKey> {
     let decoded = Address::from_bech32(address).ok()?;
     holder_key_bytes(&decoded.to_vec()).map(|(holder, _)| holder)
@@ -534,23 +697,28 @@ fn holder_key(address: &str) -> Option<HolderKey> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fold")]
     use std::path::PathBuf;
 
+    #[cfg(feature = "fold")]
     use mitos_fold::Fingerprint;
 
     use super::*;
 
+    #[cfg(feature = "fold")]
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../mitos-platform/tests/fixtures/186000000.block.cbor")
     }
 
+    #[cfg(feature = "fold")]
     fn fixture_block() -> Option<DecodedBlock> {
         let bytes = std::fs::read(fixture()).ok()?;
         let block = pallas_traverse::MultiEraBlock::decode(&bytes).ok()?;
         Some(chain_decode::decode_block(&block))
     }
 
+    #[cfg(feature = "fold")]
     fn first_policy(block: &DecodedBlock) -> Option<[u8; 28]> {
         for tx in &block.txs {
             for output in &tx.outputs {
@@ -564,6 +732,7 @@ mod tests {
         None
     }
 
+    #[cfg(feature = "fold")]
     fn table_for(block: &DecodedBlock, policy: [u8; 28]) -> HolderTable {
         let mut aggregate = Box::new(HolderTableAggregate::new(policy, Vec::new(), Vec::new()));
         aggregate.observe(block).expect("observe");
@@ -572,6 +741,7 @@ mod tests {
             .expect("finish")
     }
 
+    #[cfg(feature = "fold")]
     #[test]
     fn the_real_fixture_produces_a_table() {
         let Some(block) = fixture_block() else {
@@ -596,6 +766,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fold")]
     #[test]
     fn the_same_block_produces_the_same_table() {
         let Some(block) = fixture_block() else {
@@ -608,6 +779,7 @@ mod tests {
         assert_eq!(table_for(&block, policy), table_for(&block, policy));
     }
 
+    #[cfg(feature = "fold")]
     #[test]
     fn a_policy_the_block_does_not_hold_produces_an_empty_table() {
         let Some(block) = fixture_block() else {
@@ -619,6 +791,74 @@ mod tests {
         assert_eq!(table.total_quantity(), 0);
     }
 
+    #[cfg(feature = "fold")]
+    #[test]
+    fn a_table_round_trips_through_its_rows_file() {
+        let Some(block) = fixture_block() else {
+            return;
+        };
+        let Some(policy) = first_policy(&block) else {
+            return;
+        };
+
+        let table = table_for(&block, policy);
+        let rows = table.to_rows();
+        let read_back = HolderTable::from_rows(policy, &rows).expect("the rows file reads back");
+        assert_eq!(read_back, table);
+        assert_eq!(
+            read_back.to_rows(),
+            rows,
+            "the file is stable across the round trip"
+        );
+    }
+
+    #[test]
+    fn a_rows_file_with_a_moved_column_is_refused() {
+        let error = HolderTable::from_rows([0u8; 28], "holder\taddress\tquantity\n").unwrap_err();
+        assert_eq!(error.line, 1);
+        assert!(error.to_string().contains("header"), "{error}");
+    }
+
+    #[test]
+    fn a_row_with_the_wrong_number_of_columns_is_refused() {
+        let text = format!("{}\nnot\tenough\n", HolderTable::ROWS_HEADER);
+        let error = HolderTable::from_rows([0u8; 28], &text).unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.to_string().contains("5 columns"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_cohort_in_a_row_is_refused() {
+        let text = format!(
+            "{}\nabc\taddr1xyz\tnot-a-cohort\t\t1\n",
+            HolderTable::ROWS_HEADER
+        );
+        let error = HolderTable::from_rows([0u8; 28], &text).unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.to_string().contains("cohort"), "{error}");
+    }
+
+    #[test]
+    fn the_real_pilot_rows_file_reads_back() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.tmp/pilot/full/holders.tsv");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping: no pilot rows file (run `fold-probe pilot`)");
+            return;
+        };
+        let policy: [u8; 28] =
+            hex::decode("407ca40d92693cb737f1cfedb98023ae753038d8c6ca9e02483d79c6")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        let table = HolderTable::from_rows(policy, &text).expect("the pilot rows read back");
+        assert_eq!(table.distinct_holders(), 294);
+        assert_eq!(table.total_quantity(), 68_994_134);
+        assert_eq!(table.to_rows(), text, "re-rendering is byte-identical");
+    }
+
+    #[cfg(feature = "fold")]
     #[test]
     fn a_holder_key_keeps_the_stake_credential_and_drops_pointer_addresses() {
         let Some(block) = fixture_block() else {
@@ -650,6 +890,7 @@ mod tests {
 
     /// A block carrying `txs`, at the fixture's slot and hash — only the txs matter to
     /// an aggregate.
+    #[cfg(feature = "fold")]
     fn block_of(base: &DecodedBlock, txs: Vec<chain_decode::DecodedTx>) -> DecodedBlock {
         DecodedBlock {
             slot: base.slot,
@@ -660,6 +901,7 @@ mod tests {
 
     /// A transaction with the template's hash: a distinct hash per template, and the
     /// template is the only way to a `Hash<32>` without a manifest of its own.
+    #[cfg(feature = "fold")]
     fn tx_like(
         template: &chain_decode::DecodedTx,
         inputs: Vec<chain_decode::DecodedInput>,
@@ -676,6 +918,7 @@ mod tests {
     }
 
     /// An output at `address` holding `quantity` of the policy's single asset.
+    #[cfg(feature = "fold")]
     fn holding(address: &str, index: u32, policy: [u8; 28], quantity: u64) -> DecodedOutput {
         DecodedOutput {
             address: address.to_owned(),
@@ -693,6 +936,7 @@ mod tests {
     }
 
     /// A spend of one output reference.
+    #[cfg(feature = "fold")]
     fn spending(hash_of: &chain_decode::DecodedTx, index: u32) -> chain_decode::DecodedInput {
         chain_decode::DecodedInput {
             oref: (hash_of.tx_hash, index),
@@ -701,6 +945,7 @@ mod tests {
     }
 
     /// The fixture's first holder address and policy, for a test that needs real values.
+    #[cfg(feature = "fold")]
     fn a_real_holder(block: &DecodedBlock) -> Option<(String, [u8; 28])> {
         for tx in &block.txs {
             for output in &tx.outputs {
@@ -717,6 +962,7 @@ mod tests {
         None
     }
 
+    #[cfg(feature = "fold")]
     #[test]
     fn a_spend_removes_the_output_and_the_holder_with_it() {
         let Some(base) = fixture_block() else {
@@ -761,6 +1007,7 @@ mod tests {
         assert_eq!(spent.total_quantity(), 0);
     }
 
+    #[cfg(feature = "fold")]
     #[test]
     fn spending_one_of_two_outputs_leaves_the_other() {
         let Some(base) = fixture_block() else {
@@ -797,6 +1044,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fold")]
     #[test]
     fn a_spend_the_window_never_created_is_not_an_error() {
         let Some(base) = fixture_block() else {

@@ -19,6 +19,7 @@
 
 pub mod chain_data;
 pub mod emit;
+pub mod fold_data;
 pub mod interest;
 pub mod logging;
 pub mod scan_cache;

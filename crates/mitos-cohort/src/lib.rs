@@ -100,6 +100,24 @@ impl Cohort {
             Cohort::Script | Cohort::Wallet => "chain",
         }
     }
+
+    /// The cohort [`Cohort::as_str`] writes, read back.
+    ///
+    /// The inverse exists because `as_str` is not only a label: the holder table
+    /// persists it in its rows file, so the pair has to round-trip or a persisted
+    /// table cannot be read. `None` for a name this build does not know — a reader
+    /// refuses rather than defaulting a cohort it has never heard of.
+    pub fn parse(value: &str) -> Option<Cohort> {
+        match value {
+            "burn" => Some(Cohort::Burn),
+            "inventory" => Some(Cohort::Inventory),
+            "pool" => Some(Cohort::Pool),
+            "vesting" => Some(Cohort::Vesting),
+            "script" => Some(Cohort::Script),
+            "wallet" => Some(Cohort::Wallet),
+            _ => None,
+        }
+    }
 }
 
 /// Lower-case hex. The registry's lookups are exact and its own guard test
@@ -230,6 +248,30 @@ mod tests {
     const BURN: &str = "addr1w8qmxkacjdffxah0l3qg8hq2pmvs58q8lcy42zy9kda2ylc6dy5r4";
     // CSwap pool (script payment + key stake, `addr1z`).
     const CSWAP: &str = "addr1z8ke0c9p89rjfwmuh98jpt8ky74uy5mffjft3zlcld9h7ml3lmln3mwk0y3zsh3gs3dzqlwa9rjzrxawkwm4udw9axhs6fuu6e";
+
+    #[test]
+    fn a_cohort_name_round_trips_through_its_persisted_form() {
+        // `as_str` is not only a label: the holder table writes it into its rows file, so a
+        // name that no longer parses makes every persisted table unreadable.
+        for cohort in [
+            Cohort::Burn,
+            Cohort::Inventory,
+            Cohort::Pool,
+            Cohort::Vesting,
+            Cohort::Script,
+            Cohort::Wallet,
+        ] {
+            assert_eq!(Cohort::parse(cohort.as_str()), Some(cohort));
+        }
+    }
+
+    #[test]
+    fn an_unknown_cohort_name_is_refused_rather_than_defaulted() {
+        for name in ["", "Wallet", "holder", "wallet ", "pool\n"] {
+            assert_eq!(Cohort::parse(name), None, "{name:?} should not parse");
+        }
+    }
+
     // An ordinary base address.
     const WALLET: &str = "addr1qylnwp3lp2re0jtw9kf0dfvxf4mkvwt3jqzqhqzc5jvxjqrcfxvqcnf2v7xqcnqzsxsdxaewwqnyzcnrqhqhqhqhqhqcnfsz3";
 

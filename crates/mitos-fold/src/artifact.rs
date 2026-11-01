@@ -360,6 +360,39 @@ impl Artifact {
         )
     }
 
+    /// The files a manifest names, without the rest of it.
+    ///
+    /// For a reader that serves or stores an artifact **without interpreting it** — a host
+    /// handing bytes to a module, a mirror, a copy. The schema and the stamp are the
+    /// business of a reader that will parse rows, and this one has not claimed to be that:
+    /// naming a schema it does not read would be the very guess [`Artifact::decode`]
+    /// refuses.
+    ///
+    /// Only `file` lines are read. Every name is validated the same way [`Artifact`]
+    /// validates it, so a name that could escape the artifact root is still refused.
+    pub fn file_names(text: &str) -> Result<Vec<ArtifactFile>> {
+        let mut files = Vec::new();
+        for (index, raw) in text.lines().enumerate() {
+            let line = index + 1;
+            let Some(value) = raw.strip_prefix("file ") else {
+                continue;
+            };
+            let (size, name) = value
+                .split_once(' ')
+                .ok_or_else(|| Error::InvalidEnvelope {
+                    reason: format!("line {line}: a file is `file <bytes> <name>`"),
+                })?;
+            let size = size.parse().map_err(|_| Error::InvalidEnvelope {
+                reason: format!("line {line}: `file` size is not a number: {size:?}"),
+            })?;
+            files.push(ArtifactFile::new(name, size)?);
+        }
+        if files.is_empty() {
+            return Err(Error::EmptyArtifact);
+        }
+        Ok(files)
+    }
+
     /// Refuse an artifact whose base is not the one the caller requires.
     ///
     /// Exact, all three fields. A caller that cares about fewer compares them itself; a

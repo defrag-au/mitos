@@ -3,10 +3,16 @@
 #
 #   direnv exec . deploy/local/up.sh                 # host on dolos, as before
 #   direnv exec . deploy/local/up.sh --plane book --book .tmp/book-window-1848
+#   direnv exec . deploy/local/up.sh --fold .tmp/pilot/full
 #
-# `--book` / `--datum` are host paths under the repository's .tmp/ (or
-# MITOS_BOOK_DIR / MITOS_DATUM_DIR for the same); the stack mounts that
-# directory at /books and the container sees /books/<name>.
+# `--book` / `--datum` / `--fold` are host paths under the repository's .tmp/ (or
+# MITOS_BOOK_DIR / MITOS_DATUM_DIR / MITOS_FOLD_ARTIFACT for the same); the stack
+# mounts that directory at /books and the container sees /books/<name>.
+#
+# `--fold` names a fold artifact directory (`artifact.meta` + the files it lists).
+# The host serves it through the `fold-data` interface and stages the
+# `holders-from-fold` module, which reads it and emits the pilot's holder snapshot
+# with no chain access at all. That is `docs/design/FOLD_PLANE.md` §8 item 4.
 #
 # Builds the worker (and its module artifact), cross-builds the mitos host for
 # the container's architecture, starts a Cloudflare quick tunnel for the worker,
@@ -60,6 +66,7 @@ CHECK=0
 PLANE="${MITOS_DATA_PLANE:-dolos}"
 BOOK_HOST="${MITOS_BOOK_DIR:-}"
 DATUM_HOST="${MITOS_DATUM_DIR:-}"
+FOLD_HOST="${MITOS_FOLD_ARTIFACT:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) CHECK=1; shift ;;
@@ -78,8 +85,13 @@ while [ $# -gt 0 ]; do
             DATUM_HOST="$2"
             shift 2
             ;;
+        --fold)
+            [ $# -ge 2 ] || die "--fold needs an artifact directory"
+            FOLD_HOST="$2"
+            shift 2
+            ;;
         *)
-            die "usage: deploy/local/up.sh [--check] [--plane dolos|book] [--book <dir>] [--datum <dir>]"
+            die "usage: deploy/local/up.sh [--check] [--plane dolos|book] [--book <dir>] [--datum <dir>] [--fold <dir>]"
             ;;
     esac
 done
@@ -102,6 +114,7 @@ container_path() {
 
 BOOK_DIR=""
 DATUM_DIR=""
+FOLD_DIR=""
 if [ -n "${BOOK_HOST}" ]; then
     BOOK_DIR="$(container_path "${BOOK_HOST}")"
     [ -f "${BOOK_HOST}/book.meta" ] \
@@ -111,6 +124,11 @@ if [ -n "${DATUM_HOST}" ]; then
     DATUM_DIR="$(container_path "${DATUM_HOST}")"
     [ -f "${DATUM_HOST}/datum.tbl" ] \
         || die "${DATUM_HOST} has no datum.tbl; point --datum at a datum capture"
+fi
+if [ -n "${FOLD_HOST}" ]; then
+    FOLD_DIR="$(container_path "${FOLD_HOST}")"
+    [ -f "${FOLD_HOST}/artifact.meta" ] \
+        || die "${FOLD_HOST} has no artifact.meta; point --fold at a fold artifact (fold-probe pilot … --out <dir>)"
 fi
 if [ "${PLANE}" = "book" ] && [ -z "${BOOK_DIR}" ]; then
     die "--plane book needs --book <dir> (or MITOS_BOOK_DIR)"
@@ -156,13 +174,18 @@ if [ "${CHECK}" = "1" ]; then
         [ -d "${MITOS_SRC}/community-modules/${name}/target/mitos/${name}" ] \
             || die "${name} has no built artifact; run: mitos-build --module community-modules/${name}/${stem}.rs"
     done
+    if [ -n "${FOLD_DIR}" ]; then
+        [ -d "${MITOS_SRC}/community-modules/holders-from-fold/target/mitos/holders-from-fold" ] \
+            || die "holders-from-fold has no built artifact; run: mitos-build --module community-modules/holders-from-fold/holders_from_fold.rs"
+    fi
     if [ -n "$(command -v llvm-strip || true)" ]; then
         STRIP="llvm-strip"
     else
         STRIP="none"
     fi
-    printf '✓ check ok\n  mitos     %s\n  worker    %s\n  modules   cip-25-mint cip-68-mint credit-address\n  plane     %s\n  book      %s\n  datum     %s\n  container %s\n  compose   %s\n  fds       soft %s, hard %s\n  strip     %s\n' \
-        "${MITOS_SRC}" "${WORKER_DIR}" "${PLANE}" "${BOOK_DIR:-(none)}" "${DATUM_DIR:-(none)}" \
+    printf '✓ check ok\n  mitos     %s\n  worker    %s\n  modules   cip-25-mint cip-68-mint credit-address%s\n  plane     %s\n  book      %s\n  datum     %s\n  fold      %s\n  container %s\n  compose   %s\n  fds       soft %s, hard %s\n  strip     %s\n' \
+        "${MITOS_SRC}" "${WORKER_DIR}" "${FOLD_DIR:+ holders-from-fold}" "${PLANE}" \
+        "${BOOK_DIR:-(none)}" "${DATUM_DIR:-(none)}" "${FOLD_DIR:-(none)}" \
         "${CONTAINER_BIN}" "$(command -v "${CONTAINER_COMPOSE}")" "$(ulimit -Sn)" "$(ulimit -Hn)" "${STRIP}"
     exit 0
 fi
@@ -267,6 +290,12 @@ rm -rf "${GENERATED}/community-modules"
 stage_module cip-25-mint
 stage_module cip-68-mint
 stage_module credit-address
+# The fold reader is staged only when an artifact is being served: it is inert
+# without one, and staging it on a dolos-backed run would advertise a module
+# whose one input is missing.
+if [ -n "${FOLD_DIR}" ]; then
+    stage_module holders-from-fold
+fi
 
 cat > "${GENERATED}/mitos.toml" <<EOF
 network = "preprod"
@@ -351,10 +380,14 @@ EOF
 
 log "starting stack — Ctrl-C stops both services and the tunnel"
 log "data plane: ${PLANE}${BOOK_DIR:+ (${BOOK_DIR})}"
+if [ -n "${FOLD_DIR}" ]; then
+    log "fold artifact: ${FOLD_DIR} (holders-from-fold)"
+fi
 # The stack resolves these from the environment, which wins over `.env`; a
-# compose file can only name variables that resolve, so all three are always
+# compose file can only name variables that resolve, so all four are always
 # exported (empty means unset to the host).
 export MITOS_DATA_PLANE="${PLANE}"
 export MITOS_BOOK_DIR="${BOOK_DIR}"
 export MITOS_DATUM_DIR="${DATUM_DIR}"
+export MITOS_FOLD_ARTIFACT="${FOLD_DIR}"
 "${CONTAINER_COMPOSE}" --runtime "${CONTAINER_BIN}" -f "${DIR}/stack.toml" up

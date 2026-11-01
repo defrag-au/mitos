@@ -27,6 +27,11 @@ pipeline-types = { workspace = true }
 # store behind it.
 live-book = { path = "../live-book" }
 
+# The fold plane's contract: the artifact envelope and its text form. Dependency-free and
+# I/O-free, so a host reading an artifact and the walker writing one share one decoder
+# rather than two readings of the same format.
+mitos-fold = { path = "../mitos-fold" }
+
 # Pallas types where unavoidable: PlutusData (typed; not heavy),
 # Hash<N>, address structs. We re-expose narrowed forms but keep
 # pallas as the underlying source of truth for fidelity.

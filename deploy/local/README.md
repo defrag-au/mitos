@@ -82,7 +82,8 @@ The script:
 4. stages `cip-25-mint`, `cip-68-mint` and `credit-address` from
    `community-modules/` into `generated/community-modules/` — the host refuses a
    subscribe for a module it has no artifact for, and the in-tree `cip-25-mint`
-   is the parent instance the announced build moves away from;
+   is the parent instance the announced build moves away from. `--fold` adds
+   `holders-from-fold` to that set;
 5. renders `generated/mitos.toml`, `generated/namespaces.toml` and the worker's
    `.dev.vars` from that tunnel hostname;
 6. runs `container-compose up` in the foreground.
@@ -128,6 +129,42 @@ POLICY=0a85dd1543465407852c90e66c074a3b52ea2d7c77a2346ddc20550a \
 `--datum <dir>` adds a `datum.tbl` capture beside the book (`MITOS_DATUM_DIR`). Both flags
 name host paths under `.tmp/`; the stack mounts that directory at `/books` and refuses a
 path outside it rather than creating a bind the host never reads.
+
+### Run it serving a fold artifact
+
+A fold artifact is a directory `fold-probe pilot` writes: a manifest (`artifact.meta`) and
+the files it names. `--fold` mounts it, points the host at it (`MITOS_FOLD_ARTIFACT`) and
+stages the `holders-from-fold` module, which reads the artifact through the `fold-data`
+interface and emits the holder snapshot — no chain, no policy scan, no Dolos.
+
+```sh
+# the pilot: chunks 0..=1999 of the mainnet store → 294 holders / 68,994,134 units
+direnv exec . cargo run -q --release -p fold-probe -- pilot \
+    --immutable ~/data/mithril/immutable --start 0 --chunks 2000 \
+    --policy 407ca40d92693cb737f1cfedb98023ae753038d8c6ca9e02483d79c6 \
+    --book .tmp/pilot/book-2000 --out .tmp/pilot/full
+
+direnv exec . deploy/local/up.sh --fold .tmp/pilot/full
+```
+
+The host logs `fold artifact served` on the first `fold-data` call and the module logs
+`serving holder-table/v1 · policy … · base slot …`. What this does **not** wire is a
+subscriber: `holders-from-fold` starts when a companion names it, exactly like every other
+module, so minting-engine (which subscribes to `cip-25-mint`) leaves it activated and idle.
+The read-and-emit path is exercised end to end by the platform acceptance test, which
+needs no stack at all:
+
+```sh
+direnv exec . cargo test -p mitos-platform --test holders_from_fold -- --nocapture
+```
+
+That test boots the real host, activates the real built module, drives `rebootstrap`, and
+compares the emission against `holders.tsv` parsed independently in the test.
+
+**Network mismatch is the point, not a bug.** The chunk store on this workstation is
+mainnet and the stack follows preprod, so a fold artifact served here is a mainnet table
+on a preprod host. The module reports the artifact's base slot in `SnapshotBegin` and does
+not compare it with the followed chain — a reader that cares pairs the two.
 
 What to read back: `up.sh` prints `data plane: book`, the host logs
 `data plane selected plane="book"`, and `/_admin/status` reports the book's `base_slot`

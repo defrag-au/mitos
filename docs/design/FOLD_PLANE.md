@@ -295,8 +295,10 @@ aggregate and the view disagree.
   in it, and a reader checks the length before trusting it — so replacing
   `HolderTable::to_rows` is the whole of that change.
 - The module's snapshot becomes a read of the summary/page; its delta path stays in wasm.
-  The module keeps its interest handling and its live events. It stops doing the
-  aggregation.
+  That read is a **new module**, `community-modules/holders-from-fold`, rather than a mode
+  on `collection-holders` — one ledger cannot have a frozen artifact and a moving tip as
+  two sources of truth. `collection-holders` keeps its interest handling, its live events
+  and its scan; the fold reader has no interest to keep and no delta to compute.
 - Parity: the artifact summary against the module's 396-ref snapshot, byte-identical where
   they overlap. The 995-ref and 9,625-ref policies exercise the delta path and the
   no-cap enumeration, not the snapshot builder.
@@ -339,7 +341,19 @@ The gate:
 4. **The local stack** — `deploy/local` serves the artifact and the flow plane together;
    `container-compose` is pinned (the `observe()` fix must be committed and re-pinned, or
    the lab is one machine's working tree); the module reads the artifact and emits the same
-   events. **Not started** — this is the remaining item.
+   events. **Done, 2026-11-01** — except the subscribe half, which is the consumer's:
+   `deploy/local/up.sh --fold <dir>` mounts the artifact, exports `MITOS_FOLD_ARTIFACT`,
+   stages the new `community-modules/holders-from-fold`, and the host logs
+   `fold artifact served`. The read-and-emit path is proven by
+   `crates/mitos-platform/tests/holders_from_fold.rs`: the real host boots, the real built
+   module activates, `start(module, rebootstrap = true)` drives it to `done`, and the
+   emission is compared with `holders.tsv` parsed independently in the test —
+   **1 begin · 1 chunk · 1 end · 294 holdings · 294 holders · Σ 68,994,134**, matching the
+   pilot exactly. No chain, no book, no Dolos, `NullChainDataPlane` underneath so a stray
+   chain call would fail rather than pass silently. What remains unwired is a *subscriber*:
+   the module starts when a companion names it, and minting-engine names only
+   `cip-25-mint`, so on the stack it is activated and idle. Wiring it in belongs to the
+   consumer, in the consumer's repo.
 5. **No production path** — the first publish target is a local directory or a test prefix.
    `mitos-watch`, the box, and the edge are untouched. **Holds.**
 
@@ -397,6 +411,18 @@ Settled:
   finished the substrate, so the build is two phases (walk → book → views). The holder table
   is implemented both ways; the stream shape stays for artifacts a view cannot express —
   window counts, per-epoch histograms, logs.
+- **The fold reader is a new module, not a mode on `collection-holders`.**
+  `community-modules/holders-from-fold` reads the artifact; `collection-holders` keeps its
+  chain scan and its delta path. One module holding a frozen artifact *and* a moving tip
+  would have two sources of truth for one ledger, and the delta walk would have to know
+  which one its state came from. Two modules, one documented base: the fold module reports
+  the artifact's slot in `SnapshotBegin`, and a consumer that wants freshness pairs it with
+  the chain-scanning module. See §7.
+- **`mitos-fold` is not a `fold`-feature dependency of `mitos-holder-table`.** The envelope
+  helpers (`POLICY_EXTENSION`, `policy_of`) are part of the artifact's contract, not of
+  either fold shape, and `mitos-fold` is dependency-free and builds for
+  `wasm32-unknown-unknown`. `fold` gates exactly the two shapes whose dependencies cannot
+  cross into wasm (`chain-decode`, `live-book`).
 - **Migration waits** until the pilot and the local gate.
 
 Open:

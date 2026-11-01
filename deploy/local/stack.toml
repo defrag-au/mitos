@@ -7,9 +7,10 @@
 # rather than copied into an image. Shadow diffing adds a second host service
 # over the same inputs.
 #
-# `MITOS_BOOK_DIR` / `MITOS_DATUM_DIR` are container paths and are always
-# exported by `up.sh` (empty when the run is dolos-backed), because a compose
-# file can only name a variable that resolves.
+# `MITOS_BOOK_DIR` / `MITOS_DATUM_DIR` / `MITOS_FOLD_ARTIFACT` are container paths and are
+# always exported by `up.sh` (empty when the run does not use one), because a compose
+# file can only name a variable that resolves. An empty `MITOS_FOLD_ARTIFACT` is unset to
+# the host, not a directory — see `host_fns_v2/fold_data.rs`.
 #
 # The worker is the module owner: it serves `cip-25-mint` at the well-known
 # paths mitos derives from the announcement. `up.sh` starts a Cloudflare quick
@@ -38,7 +39,7 @@ size = "40G"
 [services.mitos]
 entrypoint = "/usr/local/bin/mitos"
 command = ["--config-file", "/etc/mitos/mitos.toml"]
-env = { MITOS_AUTH_TOKEN = "${MITOS_AUTH_TOKEN}", MITOS_TOKEN_DEV = "${MITOS_TOKEN_DEV}", MITOS_NAMESPACES_FILE = "/etc/mitos/namespaces.toml", BUNDLE_COMMUNITY_MODULES_DIR = "/community-modules", MITOS_DATA_PLANE = "${MITOS_DATA_PLANE}", MITOS_BOOK_DIR = "${MITOS_BOOK_DIR}", MITOS_DATUM_DIR = "${MITOS_DATUM_DIR}", RUST_LOG = "info,mitos_platform=debug" }
+env = { MITOS_AUTH_TOKEN = "${MITOS_AUTH_TOKEN}", MITOS_TOKEN_DEV = "${MITOS_TOKEN_DEV}", MITOS_NAMESPACES_FILE = "/etc/mitos/namespaces.toml", BUNDLE_COMMUNITY_MODULES_DIR = "/community-modules", MITOS_DATA_PLANE = "${MITOS_DATA_PLANE}", MITOS_BOOK_DIR = "${MITOS_BOOK_DIR}", MITOS_DATUM_DIR = "${MITOS_DATUM_DIR}", MITOS_FOLD_ARTIFACT = "${MITOS_FOLD_ARTIFACT}", RUST_LOG = "info,mitos_platform=debug" }
 volumes = [
   "mitos-data:/var/lib/mitos",
   "./generated/mitos.toml:/etc/mitos/mitos.toml:ro",

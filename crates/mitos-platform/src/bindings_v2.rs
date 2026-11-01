@@ -34,6 +34,7 @@ wasmtime::component::bindgen!({
 // is plain `Host` traits per interface.
 pub use mitos::platform_v2::chain_data::Host as ChainDataHost;
 pub use mitos::platform_v2::emit::Host as EmitHost;
+pub use mitos::platform_v2::fold_data::Host as FoldDataHost;
 pub use mitos::platform_v2::interest::Host as InterestHost;
 pub use mitos::platform_v2::logging::{Host as LoggingHost, LogLevel};
 pub use mitos::platform_v2::state_kv::Host as StateKvHost;
