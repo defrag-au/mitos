@@ -1991,6 +1991,7 @@ fn pass(
 mod tests {
     use super::*;
     use crate::archive::PolicyArchive;
+    use policy_archive::feed::{Direction, direction};
 
     fn h(b: u8) -> Hash<32> {
         Hash::from([b; 32])
@@ -2203,6 +2204,132 @@ mod tests {
             covered_to: 0,
             sealed_unix: 0,
         }
+    }
+
+    fn tx_at(slot: u64, b: u8, deltas: Vec<(&str, &str, i64)>) -> PassTx {
+        let mut t = tx(b, deltas);
+        t.slot = slot;
+        t
+    }
+
+    /// A VOLATILE TAIL PASS whose spender sits inside `[floor, ceiling)` and
+    /// whose only source was created BELOW the floor. `settle_with` stands in
+    /// for the tx-index, which is exactly the tail's end-of-range settle: the
+    /// source is never in the range, so only the index can answer it.
+    ///
+    /// Returns the archive's feed rows, read back the way an API page reads
+    /// them.
+    fn tail_with_a_below_floor_source(
+        source_address: &str,
+    ) -> (
+        tempfile::TempDir,
+        Manifest,
+        Vec<policy_archive::feed::FeedRow>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy_hex = "cd".repeat(28);
+        let dir = tmp.path().join(&policy_hex);
+        let floor = 201_938_400u64;
+        let ceiling = floor + 1_000;
+        // The destination is the same wallet on both sides of the self-move
+        // case; only the source address changes between the two tests.
+        let spender = tx_at(floor + 17, 5, vec![("Perp0190", "bob", 1)]);
+        let source = h(9);
+
+        let tip = dir.join(PassEntry::tip_dir_name(0));
+        let mut w = SegmentWriter::new(&tip, stamp(&policy_hex)).unwrap();
+        w.push_own(spender.rows());
+        let mut pending = Pending::default();
+        pending.want(&spender, missing("Perp0190", 1), &[(source, 0)]);
+        let settled = pending.settle_with(|oref| {
+            assert_eq!(*oref, (source, 0), "only the unresolved input is offered");
+            Lookup::Held {
+                units: vec![(b"Perp0190".to_vec(), 1)],
+                address: source_address.to_string(),
+            }
+        });
+        assert!(pending.is_empty(), "the index answered the source");
+        for r in &settled {
+            assert_eq!(
+                r.row.slot, spender.slot,
+                "a correction sits at the SPENDER, not at the source"
+            );
+            w.push_corr(r.row.clone());
+        }
+        let segments = w.finish().unwrap();
+        // The tail's ceiling at infinity: every row is its own, so the
+        // correction folds onto the arrival exactly as it does in `write_tail`.
+        let compacted = segments::compact(&tip, &segments, u64::MAX, &stamp(&policy_hex)).unwrap();
+
+        let mut manifest = Manifest::new(&policy_hex);
+        manifest.first_mint_slot = Some(floor - 10_000);
+        manifest.passes.push(PassEntry {
+            seq: 0,
+            dir: PassEntry::tip_dir_name(0),
+            ceiling,
+            floor,
+            windows: Vec::new(),
+            kind: RangeKind::Volatile,
+            rolled_up: false,
+            movements: Some(compacted.movements),
+            corrections: compacted.corrections,
+            observations: None,
+            segments: Vec::new(),
+            pending: pending.len() as u64,
+            found: 1,
+            written: compacted.written,
+            backfilled: settled.len() as u64,
+            units: compacted.units,
+            secs: 0.0,
+            written_unix: 1,
+        });
+        crate::archive::store_manifest(&dir, &manifest).unwrap();
+
+        let mut a = PolicyArchive::open(&dir).unwrap().expect("manifest");
+        let rows = a.feed_rows(10, None).unwrap();
+        (tmp, manifest, rows)
+    }
+
+    /// A spend in the volatile tail whose source is just below the floor is
+    /// a TRANSFER once the index answers it — not `SourceBelowFloor`.
+    ///
+    /// This is $PERP on 2026-11-02: six spenders above the floor, their
+    /// sources in the newest immutable chunk, and a tail pass that wrote only
+    /// the arrivals because the hosted process's index mapping did not cover
+    /// the chunk. The archive was `complete` with `unresolved: 0` and the
+    /// feed carried 52 unit movements with no sender.
+    #[test]
+    fn a_source_below_the_tail_floor_settles_into_a_transfer() {
+        let (_tmp, manifest, rows) = tail_with_a_below_floor_source("alice");
+        assert_eq!(manifest.latest_pass().map(|p| p.pending), Some(0));
+        assert_eq!(rows.len(), 1, "the transaction has a row and a direction");
+        let unit = &rows[0].units[0];
+        assert_eq!(
+            direction(unit),
+            Direction::Transfer {
+                from: "alice".into(),
+                to: "bob".into(),
+            }
+        );
+        assert_eq!(
+            unit.parties.iter().map(|p| p.amount).sum::<i64>(),
+            0,
+            "one unit left alice and arrived at bob"
+        );
+    }
+
+    /// The same spend against the SAME address is a self-move: the arrival
+    /// and the correction cancel, the unit disappears from the feed, and no
+    /// `SourceBelowFloor` row is left behind. The staking workaround only
+    /// covers this case, which is why the transfer above is the real test.
+    #[test]
+    fn a_self_move_below_the_tail_floor_nets_to_nothing() {
+        let (_tmp, manifest, rows) = tail_with_a_below_floor_source("bob");
+        assert_eq!(manifest.latest_pass().map(|p| p.pending), Some(0));
+        assert!(
+            rows.is_empty(),
+            "the only unit netted to zero, so the transaction has nothing to show"
+        );
     }
 
     /// THE ARCHIVE END TO END, without a chain: two passes, spilled as

@@ -126,9 +126,14 @@ pub fn spawn(hub: Arc<PolicyHub>, args: TipArgs) {
         .spawn(move || {
             tracing::info!(spool = %spool.display(), secs = every.as_secs(), floor_secs = FLOOR_SECS, "tip: reading the chain-tail spool");
             let mut floors_at: Option<Instant> = None;
+            // The newest immutable chunk the tx-index covered on the last
+            // tick. Not archive state: it only decides whether a pass that
+            // still had unresolved spenders is worth re-deriving (see
+            // `refresh`).
+            let mut index_chunk: Option<u16> = None;
             loop {
                 std::thread::sleep(every);
-                if let Err(e) = refresh(&hub, &spool) {
+                if let Err(e) = refresh(&hub, &spool, &mut index_chunk) {
                     tracing::warn!(error = %format!("{e:#}"), "tip: could not refresh the tail");
                 }
                 if floors_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(FLOOR_SECS)) {
@@ -273,7 +278,7 @@ fn extent(conn: &Connection) -> Result<Option<Extent>> {
 
 /// One tick: read the spool once, gate it once, and re-derive every
 /// archived policy's tail from the same blocks.
-fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
+fn refresh(hub: &PolicyHub, spool: &Path, last_index_chunk: &mut Option<u16>) -> Result<()> {
     // The WHOLE pass, including the spool open, the extent probe and the
     // chunk listing — those are outside `read_secs` and were 0.2 s of a poll
     // nobody was counting.
@@ -300,6 +305,33 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
         );
         return Ok(());
     }
+
+    // ⚠️ RELOAD THE INDEX BEFORE THE SCAN. `PolicyHub` holds the tx-index
+    // handle for the life of the process, and a segment written after it was
+    // opened is invisible to the mapping in hand. The scheduler reloads
+    // before a walk; the tail must do the same, or a source in a chunk that
+    // was indexed minutes ago resolves as `UnknownTx` and the pass writes a
+    // `source_below_floor` row the index could have answered.
+    //
+    // MEASURED 2026-11-02 on $PERP: six spenders in the newest immutable
+    // chunk, `unresolved=6` in the tail log, with the tx-index segments that
+    // covered that chunk written fifteen seconds before the tick.
+    let index = hub.index.as_ref().map(|h| {
+        if let Err(e) = h.reload_if_changed() {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "tip: tx-index reload failed; using the mapping in hand"
+            );
+        }
+        h.get()
+    });
+    let index_chunk = index.as_ref().and_then(|i| i.coverage().newest_chunk);
+    // A tail pass written while the index reached only this far is re-derived
+    // when the index moves: the one answer that can have changed for it is a
+    // source it could not resolve. A clean pass is still skipped, so a quiet
+    // tick writes nothing.
+    let index_advanced = *last_index_chunk != index_chunk;
+    *last_index_chunk = index_chunk;
 
     // ONE read and ONE gate for every policy: most blocks in the tail touch
     // none of them, and a miss costs one memmem rather than a decode per
@@ -329,7 +361,6 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
     // policy looks untouched.
     let untouched = owned.iter().filter(|b| b.is_empty()).count();
 
-    let index = hub.index.as_ref().map(|h| h.get());
     let mut with_rows = Phases::default();
     let mut without_rows = Phases::default();
     let mut skipped = 0u64;
@@ -347,6 +378,7 @@ fn refresh(hub: &PolicyHub, spool: &Path) -> Result<()> {
             floor,
             ceiling,
             index.as_deref(),
+            index_advanced,
         ) {
             // ⚠️ THE DERIVED SERIES IS STILL NOT WRITTEN HERE. It carries the
             // fold's state at a boundary, and a reader continues it through
@@ -491,6 +523,7 @@ impl Phases {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_tail(
     hub: &PolicyHub,
     policy: &str,
@@ -499,6 +532,7 @@ fn write_tail(
     floor: u64,
     ceiling: u64,
     index: Option<&tx_index::Index>,
+    index_advanced: bool,
 ) -> Result<Wrote> {
     let dir = hub.policy_dir(policy);
     let mut phases = Phases::default();
@@ -533,6 +567,20 @@ fn write_tail(
         .max()
         .unwrap_or(floor);
     let has_new = blocks.iter().any(|(slot, _)| *slot >= last_ceiling);
+    // Unresolved spenders are the one reason a pass with nothing new is still
+    // worth re-deriving: the tx-index may now be able to answer a source it
+    // could not when the pass was written. Without this the pass stays as it
+    // was until the policy's next block, even though the answer was ready a
+    // tick later — see the reload in `refresh` and the honest `pending`
+    // recorded below.
+    let last_pending = manifest
+        .passes
+        .iter()
+        .filter(|p| p.kind == RangeKind::Volatile)
+        .map(|p| p.pending)
+        .max()
+        .unwrap_or(0);
+    let retry_pending = index_advanced && last_pending > 0;
 
     // A snapshot refresh raises the tail's floor, and the volatile pass below
     // the new floor is now ALSO covered by the immutable archive — leaving it
@@ -543,7 +591,7 @@ fn write_tail(
         .passes
         .iter()
         .any(|p| p.kind == RangeKind::Volatile && p.floor < floor);
-    if !has_new && !floor_moved {
+    if !has_new && !floor_moved && !retry_pending {
         return Ok(Wrote::Nothing);
     }
     // From the scheduler's allocator, not the manifest: a walk job may
@@ -670,7 +718,10 @@ fn write_tail(
         segments: Vec::new(),
         // The tail carries NO state forward: it is re-derived whole every
         // tick, so there is no sidecar and nothing for a later job to load.
-        pending: 0,
+        // The COUNT is still real: an unresolved spender belongs to this pass
+        // until a re-derivation settles it, and reporting zero here hid that
+        // on a published archive.
+        pending: out.unresolved,
         found: out.written,
         written: compacted.written,
         backfilled: out.backfilled,
