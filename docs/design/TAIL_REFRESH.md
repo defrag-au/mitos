@@ -280,6 +280,20 @@ This is the load-bearing change and the one to test hardest: the sum rule, the
    Appending must never raise a pass's `floor`.
 5. **The tail has no state between writes** — a fresh `Pending` every time, so
    an unresolvable row is an honest gap rather than something carried forward.
+6. **The tail reports what it could not settle, and retries when the index
+   reaches further.** `PassEntry.pending` is the pass's own
+   `Outcome::unresolved`, not zero: a published tail that still has a source
+   below its floor must be visible to a reader. The tx-index handle is
+   reloaded at the start of every tick (the scheduler already did this before
+   a walk; the tail did not, so a segment written after process start was
+   invisible), and a pass with `pending > 0` is re-derived on the tick the
+   index's coverage advances even when no block touches the policy. The
+   re-derivation is from `floor` as always — nothing is carried forward — and
+   a clean pass still returns `Wrote::Nothing`, so a quiet tick writes
+   nothing. MEASURED 2026-11-02 on $PERP: six spenders above the floor, their
+   sources in the newest immutable chunk, `unresolved=6` in the log and
+   `pending: 0` in the manifest. The tail read 52 unit movements with no
+   sender until the index was reloaded.
 
 ## Order of work
 
