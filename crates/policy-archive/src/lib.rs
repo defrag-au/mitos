@@ -100,7 +100,7 @@ pub use holders::{HOLDERS, HOLDERS_FORMAT, HoldersError, HoldersFile};
 pub use manifest::{FileEntry, FileKind, Manifest, PassEntry, RangeKind, SlotRange, merge_ranges};
 pub use multi::{FetchedFooter, Got, MultiArchive, Want, fetch_footer};
 pub use observation::{
-    Decoded, OBSERVATION_FORMAT, OBSERVATIONS, Observation, ObservationWriter, read_all,
+    Decoded, OBSERVATION_FORMAT, OBSERVATIONS, Observation, ObservationWriter, live, read_all,
 };
 pub use price::{PairDepth, Spot, Unit, price_slots, spot_at};
 pub use profile::{Class, Profile};

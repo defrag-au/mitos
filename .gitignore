@@ -34,5 +34,10 @@ community-modules/**/build/
 # as shared-crates, so scratch written here cannot be committed by accident.
 .tmp/
 
+# Agent findings — a working set on the machine that captured it, not product.
+# The durable record is the rule and its `docs/inventory.md` entry. See
+# agent-playbook/docs/findings.md.
+.playbook/findings/
+
 # Packed host tarballs from scripts/pack-release.sh
 /dist/

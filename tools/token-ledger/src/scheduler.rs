@@ -53,7 +53,7 @@
 //! was 206 s of a 300 s interval, and every one of those seconds was a landing
 //! it could have been doing instead.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -203,6 +203,13 @@ pub struct Scheduler {
     /// Next pass sequence per policy, allocated here so concurrent jobs on
     /// one policy never share one.
     seqs: Mutex<HashMap<String, u32>>,
+    /// LP policy → the policies whose summary waits on its archive.
+    ///
+    /// A token's pool decomposition reads its LP token's archive, so when that
+    /// walk lands the token is refolded at once rather than at its own next
+    /// walk, which can be a day away. In memory only: a restart loses it, and
+    /// the token's next fold asks again.
+    lp_parents: Mutex<HashMap<String, BTreeSet<String>>>,
 }
 
 impl Scheduler {
@@ -215,7 +222,28 @@ impl Scheduler {
             inflight: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             seqs: Mutex::new(HashMap::new()),
+            lp_parents: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Walk `parent`'s LP policy, and refold `parent` when it lands.
+    pub fn want_lp_walk(&self, parent: &str, lp_policy: &str, first_mint: u64) {
+        self.lp_parents
+            .lock()
+            .expect("lp parents")
+            .entry(lp_policy.to_string())
+            .or_default()
+            .insert(parent.to_string());
+        self.want_walk(lp_policy, Some(first_mint));
+    }
+
+    /// The policies waiting on this one as their LP archive, taken.
+    fn take_lp_parents(&self, lp_policy: &str) -> BTreeSet<String> {
+        self.lp_parents
+            .lock()
+            .expect("lp parents")
+            .remove(lp_policy)
+            .unwrap_or_default()
     }
 
     // ── what the API asks ────────────────────────────────────────────────
@@ -725,17 +753,16 @@ fn worker(hub: Arc<PolicyHub>, kind: JobKind) {
                         // the request path. One decode covers both. A failure
                         // is logged and never blocks the archive; `/live`
                         // falls back to folding.
-                        // A registry that cannot be read costs the scale, not
-                        // the summary: the fold is still worth writing.
-                        let decimals = crate::registry::decimals(&hub.tokens, &policy)
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(policy, error = %format!("{e:#}"), "policy: decimals unknown");
-                                None
-                            });
-                        if let Err(e) =
-                            crate::archive::write_derived_at(&hub.policy_dir(&policy), decimals)
-                        {
-                            tracing::warn!(policy, error = %format!("{e:#}"), "policy: derived artifacts not written");
+                        derive(&hub, &policy);
+                        // This walk may be an LP token some summary is waiting
+                        // on: its pool can be decomposed now.
+                        for parent in hub.sched.take_lp_parents(&policy) {
+                            tracing::info!(
+                                policy = parent.as_str(),
+                                lp = policy.as_str(),
+                                "policy: LP archive landed, refolding"
+                            );
+                            derive(&hub, &parent);
                         }
                     }
                     continue;
@@ -762,6 +789,38 @@ fn worker(hub: Arc<PolicyHub>, kind: JobKind) {
             }
         }
         hub.sched.job_finished(&job, &live, outcome.as_ref().ok());
+    }
+}
+
+/// Write a policy's derived artefacts, and walk the LP policy its pool needs
+/// when it has none.
+///
+/// A failure is logged and never blocks the archive; `/live` falls back to
+/// folding.
+fn derive(hub: &PolicyHub, policy: &str) {
+    // A registry that cannot be read costs the scale, not the summary: the
+    // fold is still worth writing.
+    let decimals = crate::registry::decimals(&hub.tokens, policy).unwrap_or_else(|e| {
+        tracing::warn!(policy, error = %format!("{e:#}"), "policy: decimals unknown");
+        None
+    });
+    match crate::archive::write_derived_at(&hub.policy_dir(policy), decimals) {
+        Ok(Some(lp)) => {
+            // The index knows the true mint when it has reached it; the pool's
+            // first sighting, under-shot, is the floor when it has not.
+            let first_mint = hub.first_mint_from_index(&lp.policy).unwrap_or(lp.floor);
+            tracing::info!(
+                policy,
+                lp = lp.policy,
+                first_mint,
+                "policy: walking the pool's LP token"
+            );
+            hub.sched.want_lp_walk(policy, &lp.policy, first_mint);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(policy, error = %format!("{e:#}"), "policy: derived artifacts not written");
+        }
     }
 }
 

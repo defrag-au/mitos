@@ -1791,7 +1791,7 @@ pub fn tail_series(
 /// instead, so this wrapper is not in the shipped binary.
 #[cfg(test)]
 pub fn write_derived(dir: &Path) -> Result<()> {
-    write_derived_at(dir, None)
+    write_derived_at(dir, None).map(|_| ())
 }
 
 /// The derived-artifact fold, stating what the token's display decimals are.
@@ -1799,12 +1799,19 @@ pub fn write_derived(dir: &Path) -> Result<()> {
 /// The scale is the registry's to know and this module's to carry: a summary
 /// that names it lets every reader draw a human number without owning a table
 /// of its own.
-pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
+///
+/// Returns the LP policy the summary's pool decomposition needed and found no
+/// complete archive for, so the caller can walk it — the scheduler does, and
+/// refolds this policy when that walk lands.
+pub fn write_derived_at(
+    dir: &Path,
+    decimals: Option<u8>,
+) -> Result<Option<crate::segmentation::LpWanted>> {
     let Some(manifest) = load_manifest(dir)? else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(mut history) = History::open(dir)? else {
-        return Ok(());
+        return Ok(None);
     };
     // ⚠️ The carried artifacts describe the IMMUTABLE archive, and say so with
     // `settled_to == immutable_to`. The volatile tail below is a projection
@@ -1863,7 +1870,7 @@ pub fn write_derived_at(dir: &Path, decimals: Option<u8>) -> Result<()> {
         crate::segmentation::build(dir, summary.settled_to, &observations, movements);
     summary.apply_segmentation(segmentation);
     store_summary(dir, &summary, &checkpoints)?;
-    Ok(())
+    Ok(crate::segmentation::lp_wanted(dir, &observations))
 }
 
 /// The policy a directory holds: its name, as [`policy_dir`] builds it.
@@ -2016,7 +2023,15 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
     let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
     let started = std::time::Instant::now();
     let decimals = crate::registry::decimals(&args.tokens, &args.policy)?;
-    write_derived_at(&dir, decimals)?;
+    if let Some(crate::segmentation::LpWanted { policy: lp, floor }) =
+        write_derived_at(&dir, decimals)?
+    {
+        // By hand there is no scheduler to queue it; serve does this itself.
+        eprintln!(
+            "note: the pool's LP policy {lp} has no complete archive, so its providers read zero — \
+             walk it (POST /policy/{lp}/refresh, or `reverse --to-slot {floor}`) and fold again"
+        );
+    }
     let Some(s) = read_summary(&dir)? else {
         bail!("no archive at {}", dir.display());
     };
@@ -2832,6 +2847,9 @@ pub fn read_observations(dir: &Path, m: &Manifest) -> Result<Vec<policy_archive:
         })?;
         rows.extend(policy_archive::read_all(&bytes)?);
     }
+    // Spends are joined across passes: a position sealed in one pass is
+    // claimed in a later one, so `live` runs over the whole set, never per file.
+    let mut rows = policy_archive::live(rows);
     redecode(&mut rows, m);
     Ok(rows)
 }
@@ -2864,10 +2882,15 @@ pub fn read_observations_upto(
                 p.seq,
             )
         })?;
+        // Spend rows dropped but NOT joined: a position opened below `slot`
+        // and claimed above it is on the other side of this boundary, and
+        // half a join would keep it. The carried series reads pool states,
+        // which a spend row is not; what still stands is `read_observations`'
+        // question, over the whole set.
         rows.extend(
             policy_archive::read_all(&bytes)?
                 .into_iter()
-                .filter(|o| o.slot <= slot),
+                .filter(|o| o.slot <= slot && !o.spent),
         );
     }
     redecode(&mut rows, m);
@@ -2918,10 +2941,11 @@ pub fn read_observations_above(
                 p.seq,
             )
         })?;
+        // Spend rows dropped, not joined — see `read_observations_upto`.
         rows.extend(
             policy_archive::read_all(&bytes)?
                 .into_iter()
-                .filter(|o| o.slot > slot),
+                .filter(|o| o.slot > slot && !o.spent),
         );
     }
     redecode(&mut rows, m);
@@ -3925,6 +3949,8 @@ mod tests {
                 reserve_source: "datum-plus-virtual".into(),
                 pricing: policy_archive::observation::pricing::CONSTANT_PRODUCT_VIRTUAL.into(),
             }),
+            output_index: Some(0),
+            spent: false,
         };
 
         let roles = venue_roles_for(std::slice::from_ref(&obs));

@@ -219,6 +219,7 @@ pub fn classify(address: &str, pools: &[String], lock_creds: &[[u8; 28]]) -> Cla
                 c(Cohort::Inventory)
             } else if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred)
                 || mitos_vesting_decode::snek_fun::is_snek_fun(&cred)
+                || mitos_vesting_decode::perps_staking::is_perps_staking(&cred)
             {
                 c(Cohort::Vesting)
             } else if lock_creds.contains(&cred) {

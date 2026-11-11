@@ -48,6 +48,62 @@ pub fn build(
     Segmentation { as_of, vests, lp }
 }
 
+/// An LP policy this policy's decomposition needs and does not have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LpWanted {
+    /// The LP token's policy, hex.
+    pub policy: String,
+    /// A slot at or below the LP token's first mint, for when the policy index
+    /// does not know it: a day below the pool's first sighting here. A pool's LP
+    /// is minted in the transaction that creates the pool, so the first datum
+    /// naming that LP policy is at or after the mint, and a day under-shoots
+    /// it. A floor too high would produce a short archive that calls itself
+    /// complete — see the README's traps.
+    pub floor: u64,
+}
+
+/// One day of slots: how far [`LpWanted::floor`] under-shoots the first pool
+/// sighting.
+const LP_FLOOR_MARGIN_SLOTS: u64 = 86_400;
+
+/// The LP policy this archive's pool names, when that policy has no complete
+/// archive beside this one.
+///
+/// Without it the decomposition reports the pool `Unavailable` and every
+/// provider reads zero — MEASURED 2026-11-11 on $PERP: 61.2M units in the CSwap
+/// pool attributed to nobody, because nothing had ever walked its LP token.
+/// Walking it is small (50 transactions there), so the fold asks for it rather
+/// than leaving it to someone to notice.
+pub fn lp_wanted(dir: &Path, observations: &[Observation]) -> Option<LpWanted> {
+    let (_, datum) = latest_cswap_pool(observations)?;
+    if datum.lp_policy.is_empty() {
+        return None;
+    }
+    let policy = hex::encode(&datum.lp_policy);
+    let walked = dir
+        .parent()
+        .and_then(|root| load_manifest(&policy_dir(root, &policy)).ok().flatten())
+        .is_some_and(|m| m.completeness() == policy_archive::Completeness::Complete);
+    if walked {
+        return None;
+    }
+    let first_sighting = observations
+        .iter()
+        .filter(|o| o.address == cswap::POOL_SCRIPT_ADDR)
+        .filter(|o| {
+            o.datum
+                .as_deref()
+                .and_then(cswap::decode_pool_datum)
+                .is_some_and(|d| d.lp_policy == datum.lp_policy)
+        })
+        .map(|o| o.slot)
+        .min()?;
+    Some(LpWanted {
+        policy,
+        floor: first_sighting.saturating_sub(LP_FLOOR_MARGIN_SLOTS),
+    })
+}
+
 /// A lock observation, before its address's current balance is applied.
 struct PendingVest {
     owner: String,
@@ -231,6 +287,10 @@ fn vest_style(address: &str) -> Option<VestStyle> {
         Some(VestStyle::CrowdLock)
     } else if mitos_vesting_decode::snek_fun::is_snek_fun(&cred) {
         Some(VestStyle::SnekFun)
+    } else if mitos_vesting_decode::perps_staking::is_perps_staking(&cred) {
+        // Staked, not vesting: its datum's date is when it was staked. `Other` keeps the
+        // summary's wire format, and the owner is what a reader of the vests needs.
+        Some(VestStyle::Other)
     } else if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Vesting {
         Some(VestStyle::Other)
     } else {
@@ -480,6 +540,95 @@ fn lp_amounts(
 mod tests {
     use super::*;
 
+    /// The $PERP staking site, and two real positions on it (2026-11-10):
+    /// 1,035,179 owned by `cce969f5…` and 328,938 by `8974b7a4…`.
+    const SITE: &str = "addr1zyzayvten00vtt9tz0n8pdqs0kq62ujcznpdu7gq6s30md5uwrkupakg244k2dedgyzg0r6k0wgyplm2qdq0trqny98qv0xlua";
+    const POSITION_A: &str =
+        "d879821b0000019c247836ec581ccce969f5c0a16d5735feb093b883e4656f0dd4eb377dbc5d787391bf";
+    const POSITION_B: &str =
+        "d879821b0000019c247b4650581c8974b7a444f372d07f15abcc0ecd9729e79f9e196b72a0bb3fc5410c";
+
+    fn position(slot: u64, tx: u8, datum: &str, amount: i64) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![tx; 32],
+            address: SITE.into(),
+            lovelace: 1_400_750,
+            unit_name: b"PERP COIN".to_vec(),
+            unit_amount: amount,
+            datum: Some(hex::decode(datum).unwrap()),
+            decoded: None,
+            output_index: Some(0),
+            spent: false,
+        }
+    }
+
+    fn spend_of(slot: u64, position: &Observation) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: position.tx_hash.clone(),
+            address: String::new(),
+            lovelace: 0,
+            unit_name: Vec::new(),
+            unit_amount: 0,
+            datum: None,
+            decoded: None,
+            output_index: position.output_index,
+            spent: true,
+        }
+    }
+
+    /// Before spends were recorded, a claimed lock stayed in the archive and
+    /// the site's live balance was scaled across every position ever seen —
+    /// an active staker credited less than they hold, and a former one
+    /// credited something. With the spend recorded and joined, the claimed
+    /// position is gone and the survivor keeps its whole amount.
+    #[test]
+    fn a_claimed_lock_drops_out_and_the_survivor_is_not_scaled() {
+        let a = position(100, 1, POSITION_A, 1_035_179);
+        let b = position(110, 2, POSITION_B, 328_938);
+        // B was claimed: the site now holds only A's amount.
+        let rows = policy_archive::live(vec![spend_of(200, &b), a.clone(), b]);
+        let balances = HashMap::from([(SITE, 1_035_179)]);
+        let owners = vesting(&rows, &HashMap::new(), &HashMap::new(), &balances);
+
+        assert_eq!(owners.len(), 1, "the claimed position names no owner");
+        let only = &owners[0];
+        assert_eq!(only.amount, 1_035_179, "the whole position, unscaled");
+        assert_eq!(only.locks.len(), 1);
+        assert_eq!(only.locks[0].style, VestStyle::Other);
+    }
+
+    /// The same two positions with no spend recorded: the old reading, kept so
+    /// the scale-down is known to still cover an archive written before the
+    /// column existed. Both owners resolve, and the site's balance is split
+    /// across both positions — the claimed one credited something it no longer
+    /// holds, the survivor credited less than it does.
+    #[test]
+    fn without_a_recorded_spend_the_balance_is_still_scaled_across_both() {
+        let a = position(100, 1, POSITION_A, 1_035_179);
+        let b = position(110, 2, POSITION_B, 328_938);
+        let balances = HashMap::from([(SITE, 1_035_179)]);
+        // The owners' payment keys, as the movement rows would have resolved them.
+        let by_payment = HashMap::from([
+            (
+                "cce969f5c0a16d5735feb093b883e4656f0dd4eb377dbc5d787391bf".to_string(),
+                "owner-a".to_string(),
+            ),
+            (
+                "8974b7a444f372d07f15abcc0ecd9729e79f9e196b72a0bb3fc5410c".to_string(),
+                "owner-b".to_string(),
+            ),
+        ]);
+        let owners = vesting(&[a, b], &by_payment, &HashMap::new(), &balances);
+        assert_eq!(owners.len(), 2);
+        let total: u64 = owners.iter().map(|o| o.amount).sum();
+        assert_eq!(total, 1_035_179, "scaled to the balance, sum preserved");
+        assert!(owners.iter().all(|o| o.amount < 1_035_179));
+    }
+
     #[test]
     fn observed_locks_scale_down_to_the_current_balance_and_keep_their_sum() {
         assert_eq!(scale_to(50, 100, vec![60, 40]), vec![30, 20]);
@@ -510,5 +659,68 @@ mod tests {
         let (out, residual) = lp_amounts(1_000, 1_000, BTreeMap::new());
         assert!(out.is_empty());
         assert_eq!(residual, 1_000);
+    }
+
+    /// $PERP's CSwap pool and its LP token, as the pool datum names them.
+    const PERP_POLICY: &str = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64";
+    const LP_POLICY: &str = "f1dfb5314d99902d370e059a4851095646bfe8db57fb0d72a2d106fc";
+
+    /// A CSwap pool datum (`Constr 0`, eight fields) for the ADA × $PERP pool.
+    fn perp_pool_datum(total_lp: u32) -> Vec<u8> {
+        let perp_name = hex::encode("PERP COIN");
+        let lp_name = hex::encode("C-LP: ADA x PERP COIN");
+        // Constr 0, indefinite list: total LP (u32), fee 85 bps, quote = ADA
+        // (two empty byte strings), base policy and name, LP policy and name.
+        let fields = [
+            format!("1a{total_lp:08x}"),
+            "1855".to_string(),
+            "40".to_string(),
+            "40".to_string(),
+            format!("581c{PERP_POLICY}"),
+            format!("49{perp_name}"),
+            format!("581c{LP_POLICY}"),
+            format!("55{lp_name}"),
+        ];
+        hex::decode(format!("d8799f{}ff", fields.concat())).unwrap()
+    }
+
+    fn pool_sighting(slot: u64, total_lp: u32) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![slot as u8; 32],
+            address: cswap::POOL_SCRIPT_ADDR.into(),
+            lovelace: 1_000_000,
+            unit_name: b"PERP COIN".to_vec(),
+            unit_amount: 61_177_936,
+            datum: Some(perp_pool_datum(total_lp)),
+            decoded: None,
+            output_index: Some(0),
+            spent: false,
+        }
+    }
+
+    /// MEASURED 2026-11-11: $PERP's pool held 61.2M units attributed to nobody
+    /// because its LP token had never been walked. The fold now names it, with
+    /// a floor a day below the pool's FIRST sighting — never its latest, which
+    /// would cut off every LP movement before it.
+    #[test]
+    fn an_unwalked_lp_policy_is_asked_for_with_a_floor_below_the_first_sighting() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path(), PERP_POLICY);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(cswap::decode_pool_datum(&perp_pool_datum(1)).is_some());
+        let rows = vec![
+            pool_sighting(172_600_000, 838_040_878),
+            pool_sighting(172_500_000, 1_000),
+        ];
+        assert_eq!(
+            lp_wanted(&dir, &rows),
+            Some(LpWanted {
+                policy: LP_POLICY.into(),
+                floor: 172_500_000 - LP_FLOOR_MARGIN_SLOTS,
+            })
+        );
+        assert_eq!(lp_wanted(&dir, &[]), None, "no pool, nothing to walk");
     }
 }

@@ -32,6 +32,7 @@
 use pallas_primitives::{BigInt, PlutusData};
 
 pub mod crowd_lock;
+pub mod perps_staking;
 pub mod snek_fun;
 
 const HASH_BYTES: usize = 28;

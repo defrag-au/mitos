@@ -557,6 +557,8 @@ mod tests {
             unit_amount: base,
             datum: None,
             decoded: Some(decoded("v", key, base, quote, true)),
+            output_index: Some(0),
+            spent: false,
         }
     }
 
@@ -703,6 +705,8 @@ mod tests {
             unit_amount: 733_043_488,
             datum: None,
             decoded: Some(d),
+            output_index: Some(0),
+            spent: false,
         };
         let view = PolicyView::from_observations(&[o]);
         let spot = view.spot(10, &Projection::default());

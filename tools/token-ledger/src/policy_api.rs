@@ -1503,6 +1503,8 @@ impl UnrecognisedKind {
             (UnrecognisedKind::Lock, Some("crowdlock"))
         } else if mitos_vesting_decode::snek_fun::is_snek_fun(cred) {
             (UnrecognisedKind::Lock, Some(SNEK_FUN))
+        } else if mitos_vesting_decode::perps_staking::is_perps_staking(cred) {
+            (UnrecognisedKind::Lock, Some("perps-staking"))
         } else if let Some(label) = airdropper(cred) {
             // "Unknown" is the registry saying nobody is named: no operator.
             (
@@ -3438,6 +3440,8 @@ mod pools_tests {
                 reserve_source: "value".into(),
                 pricing: pricing::CONSTANT_PRODUCT.into(),
             }),
+            output_index: Some(0),
+            spent: false,
         }
     }
 

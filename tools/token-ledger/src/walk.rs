@@ -834,6 +834,7 @@ fn run_one(
                 let is_lock_platform = cred.as_ref().is_some_and(|c| {
                     mitos_vesting_decode::crowd_lock::is_crowd_lock(c)
                         || mitos_vesting_decode::snek_fun::is_snek_fun(c)
+                        || mitos_vesting_decode::perps_staking::is_perps_staking(c)
                 });
 
                 let (unlock_ts_ms, owner_pkh) = if is_lock_platform {

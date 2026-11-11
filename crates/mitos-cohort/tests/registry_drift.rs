@@ -35,6 +35,9 @@ enum Want {
     Launchpad,
     /// A lock platform.
     Vesting,
+    /// One project's staking contract: read like a lock (its datum names the owner), named as
+    /// what it is.
+    Staking,
 }
 
 impl Want {
@@ -50,6 +53,9 @@ impl Want {
             ) | (
                 Want::Vesting,
                 AddressCategory::Script(ScriptCategory::Vesting { .. })
+            ) | (
+                Want::Staking,
+                AddressCategory::Script(ScriptCategory::Staking { .. })
             )
         )
     }
@@ -94,6 +100,11 @@ fn mitos_contracts() -> Vec<(String, [u8; 28], Want)> {
         "snek.fun lock".into(),
         mitos_vesting_decode::snek_fun::PAYMENT_CRED,
         Want::Vesting,
+    ));
+    out.push((
+        "the $PERP staking site".into(),
+        mitos_vesting_decode::perps_staking::PAYMENT_CRED,
+        Want::Staking,
     ));
     out
 }
