@@ -1791,8 +1791,18 @@ pub fn tail_series(
 /// instead, so this wrapper is not in the shipped binary.
 #[cfg(test)]
 pub fn write_derived(dir: &Path) -> Result<()> {
-    write_derived_at(dir, None).map(|_| ())
+    write_derived_at(dir, None, None).map(|_| ())
 }
+
+/// A policy's landing lock, by policy hex — `Scheduler::lock_for` in `serve`.
+///
+/// The derived fold reads every file the manifest names, across several
+/// seconds, while the tail rebuild REPLACES the volatile pass every 30 s. Read
+/// without the lock, the fold can open a manifest naming a tip pass the tail
+/// has since deleted. MEASURED 2026-11-11 on `279c909f…`: "pass 10122 names
+/// tip-10122/observations.parquet and it is not there", and the summary was
+/// not written.
+pub type LockFor<'a> = &'a dyn Fn(&str) -> std::sync::Arc<std::sync::Mutex<()>>;
 
 /// The derived-artifact fold, stating what the token's display decimals are.
 ///
@@ -1803,10 +1813,21 @@ pub fn write_derived(dir: &Path) -> Result<()> {
 /// Returns the LP policy the summary's pool decomposition needed and found no
 /// complete archive for, so the caller can walk it — the scheduler does, and
 /// refolds this policy when that walk lands.
+///
+/// `lock`, when given, is held for the whole fold, and the pool's LP policy's
+/// lock while its archive is read — always this policy's first, so two folds
+/// cannot deadlock. `None` is for a caller with no concurrent writer: a test,
+/// or `summary` by hand, which runs outside `serve` and cannot take its locks.
 pub fn write_derived_at(
     dir: &Path,
     decimals: Option<u8>,
+    lock: Option<LockFor>,
 ) -> Result<Option<crate::segmentation::LpWanted>> {
+    let policy = policy_of(dir);
+    let landing = lock.map(|lock_for| lock_for(&policy));
+    let _held = landing
+        .as_ref()
+        .map(|l| l.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let Some(manifest) = load_manifest(dir)? else {
         return Ok(None);
     };
@@ -1841,7 +1862,6 @@ pub fn write_derived_at(
     let mut all = history.all_movements()?.to_vec();
     let full = carry_of(&all, &observations);
     let complete = manifest.completeness() == Completeness::Complete;
-    let policy = policy_of(dir);
     // ⚠️ USER units only, the same rule as `holders_from` and the supply
     // route. A CIP-68 reference twin or a CIP-27 royalty declaration shares
     // the policy but is not a member of the collection; folding it here put
@@ -1867,7 +1887,7 @@ pub fn write_derived_at(
     // the summary and the holder table cannot disagree about what is locked or
     // how much LP a provider owns.
     let segmentation =
-        crate::segmentation::build(dir, summary.settled_to, &observations, movements);
+        crate::segmentation::build(dir, summary.settled_to, &observations, movements, lock);
     summary.apply_segmentation(segmentation);
     store_summary(dir, &summary, &checkpoints)?;
     Ok(crate::segmentation::lp_wanted(dir, &observations))
@@ -2024,7 +2044,7 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
     let started = std::time::Instant::now();
     let decimals = crate::registry::decimals(&args.tokens, &args.policy)?;
     if let Some(crate::segmentation::LpWanted { policy: lp, floor }) =
-        write_derived_at(&dir, decimals)?
+        write_derived_at(&dir, decimals, None)?
     {
         // By hand there is no scheduler to queue it; serve does this itself.
         eprintln!(
@@ -4113,6 +4133,53 @@ mod tests {
     /// archive to 6,000 units across 428 parties; after `/live` had warmed the
     /// shared cache from `holders.bin`, the same route reported 6,156 across
     /// 429, from the same files.
+    /// The fold waits for a tail write in progress, and takes the lock by its
+    /// own policy's name. MEASURED 2026-11-11: without it the fold opened a
+    /// manifest naming a tip pass the tail had already replaced, and failed.
+    #[test]
+    fn the_derived_fold_waits_for_the_landing_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        archive_with_a_tail(&dir, vec![row(1_500, 3, "addr_carol", 2, 2)]);
+
+        let landing = Arc::new(Mutex::new(()));
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        // The tail is mid-write.
+        let tail = landing.lock().unwrap();
+
+        let fold = {
+            let (landing, asked, done, dir) = (
+                Arc::clone(&landing),
+                Arc::clone(&asked),
+                Arc::clone(&done),
+                dir.clone(),
+            );
+            std::thread::spawn(move || {
+                let lock_for = |p: &str| {
+                    asked.lock().unwrap().push(p.to_string());
+                    Arc::clone(&landing)
+                };
+                let out = write_derived_at(&dir, None, Some(&lock_for));
+                done.store(true, Ordering::SeqCst);
+                out
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the fold must not read while the tail holds the lock"
+        );
+        drop(tail);
+        fold.join().unwrap().unwrap();
+        assert!(read_summary(&dir).unwrap().is_some(), "and then it folds");
+        assert_eq!(*asked.lock().unwrap(), vec![policy_of(&dir)]);
+        assert!(landing.try_lock().is_ok(), "and lets go when it is done");
+    }
+
     #[test]
     fn a_holder_artifact_never_carries_the_volatile_tail() {
         use policy_archive::supply::Diagnose;

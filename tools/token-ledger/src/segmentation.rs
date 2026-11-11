@@ -28,23 +28,29 @@ use policy_archive::summary::{
 };
 use policy_archive::{Observation, holders};
 
-use crate::archive::{History, holders_from, load_manifest, policy_dir, read_observations};
+use crate::archive::{
+    History, LockFor, holders_from, load_manifest, policy_dir, read_observations,
+};
 
 /// Build the tip decomposition for one policy.
 ///
 /// `movements` must already be filtered to user units, and `as_of` is the
 /// summary's `settled_to`.
+///
+/// `lock`, when given, is taken for the LP policy while its archive is read:
+/// that archive has a tail of its own, rewritten under its own landing lock.
 pub fn build(
     dir: &Path,
     as_of: u64,
     observations: &[Observation],
     movements: &[policy_archive::Movement],
+    lock: Option<LockFor>,
 ) -> Segmentation {
     let by_payment = payment_map(movements);
     let by_address = address_balances(movements);
     let by_key = representative_addresses(movements);
     let vests = vesting(observations, &by_payment, &by_key, &by_address);
-    let lp = lp_decomposition(dir, observations, &by_address);
+    let lp = lp_decomposition(dir, observations, &by_address, lock);
     Segmentation { as_of, vests, lp }
 }
 
@@ -342,6 +348,7 @@ fn lp_decomposition(
     dir: &Path,
     observations: &[Observation],
     by_address: &HashMap<&str, i64>,
+    lock: Option<LockFor>,
 ) -> Option<LpDecomposition> {
     let (pool_address, datum) = latest_cswap_pool(observations)?;
     let reserve = by_address
@@ -369,6 +376,15 @@ fn lp_decomposition(
         return Some(unavailable("the archive has no root directory".into()));
     };
     let lp_dir = policy_dir(root, &lp_policy);
+    // Held until the LP archive's reads below are done: the manifest, the
+    // holder fold and the farm's observations all name its tip pass. Never for
+    // this archive itself: the caller holds that lock and it is not re-entrant.
+    let landing = lock
+        .filter(|_| lp_dir != dir)
+        .map(|lock_for| lock_for(&lp_policy));
+    let _held = landing
+        .as_ref()
+        .map(|l| l.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let Some(manifest) = load_manifest(&lp_dir).ok().flatten() else {
         return Some(unavailable(format!(
             "the LP policy {lp_policy} has not been walked"

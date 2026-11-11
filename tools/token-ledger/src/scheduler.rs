@@ -804,7 +804,10 @@ fn derive(hub: &PolicyHub, policy: &str) {
         tracing::warn!(policy, error = %format!("{e:#}"), "policy: decimals unknown");
         None
     });
-    match crate::archive::write_derived_at(&hub.policy_dir(policy), decimals) {
+    // Under the landing locks: the tail rewrites the volatile pass while the
+    // fold reads it. The tail waits out the fold — seconds, against a 30 s poll.
+    let lock_for = |p: &str| hub.sched.lock_for(p);
+    match crate::archive::write_derived_at(&hub.policy_dir(policy), decimals, Some(&lock_for)) {
         Ok(Some(lp)) => {
             // The index knows the true mint when it has reached it; the pool's
             // first sighting, under-shot, is the floor when it has not.
