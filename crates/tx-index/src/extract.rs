@@ -221,10 +221,10 @@ fn span_of(
 }
 
 /// One transaction's raw slices, both borrowed from the chunk buffer.
-struct TxSlices<'a> {
-    body: &'a [u8],
+pub(crate) struct TxSlices<'a> {
+    pub(crate) body: &'a [u8],
     /// `None` for the majority of transactions, which carry no metadata.
-    aux: Option<&'a [u8]>,
+    pub(crate) aux: Option<&'a [u8]>,
 }
 
 /// Every transaction in the block, in block order.
@@ -233,7 +233,7 @@ struct TxSlices<'a> {
 /// Shelley onward it is each element of the body array. Auxiliary data is
 /// looked up positionally in `auxiliary_data_set`, which is keyed by
 /// transaction index.
-fn txs<'a>(block: &'a MultiEraBlock<'_>) -> Result<Vec<TxSlices<'a>>> {
+pub(crate) fn txs<'a>(block: &'a MultiEraBlock<'_>) -> Result<Vec<TxSlices<'a>>> {
     /// Shelley-onward eras all encode the block identically for our purposes:
     /// a body array plus an index-keyed aux map.
     macro_rules! bodies_with_aux {

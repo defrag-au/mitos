@@ -15,8 +15,15 @@
 //! stream can be diffed against the walk's own `--events` output. That comparison is the
 //! real acceptance test: the archive and the tap are two derivations of the same rows, so
 //! a fact must carry the same [`chain_events::EventId`] out of both.
+//!
+//! `--tx-index-dir <dir> --immutable <dir>` repairs chain order. Archive files written
+//! before the `tx_index` column existed read every row as position 0, so two transactions
+//! in one block came out in file order — an asset could leave a wallet before it arrived,
+//! which a replay reports as a disposal with no lot. With the index, every row at
+//! position 0 is looked up and given its real position in its block. Ids do not change;
+//! only placement does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +37,8 @@ use policy_archive::holders::{self, Fold};
 use policy_archive::reader::{Archive, SparseBytes};
 
 const USAGE: &str = "usage: policy-events --archive-dir <dir> --policy <policy-id> \
-                     [--coverage complete|partial] [--events]";
+                     [--coverage complete|partial] [--events] \
+                     [--tx-index-dir <dir> --immutable <dir>]";
 
 /// The report goes to stderr when stdout is the event stream: a pipe must carry NDJSON
 /// and nothing else, or `jaq`, `grep` and the id comparison all read report lines.
@@ -68,6 +76,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let movement_rows = rows.len();
+
+    let placed = match &args.tx_index {
+        Some((index_dir, immutable)) => Some(place(&mut rows, index_dir, immutable)?),
+        None => None,
+    };
 
     // The archive's own definition of a holder, over exactly the units the events can
     // represent. Reconstructing it independently — rows straight into the archive's fold,
@@ -179,6 +192,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     report!(args.events, "policy            {}", collection.policy());
     report!(args.events, "files             {}", files.len());
     report!(args.events, "movement rows     {movement_rows}");
+    if let Some(placed) = &placed {
+        report!(
+            args.events,
+            "positions         {} transactions at 0 looked up · {} moved · {} not in the index",
+            placed.looked_up,
+            placed.moved,
+            placed.missing
+        );
+    }
     report!(args.events, "transactions      {transactions}");
     report!(args.events, "unit moves        {unit_moves}");
     report!(args.events, "events            {events}");
@@ -280,6 +302,59 @@ fn reconcile(
     Ok(())
 }
 
+/// What [`place`] did, for the report.
+struct Placed {
+    /// Distinct transactions whose rows said position 0.
+    looked_up: usize,
+    /// Of those, the ones whose real position is not 0.
+    moved: usize,
+    /// Of those, the ones no indexed chunk holds — the tip's chunk is never indexed, and a
+    /// row there was written with the column, so its 0 is already the truth.
+    missing: usize,
+}
+
+/// Gives every row at position 0 its transaction's real position in its block.
+///
+/// A real 0 looks the same as an unrecorded one, so every 0 is asked; the first
+/// transaction of a block resolves to 0 again and costs one lookup.
+fn place(
+    rows: &mut [policy_archive::Movement],
+    index_dir: &Path,
+    immutable: &Path,
+) -> Result<Placed, Box<dyn Error>> {
+    let index = tx_index::Index::open(index_dir, immutable)
+        .map_err(|error| format!("opening the tx-index at {}: {error:#}", index_dir.display()))?;
+    let mut positions = tx_index::Positions::new(&index);
+    let mut resolved: HashMap<Vec<u8>, Option<u32>> = HashMap::new();
+    for row in rows.iter_mut().filter(|row| row.tx_index == 0) {
+        if !resolved.contains_key(&row.tx_hash) {
+            let hash: [u8; 32] = row
+                .tx_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("a {}-byte tx hash", row.tx_hash.len()))?;
+            let position = positions
+                .position(&hash)
+                .map_err(|error| format!("placing tx {}: {error:#}", hex::encode(hash)))?;
+            resolved.insert(row.tx_hash.clone(), position);
+        }
+        if let Some(Some(position)) = resolved.get(&row.tx_hash) {
+            row.tx_index = *position;
+        }
+    }
+    Ok(Placed {
+        looked_up: resolved.len(),
+        moved: resolved
+            .values()
+            .filter(|position| matches!(position, Some(p) if *p != 0))
+            .count(),
+        missing: resolved
+            .values()
+            .filter(|position| position.is_none())
+            .count(),
+    })
+}
+
 /// An asset name as text where it is legible, hex where it is not.
 fn describe(name: &[u8]) -> String {
     if name.is_empty() {
@@ -298,6 +373,8 @@ struct Args {
     policy: String,
     coverage: Coverage,
     events: bool,
+    /// `(index dir, immutable dir)` — both or neither.
+    tx_index: Option<(PathBuf, PathBuf)>,
 }
 
 impl Args {
@@ -306,6 +383,8 @@ impl Args {
         let mut policy = None;
         let mut coverage = Coverage::Partial;
         let mut events = false;
+        let mut tx_index_dir = None;
+        let mut immutable = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -321,15 +400,24 @@ impl Args {
                     };
                 }
                 "--events" => events = true,
+                "--tx-index-dir" => tx_index_dir = Some(PathBuf::from(args.next().ok_or(USAGE)?)),
+                "--immutable" => immutable = Some(PathBuf::from(args.next().ok_or(USAGE)?)),
                 other => return Err(format!("unknown argument {other:?}. {USAGE}").into()),
             }
         }
+
+        let tx_index = match (tx_index_dir, immutable) {
+            (Some(dir), Some(immutable)) => Some((dir, immutable)),
+            (None, None) => None,
+            _ => return Err(format!("--tx-index-dir and --immutable go together. {USAGE}").into()),
+        };
 
         Ok(Self {
             archive_dir: archive_dir.ok_or(USAGE)?,
             policy: policy.ok_or(USAGE)?,
             coverage,
             events,
+            tx_index,
         })
     }
 }

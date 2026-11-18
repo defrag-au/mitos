@@ -5108,6 +5108,7 @@ dependencies = [
  "hex",
  "policy-archive",
  "serde_json",
+ "tx-index",
 ]
 
 [[package]]

@@ -65,12 +65,16 @@ pub mod compact;
 #[cfg(feature = "mmap")]
 pub mod extract;
 #[cfg(feature = "mmap")]
+pub mod position;
+#[cfg(feature = "mmap")]
 pub mod reader;
 #[cfg(feature = "mmap")]
 pub mod segment;
 
 pub use format::{AuxSpan, Entry, Location, prefix_of};
 pub use locate::Span;
+#[cfg(feature = "mmap")]
+pub use position::Positions;
 #[cfg(feature = "mmap")]
 pub use reader::{AuxLookup, Coverage, Index, IndexHandle, Located, Resolution, TxBody};
 

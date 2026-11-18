@@ -116,6 +116,32 @@ struct PendingVest {
     amount: u64,
     unlock_ts_ms: u64,
     style: VestStyle,
+    /// Unix seconds the position's output appeared: when it was opened.
+    opened_unix: u64,
+}
+
+/// One live lock or staking position, its amount scaled to what its address still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Position {
+    pub owner: String,
+    pub lock_address: String,
+    pub amount: u64,
+    pub unlock_ts_ms: u64,
+    pub style: VestStyle,
+    /// Unix seconds the position was opened. A maturity rule reads this: a position opened
+    /// inside its window is new, whatever its owner held before.
+    pub opened_unix: u64,
+}
+
+/// Every live position the archive observed, attributed to its owner — what [`build`]'s vests
+/// group by owner, flat and with each position's opening time.
+pub fn positions(
+    observations: &[Observation],
+    movements: &[policy_archive::Movement],
+) -> Vec<Position> {
+    let by_payment = payment_map(movements);
+    let by_address = address_balances(movements);
+    scaled_positions(observations, &by_payment, &by_address)
 }
 
 fn payment_map(movements: &[policy_archive::Movement]) -> HashMap<String, String> {
@@ -185,6 +211,40 @@ fn vesting(
     by_key: &HashMap<String, String>,
     by_address: &HashMap<&str, i64>,
 ) -> Vec<VestOwner> {
+    let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
+    for position in scaled_positions(observations, by_payment, by_address) {
+        let owner = owners
+            .entry(position.owner.clone())
+            .or_insert_with(|| VestOwner {
+                key: position.owner,
+                address: String::new(),
+                amount: 0,
+                locks: Vec::new(),
+            });
+        owner.amount = owner.amount.saturating_add(position.amount);
+        owner.locks.push(VestLock {
+            amount: position.amount,
+            unlock_ts_ms: position.unlock_ts_ms,
+            lock_address: position.lock_address,
+            style: position.style,
+        });
+    }
+    // The address each owner is named by, where the policy's movements saw one.
+    for owner in owners.values_mut() {
+        if let Some(address) = by_key.get(&owner.key) {
+            owner.address.clone_from(address);
+        }
+    }
+    owners.into_values().collect()
+}
+
+/// Every lock observation attributed to its owner, each address's set scaled to what the address
+/// still holds — a claimed lock's share leaves with it.
+fn scaled_positions(
+    observations: &[Observation],
+    by_payment: &HashMap<String, String>,
+    by_address: &HashMap<&str, i64>,
+) -> Vec<Position> {
     let mut pending: BTreeMap<String, Vec<PendingVest>> = BTreeMap::new();
     for o in observations {
         let Some(style) = vest_style(&o.address) else {
@@ -208,10 +268,11 @@ fn vesting(
                 amount,
                 unlock_ts_ms: decoded.unlock_ts_ms,
                 style,
+                opened_unix: o.block_time,
             });
     }
 
-    let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
+    let mut out: Vec<Position> = Vec::new();
     for (address, items) in pending {
         let current = by_address
             .get(address.as_str())
@@ -228,30 +289,17 @@ fn vesting(
             if amount == 0 {
                 continue;
             }
-            let owner = owners
-                .entry(item.owner.clone())
-                .or_insert_with(|| VestOwner {
-                    key: item.owner,
-                    address: String::new(),
-                    amount: 0,
-                    locks: Vec::new(),
-                });
-            owner.amount = owner.amount.saturating_add(amount);
-            owner.locks.push(VestLock {
+            out.push(Position {
+                owner: item.owner,
+                lock_address: address.clone(),
                 amount,
                 unlock_ts_ms: item.unlock_ts_ms,
-                lock_address: address.clone(),
                 style: item.style,
+                opened_unix: item.opened_unix,
             });
         }
     }
-    // The address each owner is named by, where the policy's movements saw one.
-    for owner in owners.values_mut() {
-        if let Some(address) = by_key.get(&owner.key) {
-            owner.address.clone_from(address);
-        }
-    }
-    owners.into_values().collect()
+    out
 }
 
 /// Scale observed amounts down to `current`, preserving their sum exactly.

@@ -137,6 +137,11 @@ impl Index {
         })
     }
 
+    /// The immutable directory the located spans are read from.
+    pub fn immutable(&self) -> &Path {
+        &self.immutable
+    }
+
     pub fn coverage(&self) -> Coverage {
         let tail_entries = self.tail.iter().map(|s| s.len() as u64).sum();
         let newest_tail = self.tail.first().map(|s| s.header.chunk);

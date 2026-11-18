@@ -16,3 +16,5 @@ chain-events-cardano = { path = "../../crates/chain-events-cardano" }
 hex = { workspace = true }
 policy-archive = { path = "../../crates/policy-archive" }
 serde_json = { workspace = true }
+# Recovers the in-block position the archive's older files never recorded; see `--tx-index-dir`.
+tx-index = { path = "../../crates/tx-index" }

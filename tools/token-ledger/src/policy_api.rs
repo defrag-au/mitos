@@ -333,6 +333,12 @@ pub struct PolicyHub {
     /// observations merged with every movement. Keyed on the archive's own
     /// version, so it is recomputed when the archive moves and not before.
     series: Mutex<HashMap<String, (u64, Arc<policy_archive::series::Series>)>>,
+    /// (policy, windows in seconds) → (archive `updated_unix`, the held-through table).
+    ///
+    /// Cached for the same reason as [`Self::holders`], and keyed the same way: the table is a
+    /// whole-history fold plus a read of the observation tier, and it is a pure function of the
+    /// archive because its reading is taken AT `updated_unix` rather than at the clock.
+    held_through: HeldThroughCache,
     /// policy → the pool view folded from its observations.
     ///
     /// ⚠️ Not an artefact on disk, deliberately. The VIEW is tiny — a handful of
@@ -357,6 +363,9 @@ pub struct PolicyHub {
     /// KV at the edge without reaching this process at all.
     reads: Mutex<HashMap<String, u64>>,
 }
+
+/// See [`PolicyHub::held_through`].
+type HeldThroughCache = Mutex<HashMap<(String, Vec<u64>), (u64, Arc<archive::HeldThroughTable>)>>;
 
 /// A policy's pool view, and what it cost to fold.
 #[derive(Clone)]
@@ -456,6 +465,7 @@ impl PolicyHub {
             bearer,
             holders: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
+            held_through: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
             reads: Mutex::new(HashMap::new()),
         });
@@ -2790,6 +2800,202 @@ pub struct HoldersQuery {
     pub min: Option<String>,
 }
 
+/// One party's held-through reading.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct HeldThroughDto {
+    /// The same key `/holders` serves: stake credential hex, or the bech32 address where there is
+    /// no stake part.
+    pub key: String,
+    /// Raw units at the reading: wallet balance plus live staking and lock positions (CrowdLock
+    /// excluded — it already sits under the owner's key). ⚠️ A STRING, as `/holders`' amounts are.
+    pub now: String,
+    /// One per entry in the response's `days`, same order: raw units held THROUGHOUT the window
+    /// ending at `at_unix` — the wallet's lowest balance inside it, plus every position opened at
+    /// or before its start. Never more than `now`.
+    pub held: Vec<String>,
+    /// The part of `now` that sits in staking or lock positions rather than the wallet.
+    pub positioned: String,
+}
+
+/// `GET /policy/{p}/held-through` — what each holder held throughout the days before the reading.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PolicyHeldThroughResponse {
+    pub policy: String,
+    /// The window lengths, in days, in the order every row's `held` follows.
+    pub days: Vec<u64>,
+    /// Unix seconds every window ends at: the archive's `updated_unix`, so the table is a pure
+    /// function of the archive and a caller can see how fresh it is.
+    pub at_unix: u64,
+    pub holders: Vec<HeldThroughDto>,
+    /// Parties in the whole table, BEFORE any `key` filter.
+    pub parties: usize,
+    /// The archive's IMMUTABLE coverage ceiling.
+    pub immutable_to: u64,
+    /// When the archive was last written — equal to `at_unix`.
+    pub updated_unix: u64,
+}
+
+/// The Perps maturity schedule: units held 8 days count in full, 4 days at 75%.
+const HELD_THROUGH_DEFAULT_DAYS: [u64; 2] = [4, 8];
+/// More windows than a maturity rule needs is a caller enlarging the cache key for nothing.
+const HELD_THROUGH_MAX_WINDOWS: usize = 4;
+const HELD_THROUGH_MAX_DAYS: u64 = 365;
+/// Distinct (policy, windows) entries kept before the cache is cleared.
+const HELD_THROUGH_CACHE_ENTRIES: usize = 32;
+
+/// The query: `days` and `key`, each repeatable or comma-separated.
+#[derive(Debug, PartialEq, Eq)]
+struct HeldThroughQuery {
+    days: Vec<u64>,
+    /// Empty means every holder.
+    keys: HashSet<String>,
+}
+
+fn parse_held_through_query(pairs: &[(String, String)]) -> Result<HeldThroughQuery, ApiError> {
+    let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, msg);
+    let mut days = Vec::new();
+    let mut keys = HashSet::new();
+    for (name, value) in pairs {
+        let parts = value.split(',').map(str::trim).filter(|v| !v.is_empty());
+        match name.as_str() {
+            "days" => {
+                for part in parts {
+                    let d: u64 = part
+                        .parse()
+                        .map_err(|_| bad(format!("days must be whole days, got {part:?}")))?;
+                    if d == 0 || d > HELD_THROUGH_MAX_DAYS {
+                        return Err(bad(format!(
+                            "days must be 1..={HELD_THROUGH_MAX_DAYS}, got {d}"
+                        )));
+                    }
+                    days.push(d);
+                }
+            }
+            "key" => keys.extend(parts.map(str::to_string)),
+            // Unknown parameters are refused rather than ignored: a misspelt `day=4` silently
+            // answering the default windows would be read as the asked-for ones.
+            other => return Err(bad(format!("unknown parameter {other:?}"))),
+        }
+    }
+    if days.is_empty() {
+        days = HELD_THROUGH_DEFAULT_DAYS.to_vec();
+    }
+    if days.len() > HELD_THROUGH_MAX_WINDOWS {
+        return Err(bad(format!(
+            "at most {HELD_THROUGH_MAX_WINDOWS} windows, got {}",
+            days.len()
+        )));
+    }
+    Ok(HeldThroughQuery { days, keys })
+}
+
+/// The response body for a table — filtered to `keys` when any are given.
+fn held_through_response(
+    policy: String,
+    days: Vec<u64>,
+    table: &archive::HeldThroughTable,
+    keys: &HashSet<String>,
+    immutable_to: u64,
+    updated_unix: u64,
+) -> PolicyHeldThroughResponse {
+    let holders = table
+        .rows
+        .iter()
+        .filter(|row| keys.is_empty() || keys.contains(&row.key))
+        .map(|row| HeldThroughDto {
+            key: row.key.clone(),
+            now: row.now.to_string(),
+            held: row.held.iter().map(i64::to_string).collect(),
+            positioned: row.positioned.to_string(),
+        })
+        .collect();
+    PolicyHeldThroughResponse {
+        policy,
+        days,
+        at_unix: table.at_unix,
+        holders,
+        parties: table.rows.len(),
+        immutable_to,
+        updated_unix,
+    }
+}
+
+/// The held-through table at the archive's `updated_unix`, memoised against it.
+fn held_through_of(
+    hub: &PolicyHub,
+    policy: &str,
+    version: u64,
+    windows: &[u64],
+) -> anyhow::Result<Arc<archive::HeldThroughTable>> {
+    let key = (policy.to_string(), windows.to_vec());
+    if let Some((at, table)) = hub
+        .held_through
+        .lock()
+        .expect("held-through cache")
+        .get(&key)
+        && *at == version
+    {
+        return Ok(Arc::clone(table));
+    }
+    let dir = hub.policy_dir(policy);
+    let table = Arc::new(
+        archive::held_through_table(&dir, Some(version), windows)?.unwrap_or(
+            archive::HeldThroughTable {
+                at_unix: version,
+                rows: Vec::new(),
+            },
+        ),
+    );
+    let mut cache = hub.held_through.lock().expect("held-through cache");
+    if cache.len() >= HELD_THROUGH_CACHE_ENTRIES && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, (version, Arc::clone(&table)));
+    Ok(table)
+}
+
+/// `GET /policy/{p}/held-through?days=4&days=8[&key=<key>…]` — per holder, the balance now and
+/// the lowest balance held throughout each window, staking and lock positions folded in exactly
+/// as `token-ledger held-through` does (one shared [`archive::held_through_table`]).
+///
+/// The input a maturity rule reads for a fungible token: settled 2026-11-11 that `$PERP` matures
+/// like a Perp, so units moved into a fresh wallet, or staked from one, inside the window are new.
+///
+/// The reading is taken at the archive's `updated_unix`, not at the clock, so the answer is cached
+/// exactly as `/holders` is and goes stale only when the tail writes (every ~300 s on the box).
+pub async fn held_through(
+    State(hub): State<Arc<PolicyHub>>,
+    headers: HeaderMap,
+    AxPath(policy): AxPath<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<PolicyHeldThroughResponse>, ApiError> {
+    gate(&hub, &headers)?;
+    let policy = parse_policy(&policy)?;
+    let q = parse_held_through_query(&pairs)?;
+    let dir = hub.policy_dir(&policy);
+    let manifest = archive::load_manifest(&dir).map_err(internal)?;
+    let immutable_to = manifest.as_ref().map(archive::immutable_to).unwrap_or(0);
+    let updated_unix = manifest.as_ref().map(|m| m.updated_unix).unwrap_or(0);
+    let windows: Vec<u64> = q.days.iter().map(|d| d * 86_400).collect();
+    // ⚠️ Off the async workers: a miss reads every movement and the observation tier.
+    let table = {
+        let hub = Arc::clone(&hub);
+        let policy = policy.clone();
+        tokio::task::spawn_blocking(move || held_through_of(&hub, &policy, updated_unix, &windows))
+            .await
+            .map_err(|e| internal(anyhow::anyhow!("held-through fold panicked: {e}")))?
+            .map_err(internal)?
+    };
+    Ok(Json(held_through_response(
+        policy,
+        q.days,
+        &table,
+        &q.keys,
+        immutable_to,
+        updated_unix,
+    )))
+}
+
 /// One sighting of the bonding curve — a point on the launch timeline.
 #[derive(Serialize)]
 pub struct CurvePointDto {
@@ -3357,6 +3563,7 @@ pub fn router(hub: Arc<PolicyHub>) -> Router {
         .route("/policy/{policy}/unrecognised", get(unrecognised))
         .route("/policy/{policy}/live", get(live))
         .route("/policy/{policy}/holders", get(holders))
+        .route("/policy/{policy}/held-through", get(held_through))
         .route("/policy/{policy}/trades", get(trades))
         .route("/policy/{policy}/supply", get(supply))
         .route("/policy/{policy}/launch", get(launch))
@@ -3992,5 +4199,101 @@ mod tests {
             vec![party("alice", -1), party("bob", 1), party("idle", 0)],
         ));
         assert!(matches!(d, DirectionDto::Transfer { .. }));
+    }
+
+    fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+        raw.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn query(raw: &[(&str, &str)]) -> Option<HeldThroughQuery> {
+        parse_held_through_query(&pairs(raw)).ok()
+    }
+
+    /// `days` defaults to the Perps schedule, takes repeats and commas in the order asked, and
+    /// refuses what would silently answer a different question.
+    #[test]
+    fn held_through_query_parses_windows_and_keys() {
+        let default = query(&[]).expect("empty query");
+        assert_eq!(default.days, vec![4, 8]);
+        assert!(default.keys.is_empty());
+        assert_eq!(
+            query(&[("days", "8"), ("days", "4")])
+                .expect("repeats")
+                .days,
+            vec![8, 4]
+        );
+        let q = query(&[("days", "4,8"), ("key", "aa, bb"), ("key", "cc")]).expect("commas");
+        assert_eq!(q.days, vec![4, 8]);
+        assert_eq!(
+            q.keys,
+            ["aa", "bb", "cc"].into_iter().map(String::from).collect()
+        );
+        for refused in [
+            &[("days", "0")][..],
+            &[("days", "four")],
+            &[("days", "366")],
+            &[("days", "1,2,3,4,5")],
+            &[("day", "4")],
+        ] {
+            assert!(query(refused).is_none(), "{refused:?}");
+        }
+    }
+
+    /// The wire shape premint-status reads: amounts as strings, `held` aligned with `days`,
+    /// `parties` counted before the key filter.
+    #[test]
+    fn held_through_response_shape() {
+        let table = archive::HeldThroughTable {
+            at_unix: 1_794_000_000,
+            rows: vec![
+                archive::HeldThroughRow {
+                    key: "aa".into(),
+                    now: 9_007_199_254_740_993,
+                    held: vec![5, 3],
+                    positioned: 2,
+                },
+                archive::HeldThroughRow {
+                    key: "bb".into(),
+                    now: 10,
+                    held: vec![10, 10],
+                    positioned: 0,
+                },
+            ],
+        };
+        let keys: HashSet<String> = ["bb".to_string()].into_iter().collect();
+        let all = held_through_response(
+            "p".into(),
+            vec![4, 8],
+            &table,
+            &HashSet::new(),
+            7,
+            1_794_000_000,
+        );
+        assert_eq!(all.holders.len(), 2);
+        let body = serde_json::to_value(&all).expect("serialises");
+        assert_eq!(body["days"][1], 8);
+        assert_eq!(body["at_unix"], 1_794_000_000u64);
+        assert_eq!(body["parties"], 2);
+        assert_eq!(body["immutable_to"], 7);
+        assert_eq!(body["holders"][0]["key"], "aa");
+        // Above 2^53: a JSON number would round it.
+        assert_eq!(body["holders"][0]["now"], "9007199254740993");
+        assert_eq!(body["holders"][0]["held"][0], "5");
+        assert_eq!(body["holders"][0]["held"][1], "3");
+        assert_eq!(body["holders"][0]["positioned"], "2");
+
+        let one = held_through_response("p".into(), vec![4, 8], &table, &keys, 7, 1_794_000_000);
+        assert_eq!(one.parties, 2, "counted before the filter");
+        assert_eq!(
+            one.holders,
+            vec![HeldThroughDto {
+                key: "bb".into(),
+                now: "10".into(),
+                held: vec!["10".into(), "10".into()],
+                positioned: "0".into(),
+            }]
+        );
     }
 }

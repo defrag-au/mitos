@@ -2018,6 +2018,305 @@ pub fn read_summary(dir: &Path) -> Result<Option<policy_archive::Summary>> {
     ))
 }
 
+/// `token-ledger held-through` — what each holder held THROUGHOUT each window before a
+/// reading: the input a maturity rule reads for a fungible token.
+#[derive(clap::Args, Debug)]
+pub struct HeldThroughArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+    /// The reading, unix seconds. Defaults to the archive's last movement.
+    #[arg(long)]
+    pub at: Option<u64>,
+    /// A window, in days; repeatable. Defaults to 4 and 8 — the Perps maturity schedule.
+    #[arg(long = "days")]
+    pub days: Vec<u64>,
+    /// Write the table here instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+/// One line per holder: `<key> <now> <held through each window…>`, largest first.
+///
+/// A holder's figure is its wallet — the lowest balance across each window
+/// ([`policy_archive::holders::held_through`]) — plus every live lock or staking position it owns,
+/// which counts for a window only when it was opened before the window began. A CrowdLock is
+/// left to the wallet, whose stake key it already sits under. Settled 2026-11-11 so $PERP matures
+/// on the Perps schedule: units moved into a fresh wallet, or staked from one, the week before a
+/// snapshot are new.
+pub fn held_through(args: HeldThroughArgs) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let days = match args.days.is_empty() {
+        true => vec![4, 8],
+        false => args.days.clone(),
+    };
+    let windows: Vec<u64> = days.iter().map(|d| d * 86_400).collect();
+    let Some(table) = held_through_table(&dir, args.at, &windows)? else {
+        bail!("no archive at {}", dir.display());
+    };
+    let at = table.at_unix;
+    let rows: Vec<(String, i64, Vec<i64>)> = table
+        .rows
+        .into_iter()
+        .map(|row| (row.key, row.now, row.held))
+        .collect();
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "# key now {} · at {at}",
+        days.iter()
+            .map(|d| format!("held_{d}d"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for (key, now, held) in &rows {
+        let held: Vec<String> = held.iter().map(i64::to_string).collect();
+        let _ = writeln!(text, "{key} {now} {}", held.join(" "));
+    }
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?
+        }
+        None => print!("{text}"),
+    }
+    eprintln!(
+        "held-through: {} holders · at {at} · windows {days:?} days",
+        rows.len()
+    );
+    Ok(())
+}
+
+/// `token-ledger held-spans` — every interval each holder held the token at all, wallet and live
+/// positions together: what an achievement about holding it, or holding it for so long, reads.
+#[derive(clap::Args, Debug)]
+pub struct HeldSpansArgs {
+    /// Archive root (`<root>/<policy_hex>/manifest.json`).
+    #[arg(long, default_value = "archive")]
+    pub archive_dir: PathBuf,
+    /// 56-hex policy id.
+    #[arg(long)]
+    pub policy: String,
+    /// Write the NDJSON here instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+/// One line of `held-spans`: the shape `holder-behaviour`'s `replay --token` reads.
+#[derive(serde::Serialize)]
+struct HeldSpansLine<'a> {
+    key: &'a str,
+    held: Vec<HeldSpanLine>,
+}
+
+#[derive(serde::Serialize)]
+struct HeldSpanLine {
+    from: u64,
+    from_unix: u64,
+    to_unix: Option<u64>,
+}
+
+/// Mainnet's slot zero in unix seconds, extrapolated from Shelley's one-second slots. Only used to
+/// give a staking position a slot, which the observation records by time alone; every `$PERP`
+/// movement is Shelley-era, where the relation is exact.
+const MAINNET_SLOT_ZERO_UNIX: u64 = 1_591_566_291;
+
+/// One NDJSON line per holder, by key: `{"key","held":[{"from","from_unix","to_unix"}]}`.
+pub fn held_spans(args: HeldSpansArgs) -> Result<()> {
+    use std::fmt::Write as _;
+
+    let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
+    let Some(manifest) = load_manifest(&dir)? else {
+        bail!("no archive at {}", dir.display());
+    };
+    let Some(mut history) = History::open(&dir)? else {
+        bail!("no history at {}", dir.display());
+    };
+    let mut movements = history.all_movements()?.to_vec();
+    movements.retain(|m| is_user_unit(&m.unit_name));
+    let observations = read_observations(&dir, &manifest)?;
+    let positions = crate::segmentation::positions(&observations, &movements);
+    let table = fold_held_spans(&movements, &positions);
+
+    let mut text = String::new();
+    let mut open = 0usize;
+    for (key, spans) in &table {
+        if spans.last().is_some_and(|span| span.to_unix.is_none()) {
+            open += 1;
+        }
+        let line = HeldSpansLine {
+            key,
+            held: spans
+                .iter()
+                .map(|span| HeldSpanLine {
+                    from: span.from_slot,
+                    from_unix: span.from_unix,
+                    to_unix: span.to_unix,
+                })
+                .collect(),
+        };
+        let _ = writeln!(text, "{}", serde_json::to_string(&line)?);
+    }
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?
+        }
+        None => print!("{text}"),
+    }
+    eprintln!(
+        "held-spans: {} parties ever held · {open} hold now",
+        table.len()
+    );
+    Ok(())
+}
+
+/// Each party's wallet intervals ([`policy_archive::holders::held_spans`]) joined with every live
+/// non-CrowdLock position it owns, open from when it was opened. Overlapping or touching intervals
+/// merge, so staking out of the wallet is not a break while the position lives.
+///
+/// A position that has since been closed is not observed, so time spent in one that ended is not
+/// counted: a holder who staked everything and later withdrew shows a break for the staking.
+pub fn fold_held_spans(
+    movements: &[Movement],
+    positions: &[crate::segmentation::Position],
+) -> BTreeMap<String, Vec<policy_archive::holders::HeldSpan>> {
+    use policy_archive::holders::HeldSpan;
+    let mut table = policy_archive::holders::held_spans(movements.iter());
+    for position in positions {
+        if position.style == policy_archive::summary::VestStyle::CrowdLock {
+            continue;
+        }
+        table
+            .entry(position.owner.clone())
+            .or_default()
+            .push(HeldSpan {
+                from_slot: position
+                    .opened_unix
+                    .saturating_sub(MAINNET_SLOT_ZERO_UNIX),
+                from_unix: position.opened_unix,
+                to_unix: None,
+            });
+    }
+    for spans in table.values_mut() {
+        spans.sort_by_key(|span| span.from_unix);
+        let mut merged: Vec<HeldSpan> = Vec::with_capacity(spans.len());
+        for span in spans.drain(..) {
+            match merged.last_mut() {
+                Some(last) if last.to_unix.is_none_or(|to| span.from_unix <= to) => {
+                    last.to_unix = match (last.to_unix, span.to_unix) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        _ => None,
+                    };
+                }
+                _ => merged.push(span),
+            }
+        }
+        *spans = merged;
+    }
+    table
+}
+
+/// One holder's held-through reading: wallet and live positions together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldThroughRow {
+    /// The party key, as [`policy_archive::holders::key_of`] names it — the stake credential hex,
+    /// or the bech32 address where there is no stake part. The same key `/holders` serves.
+    pub key: String,
+    /// Wallet balance plus every live non-CrowdLock position, at the reading.
+    pub now: i64,
+    /// For each window, in the order asked: what was held throughout it.
+    pub held: Vec<i64>,
+    /// The part of [`Self::now`] that sits in live lock or staking positions (CrowdLock excluded,
+    /// being already in the wallet).
+    pub positioned: i64,
+}
+
+/// A whole policy's held-through table, and the reading it was taken at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldThroughTable {
+    /// Unix seconds every window ends at.
+    pub at_unix: u64,
+    /// Largest `now` first, then by key.
+    pub rows: Vec<HeldThroughRow>,
+}
+
+/// The held-through table for the archive at `dir` — what `token-ledger held-through` prints and
+/// `/policy/{p}/held-through` serves, so the two cannot disagree. `at` defaults to the archive's
+/// last movement. `Ok(None)` when there is no archive.
+pub fn held_through_table(
+    dir: &Path,
+    at: Option<u64>,
+    windows: &[u64],
+) -> Result<Option<HeldThroughTable>> {
+    let Some(manifest) = load_manifest(dir)? else {
+        return Ok(None);
+    };
+    let Some(mut history) = History::open(dir)? else {
+        return Ok(None);
+    };
+    let mut movements = history.all_movements()?.to_vec();
+    movements.retain(|m| is_user_unit(&m.unit_name));
+    let observations = read_observations(dir, &manifest)?;
+    let at_unix = at.unwrap_or_else(|| movements.iter().map(|m| m.block_time).max().unwrap_or(0));
+    let positions = crate::segmentation::positions(&observations, &movements);
+    Ok(Some(HeldThroughTable {
+        at_unix,
+        rows: fold_held_through(&movements, &positions, at_unix, windows),
+    }))
+}
+
+/// A holder's figure is its wallet — the lowest balance across each window
+/// ([`policy_archive::holders::held_through`]) — plus every live lock or staking position it owns,
+/// which counts for a window only when it was opened at or before the window's start. A CrowdLock
+/// is left to the wallet, whose stake key it already sits under.
+pub fn fold_held_through(
+    movements: &[Movement],
+    positions: &[crate::segmentation::Position],
+    at_unix: u64,
+    windows: &[u64],
+) -> Vec<HeldThroughRow> {
+    let mut table: BTreeMap<String, HeldThroughRow> = BTreeMap::new();
+    for row in policy_archive::holders::held_through(movements.iter(), at_unix, windows) {
+        table.insert(
+            row.key.clone(),
+            HeldThroughRow {
+                key: row.key,
+                now: row.now,
+                held: row.held,
+                positioned: 0,
+            },
+        );
+    }
+    for position in positions {
+        if position.style == policy_archive::summary::VestStyle::CrowdLock {
+            continue;
+        }
+        let amount = i64::try_from(position.amount).unwrap_or(i64::MAX);
+        let row = table
+            .entry(position.owner.clone())
+            .or_insert_with(|| HeldThroughRow {
+                key: position.owner.clone(),
+                now: 0,
+                held: vec![0; windows.len()],
+                positioned: 0,
+            });
+        row.now = row.now.saturating_add(amount);
+        row.positioned = row.positioned.saturating_add(amount);
+        for (held, window) in row.held.iter_mut().zip(windows) {
+            if position.opened_unix <= at_unix.saturating_sub(*window) {
+                *held = held.saturating_add(amount);
+            }
+        }
+    }
+    let mut rows: Vec<HeldThroughRow> = table.into_values().collect();
+    rows.sort_by(|a, b| b.now.cmp(&a.now).then(a.key.cmp(&b.key)));
+    rows
+}
+
 /// `token-ledger summary` — fold and write one policy's summary by hand, and
 /// say what is in it.
 #[derive(clap::Args, Debug)]
@@ -4332,6 +4631,135 @@ mod tests {
                 .map(|x| x.amount),
             Some(6),
             "10 minted, 4 sent on"
+        );
+    }
+
+    /// The held-through fold: a wallet's floor per window plus each position by when it was
+    /// opened, with a CrowdLock left to the wallet and a staker with an empty wallet still read.
+    #[test]
+    fn held_through_adds_positions_by_when_they_were_opened() {
+        use crate::segmentation::Position;
+        use policy_archive::summary::VestStyle;
+        let day = 86_400;
+        let at = 100 * day;
+        let windows = [4 * day, 8 * day];
+        let holder = wallet_under("stake1uxw8pmwq7my926m9xuk5zpy83at8hyzqla4qxs843sfjznsgtwgxy");
+        let staker = wallet_under("stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr");
+        let holder_key = policy_archive::holders::key_of(&holder);
+        let staker_key = policy_archive::holders::key_of(&staker);
+        let at_day = |d: u64, tx: u8, amount: i64| Movement {
+            slot: 1_000 - d,
+            block_time: at - d * day,
+            tx_hash: vec![tx; 32],
+            unit_name: b"PERP COIN".to_vec(),
+            address: holder.clone(),
+            amount,
+            net_mint: 0,
+            tx_index: 0,
+        };
+        // 100 for months, 30 out and back six days ago, 50 new three days ago.
+        let movements = [
+            at_day(90, 1, 100),
+            at_day(6, 2, -30),
+            at_day(5, 3, 30),
+            at_day(3, 4, 50),
+        ];
+        let position = |owner: &str, amount: u64, opened_days_ago: u64, style| Position {
+            owner: owner.to_string(),
+            lock_address: "addr_lock".into(),
+            amount,
+            unlock_ts_ms: 0,
+            style,
+            opened_unix: at - opened_days_ago * day,
+        };
+        let positions = [
+            // Staked five days ago: through four days, not through eight.
+            position(&holder_key, 1_000, 5, VestStyle::Other),
+            // Already under the wallet's own key: never added.
+            position(&holder_key, 7_777, 30, VestStyle::CrowdLock),
+            // Staked a month ago from a wallet that is now empty.
+            position(&staker_key, 400, 30, VestStyle::Other),
+            // Opened exactly at the eight-day boundary: held throughout.
+            position(&staker_key, 5, 8, VestStyle::SnekFun),
+        ];
+        let rows = fold_held_through(&movements, &positions, at, &windows);
+        assert_eq!(
+            rows,
+            vec![
+                HeldThroughRow {
+                    key: holder_key,
+                    now: 1_150,
+                    held: vec![1_100, 70],
+                    positioned: 1_000,
+                },
+                HeldThroughRow {
+                    key: staker_key,
+                    now: 405,
+                    held: vec![405, 405],
+                    positioned: 405,
+                },
+            ]
+        );
+    }
+
+    /// Held spans: a wallet emptied into a staking position is one unbroken span; a CrowdLock
+    /// adds nothing; a staker whose wallet never held reads from the position's opening.
+    #[test]
+    fn held_spans_join_wallet_intervals_with_live_positions() {
+        use crate::segmentation::Position;
+        use policy_archive::holders::HeldSpan;
+        use policy_archive::summary::VestStyle;
+        let holder = wallet_under("stake1uxw8pmwq7my926m9xuk5zpy83at8hyzqla4qxs843sfjznsgtwgxy");
+        let staker = wallet_under("stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr");
+        let holder_key = policy_archive::holders::key_of(&holder);
+        let staker_key = policy_archive::holders::key_of(&staker);
+        let row = |time: u64, tx: u8, amount: i64| Movement {
+            slot: time - MAINNET_SLOT_ZERO_UNIX,
+            block_time: time,
+            tx_hash: vec![tx; 32],
+            unit_name: b"PERP COIN".to_vec(),
+            address: holder.clone(),
+            amount,
+            net_mint: 0,
+            tx_index: 0,
+        };
+        let t0 = 1_760_000_000;
+        // Bought, then the whole balance staked at t0 + 100.
+        let movements = [row(t0, 1, 100), row(t0 + 100, 2, -100)];
+        let position = |owner: &str, opened_unix: u64, style| Position {
+            owner: owner.to_string(),
+            lock_address: "addr_lock".into(),
+            amount: 100,
+            unlock_ts_ms: 0,
+            style,
+            opened_unix,
+        };
+        let positions = [
+            position(&holder_key, t0 + 100, VestStyle::Other),
+            position(&holder_key, t0 + 50, VestStyle::CrowdLock),
+            position(&staker_key, t0 + 500, VestStyle::Other),
+        ];
+        let table = fold_held_spans(&movements, &positions);
+        assert_eq!(
+            table.get(&holder_key).map(Vec::as_slice),
+            Some(
+                &[HeldSpan {
+                    from_slot: t0 - MAINNET_SLOT_ZERO_UNIX,
+                    from_unix: t0,
+                    to_unix: None
+                }][..]
+            ),
+            "staking out of the wallet is not a break"
+        );
+        assert_eq!(
+            table.get(&staker_key).map(Vec::as_slice),
+            Some(
+                &[HeldSpan {
+                    from_slot: t0 + 500 - MAINNET_SLOT_ZERO_UNIX,
+                    from_unix: t0 + 500,
+                    to_unix: None
+                }][..]
+            )
         );
     }
 }
