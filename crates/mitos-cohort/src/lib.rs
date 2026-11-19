@@ -243,6 +243,7 @@ pub fn classify_with(
             } else if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred)
                 || mitos_vesting_decode::snek_fun::is_snek_fun(&cred)
                 || mitos_vesting_decode::perps_staking::is_perps_staking(&cred)
+                || mitos_vesting_decode::tsuru_staking::is_tsuru_staking(&cred)
             {
                 c(Cohort::Vesting)
             } else if lock_creds.contains(&cred) {
@@ -437,6 +438,19 @@ mod tests {
     #[test]
     fn snekfun_is_recognised_without_any_local_registration() {
         let got = classify(SNEKFUN_LOCK, &[], &[]);
+        assert_eq!(got.cohort, Cohort::Vesting);
+        assert_eq!(got.basis, "decoded");
+    }
+
+    /// The $TOOL staking site: an ENTERPRISE script address paying to
+    /// `b0ebdd68…`, holding 44.2% of supply at the 2026-11-19 walk. Registered
+    /// as a staking contract, but a contract all the same — a holder map that
+    /// calls it an unnamed script has lost the reason its numbers move.
+    const TOOL_STAKING: &str = "addr1wxcwhhtgh5q08f3nc5yhlcpy845lkfat4ntld9vma33uf3q4fagjy";
+
+    #[test]
+    fn the_tool_staking_site_is_decoded_vesting_not_an_unnamed_script() {
+        let got = classify(TOOL_STAKING, &[], &[]);
         assert_eq!(got.cohort, Cohort::Vesting);
         assert_eq!(got.basis, "decoded");
     }

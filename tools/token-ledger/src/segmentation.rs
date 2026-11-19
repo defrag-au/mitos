@@ -251,13 +251,13 @@ fn scaled_positions(
 ) -> Vec<Position> {
     let mut pending: BTreeMap<String, Vec<PendingVest>> = BTreeMap::new();
     for o in observations {
-        let Some(style) = vest_style(&o.address, registry) else {
+        let Some((style, shape)) = vest_style(&o.address, registry) else {
             continue;
         };
         let Some(datum) = o.datum.as_deref() else {
             continue;
         };
-        let Some(decoded) = mitos_vesting_decode::decode_vesting_datum(datum) else {
+        let Some((owner_pkh_hex, unlock_ts_ms)) = position_datum(shape, datum) else {
             continue;
         };
         let amount = u64::try_from(o.unit_amount).unwrap_or(0);
@@ -268,9 +268,9 @@ fn scaled_positions(
             .entry(o.address.clone())
             .or_default()
             .push(PendingVest {
-                owner: owner_key(&o.address, &decoded.owner_pkh_hex, by_payment),
+                owner: owner_key(&o.address, &owner_pkh_hex, by_payment),
                 amount,
-                unlock_ts_ms: decoded.unlock_ts_ms,
+                unlock_ts_ms,
                 style,
                 opened_unix: o.block_time,
             });
@@ -339,27 +339,68 @@ fn scale_to(current: u64, observed: u64, amounts: Vec<u64>) -> Vec<u64> {
     out
 }
 
-fn vest_style(address: &str, registry: &mitos_registry::Registry) -> Option<VestStyle> {
+fn vest_style(
+    address: &str,
+    registry: &mitos_registry::Registry,
+) -> Option<(VestStyle, DatumShape)> {
     let cred = mitos_cohort::payment_cred(address)?;
     if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred) {
-        Some(VestStyle::CrowdLock)
+        Some((VestStyle::CrowdLock, DatumShape::Timed))
     } else if mitos_vesting_decode::snek_fun::is_snek_fun(&cred) {
-        Some(VestStyle::SnekFun)
+        Some((VestStyle::SnekFun, DatumShape::Timed))
     } else if mitos_vesting_decode::perps_staking::is_perps_staking(&cred) {
         // Staked, not vesting: its datum's date is when it was staked. `Other` keeps the
         // summary's wire format, and the owner is what a reader of the vests needs.
-        Some(VestStyle::Other)
+        Some((VestStyle::Other, DatumShape::Timed))
+    } else if mitos_vesting_decode::tsuru_staking::is_tsuru_staking(&cred) {
+        // Staked, and the datum carries NO date at all — the owner-only shape.
+        Some((VestStyle::Other, DatumShape::OwnerOnly))
     } else if registry.uses(&hex::encode(cred)).iter().any(|use_of| {
         matches!(
             use_of.category,
-            mitos_registry::Category::Vesting | mitos_registry::Category::Lock
+            mitos_registry::Category::Vesting
+                | mitos_registry::Category::Lock
+                // A registered staking site is the same claim as a registered
+                // lock: the units at it belong to whoever the datum names.
+                | mitos_registry::Category::Staking
         )
     }) {
-        // Registered as a lock whose datum no decoder here reads: still a vest,
-        // with no schedule — the same weaker evidence the cohort records.
-        Some(VestStyle::Other)
+        // Registered, but no decoder here reads it: still a position, with no
+        // schedule — the same weaker evidence the cohort records.
+        Some((VestStyle::Other, DatumShape::Timed))
     } else {
         None
+    }
+}
+
+/// Which decoder reads a position's datum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatumShape {
+    /// The lock family: a timestamp and an owner. Its date is a deadline for a
+    /// lock and, at a staking site, when the position was staked — never a
+    /// maturity the decoder invents.
+    Timed,
+    /// An owner and nothing else: a staking site that records no date at all.
+    OwnerOnly,
+}
+
+/// The owner a position's datum names, and the timestamp it carries when it
+/// carries one.
+///
+/// An owner-only position reports `unlock_ts_ms = 0`, which is what a
+/// `VestStyle::Other` row without a schedule already carries. The contract says
+/// nothing about unlocking; the style is what tells a reader not to take a date
+/// off the row rather than the decoder supplying a wrong one.
+fn position_datum(shape: DatumShape, cbor: &[u8]) -> Option<(String, u64)> {
+    match shape {
+        DatumShape::Timed => {
+            let decoded = mitos_vesting_decode::decode_vesting_datum(cbor)?;
+            Some((decoded.owner_pkh_hex, decoded.unlock_ts_ms))
+        }
+        DatumShape::OwnerOnly => {
+            let decoded = mitos_vesting_decode::decode_owner_only_datum(cbor)?;
+            Some((decoded.owner_pkh_hex, 0))
+        }
     }
 }
 
@@ -637,6 +678,57 @@ mod tests {
             output_index: Some(0),
             spent: false,
         }
+    }
+
+    /// The $TOOL staking site, and a real position on it captured from chain
+    /// 2026-11-19 (42,568 $TOOL owned by `6ec2284b…`). Its datum is the
+    /// owner-only shape — one hash, no date.
+    const TOOL_SITE: &str = "addr1wxcwhhtgh5q08f3nc5yhlcpy845lkfat4ntld9vma33uf3q4fagjy";
+    const TOOL_POSITION: &str =
+        "d87981581c6ec2284b5cd330d2c140b8472cd8ff71ccb2c66d50e563f51d8c710f";
+    const TOOL_OWNER_PKH: &str = "6ec2284b5cd330d2c140b8472cd8ff71ccb2c66d50e563f51d8c710f";
+
+    /// The site holds 44.2% of supply as one row unless its positions are read.
+    /// Reading them needs the owner-only decoder; the lock family's decoder
+    /// must not be what answers here, because it would demand a date the datum
+    /// does not carry.
+    #[test]
+    fn an_owner_only_staking_position_is_attributed_to_its_owner() {
+        let mut o = position(100, 3, TOOL_POSITION, 42_568);
+        o.address = TOOL_SITE.into();
+        let balances = HashMap::from([(TOOL_SITE, 42_568)]);
+        let by_payment = HashMap::from([(TOOL_OWNER_PKH.to_string(), "owner".to_string())]);
+        let owners = vesting(
+            &[o],
+            &by_payment,
+            &HashMap::new(),
+            &balances,
+            &mitos_registry::Registry::pinned(),
+        );
+
+        assert_eq!(owners.len(), 1);
+        let only = &owners[0];
+        assert_eq!(only.key, "owner", "the datum's owner is the party");
+        assert_eq!(only.amount, 42_568);
+        assert_eq!(only.locks[0].style, VestStyle::Other);
+        assert_eq!(
+            only.locks[0].unlock_ts_ms, 0,
+            "the datum carries no date, and none is invented"
+        );
+    }
+
+    /// A site reads the shape it declares and nothing else: the two decoders
+    /// must not stand in for each other.
+    #[test]
+    fn a_site_reads_only_the_datum_shape_it_declares() {
+        let timed = hex::decode(POSITION_A).unwrap();
+        let owner_only = hex::decode(TOOL_POSITION).unwrap();
+        assert!(position_datum(DatumShape::Timed, &owner_only).is_none());
+        assert!(position_datum(DatumShape::OwnerOnly, &timed).is_none());
+        assert_eq!(
+            position_datum(DatumShape::OwnerOnly, &owner_only),
+            Some((TOOL_OWNER_PKH.to_string(), 0))
+        );
     }
 
     fn spend_of(slot: u64, position: &Observation) -> Observation {

@@ -28,12 +28,26 @@
 //! `docs/design/HOLDER_DISTRIBUTION_LP_DECOMPOSITION.md` —
 //! "the decode library is the genuine reuse unit; composition
 //! over coordination."
+//!
+//! ## Not every owner-carrying datum is a lock
+//!
+//! A staking site can name its owner and nothing else:
+//!
+//! ```text
+//! $TOOL staking:  Constr 0 [ Bytes(28) ]
+//! ```
+//!
+//! That is [`decode_owner_only_datum`], deliberately separate from the lock family.
+//! Folding it in would make "the datum has no date" indistinguishable from "the
+//! position unlocks at the epoch", and a reader of a maturity date would be lied
+//! to by a decoder rather than by the contract.
 
 use pallas_primitives::{BigInt, PlutusData};
 
 pub mod crowd_lock;
 pub mod perps_staking;
 pub mod snek_fun;
+pub mod tsuru_staking;
 
 const HASH_BYTES: usize = 28;
 
@@ -89,6 +103,37 @@ fn pkh_hex(pd: &PlutusData) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// An owner and nothing else — the shape a staking site uses when the position
+/// carries no date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerOnlyDatum {
+    /// 56-char hex of the owner's payment-key-hash (28 bytes).
+    pub owner_pkh_hex: String,
+}
+
+/// Decode `Constr 0 [ Bytes(owner_pkh) ]` — one bare 28-byte hash, exactly one
+/// field.
+///
+/// ⚠️ The field COUNT and the hash LENGTH are the whole defence, the same way
+/// the length check is for the lock family: a `Constr 0` carrying one byte
+/// string is a common shape, so a decoder that took any of them would start
+/// reading unrelated datums as positions. The owner may not be wrapped in a
+/// list here — no site is known to spell it that way, and accepting a shape the
+/// contract does not use is how a decoder drifts ahead of the chain.
+pub fn decode_owner_only_datum(cbor: &[u8]) -> Option<OwnerOnlyDatum> {
+    let pd: PlutusData = pallas_codec::minicbor::decode(cbor).ok()?;
+    let PlutusData::Constr(outer) = pd else {
+        return None;
+    };
+    let fields: Vec<PlutusData> = outer.fields.into();
+    if fields.len() != 1 {
+        return None;
+    }
+    Some(OwnerOnlyDatum {
+        owner_pkh_hex: pkh_hex(&fields[0])?,
+    })
 }
 
 pub fn bigint_to_u64(i: &BigInt) -> Option<u64> {
@@ -192,5 +237,34 @@ mod tests {
             ],
         );
         assert!(decode_vesting_datum(&encode(&wrapped)).is_none());
+    }
+
+    #[test]
+    fn the_owner_only_shape_is_read_by_its_own_decoder_only() {
+        let owner = [0x6e; 28];
+        let owner_only = constr(121, vec![bytes_pd(&owner)]);
+        assert_eq!(
+            decode_owner_only_datum(&encode(&owner_only)),
+            Some(OwnerOnlyDatum {
+                owner_pkh_hex: hex::encode(owner)
+            })
+        );
+
+        // The two shapes must not be read by each other's decoder: a date and
+        // no date are different facts, and neither stands in for the other.
+        let timed = constr(121, vec![int_pd(1), bytes_pd(&owner)]);
+        assert!(decode_owner_only_datum(&encode(&timed)).is_none());
+        assert!(decode_vesting_datum(&encode(&owner_only)).is_none());
+
+        // One field is not enough on its own — the field must be a 28-byte hash.
+        let short = constr(121, vec![bytes_pd(&[0x6e; 27])]);
+        assert!(decode_owner_only_datum(&encode(&short)).is_none());
+        let wrapped = constr(
+            121,
+            vec![PlutusData::Array(MaybeIndefArray::Indef(vec![bytes_pd(
+                &owner,
+            )]))],
+        );
+        assert!(decode_owner_only_datum(&encode(&wrapped)).is_none());
     }
 }
