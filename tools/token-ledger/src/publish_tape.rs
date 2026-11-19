@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use cf_publish::{Client, Targets, immutable_attributes, pointer_attributes};
 use object_store::path::Path as ObjPath;
+// 0.14 split the helpers (`get`, `head`, …) off the object-safe `ObjectStore`.
+use object_store::ObjectStoreExt;
 
 /// Key prefix in the bucket.
 pub const PREFIX: &str = "token-tape";

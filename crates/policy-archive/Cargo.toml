@@ -20,7 +20,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-parquet = { version = "55", default-features = false, features = ["snap"] }
+parquet = { version = "60", default-features = false, features = ["snap"] }
 bytes = "1"
 thiserror = { workspace = true }
 # The manifest is JSON on disk and in R2; the same struct on both sides of

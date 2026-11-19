@@ -38,7 +38,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+// 0.14 split the object-safe `ObjectStore` trait from the helpers (`head`,
+// `delete`, …) that used to live on it; both are needed here.
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 

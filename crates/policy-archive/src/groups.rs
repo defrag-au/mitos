@@ -165,12 +165,12 @@ impl GroupSummary {
     /// must describe exactly that many groups, and each group's buckets must
     /// sum to its `num_rows`, or the tables describe a different file.
     pub fn decode(
-        kvs: &[parquet::format::KeyValue],
+        kvs: &[parquet::file::metadata::KeyValue],
         rows_per_group: &[u64],
         bucket_secs: u64,
     ) -> Result<Vec<Self>> {
         use crate::schema::{kv, lookup};
-        fn list(kvs: &[parquet::format::KeyValue], key: &'static str) -> Result<Vec<u64>> {
+        fn list(kvs: &[parquet::file::metadata::KeyValue], key: &'static str) -> Result<Vec<u64>> {
             let raw = lookup(kvs, key).ok_or(Error::MissingStamp(key))?;
             if raw.is_empty() {
                 return Ok(Vec::new());
@@ -702,10 +702,10 @@ mod tests {
         assert_eq!(s.buckets[0].placeholders, 1);
     }
 
-    fn kvs_of(groups: &[GroupSummary]) -> Vec<parquet::format::KeyValue> {
+    fn kvs_of(groups: &[GroupSummary]) -> Vec<parquet::file::metadata::KeyValue> {
         GroupSummary::encode(groups)
             .into_iter()
-            .map(|(k, v)| parquet::format::KeyValue::new(k.to_string(), v))
+            .map(|(k, v)| parquet::file::metadata::KeyValue::new(k.to_string(), v))
             .collect()
     }
 

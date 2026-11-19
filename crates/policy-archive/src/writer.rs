@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
-use parquet::format::KeyValue;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
 
@@ -67,7 +67,10 @@ impl<W: Write + Send> ArchiveWriter<W> {
             let col = ColumnPath::from(Column::TxHash.name());
             props = props
                 .set_column_bloom_filter_enabled(col.clone(), true)
-                .set_column_bloom_filter_ndv(col.clone(), (2 * policy.min_rows).max(1_024) as u64)
+                .set_column_bloom_filter_max_ndv(
+                    col.clone(),
+                    (2 * policy.min_rows).max(1_024) as u64,
+                )
                 .set_column_bloom_filter_fpp(col, 0.05);
         }
         let inner = SerializedFileWriter::new(sink, schema, Arc::new(props.build()))?;

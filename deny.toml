@@ -39,19 +39,10 @@ ignore = [
   # out when it lands. `cargo update --precise` reports exactly the requirement
   # quoted here.
   #
-  # quick-xml >= 0.41.0. object_store v0.12.5 requires `quick-xml = "^0.38"`;
-  # cf-publish declares `object_store = "^0.12"`.
-  "RUSTSEC-2026-0194",
-  "RUSTSEC-2026-0195",
-  # libsqlite3-sys >= 0.39.0. rusqlite v0.32.1 requires `libsqlite3-sys =
-  # "^0.30.1"`; market-ledger declares `rusqlite = "^0.32"`.
-  "RUSTSEC-2026-0459",
-  # thrift >= 0.23.0. parquet v55.2.0 requires `thrift = "^0.17"`;
-  # policy-archive declares `parquet = "^55"`.
-  "RUSTSEC-2026-0435",
   # webpki-roots >= 1.0.10, and only the 1.0 line has it — the 0.26.8 here is
-  # reached through hyper-rustls 0.27.5 (reqwest) and tokio-tungstenite 0.26.2
-  # (axum, mitos-core, mitos-tail). Both have to move to webpki-roots 1.x.
+  # reached through hyper-rustls 0.27.5 (reqwest 0.12) and tokio-tungstenite
+  # 0.26.2 (mitos-core, mitos-tail, axum). Both have to move to webpki-roots
+  # 1.x: reqwest 0.13 and tokio-tungstenite 0.30.
   "RUSTSEC-2026-0381",
 ]
 
