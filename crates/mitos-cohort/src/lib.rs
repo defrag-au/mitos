@@ -46,6 +46,7 @@
 //! That property is load-bearing — see `POLICY_ARCHIVE_OBSERVATIONS.md`, which
 //! rejected inlining cohorts per movement precisely to protect it.
 
+use mitos_registry::{Category, Registry};
 use pallas_addresses::Address;
 
 /// A party's cohort. Ordered as the supply cascade renders them.
@@ -174,14 +175,36 @@ pub struct Classification {
     pub basis: &'static str,
 }
 
-/// Classify one address.
+/// Classify one address against the **pinned** registry.
+///
+/// The pinned table is the rev in the workspace dependency, embedded at build
+/// time — correct for every caller that has no table of its own (the wasm
+/// module, a test, a tool that only asks about one address). A walk that has
+/// fetched the live table uses [`classify_with`].
+pub fn classify(address: &str, pools: &[String], lock_creds: &[[u8; 28]]) -> Classification {
+    classify_with(address, pools, lock_creds, pinned())
+}
+
+fn pinned() -> &'static Registry {
+    use std::sync::LazyLock;
+    static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::pinned);
+    &REGISTRY
+}
+
+/// Classify one address against a registry the caller supplies.
 ///
 /// `sinks` and `pools` are exact address sets; `lock_creds` are 28-byte
-/// payment credentials. Everything else is decided by the payment credential's
-/// kind, read through pallas rather than by matching a bech32 prefix —
-/// `addr1z` covers two distinct address types and a prefix test would silently
-/// mis-sort one of them.
-pub fn classify(address: &str, pools: &[String], lock_creds: &[[u8; 28]]) -> Classification {
+/// payment credentials. `registry` carries the hosted behaviour table: a burn
+/// sink is a claim in that table, keyed by payment credential, not a constant in
+/// this build. Everything else is decided by the payment credential's kind, read
+/// through pallas rather than by matching a bech32 prefix — `addr1z` covers two
+/// distinct address types and a prefix test would silently mis-sort one of them.
+pub fn classify_with(
+    address: &str,
+    pools: &[String],
+    lock_creds: &[[u8; 28]],
+    registry: &Registry,
+) -> Classification {
     let c = |cohort: Cohort| Classification {
         cohort,
         basis: cohort.basis(),
@@ -195,17 +218,17 @@ pub fn classify(address: &str, pools: &[String], lock_creds: &[[u8; 28]]) -> Cla
                 pallas_addresses::ShelleyPaymentPart::Key(h)
                 | pallas_addresses::ShelleyPaymentPart::Script(h) => **h,
             };
-            // Burn sinks come from `address-registry`, by CREDENTIAL. They used
+            // Burn sinks come from the address registry, by CREDENTIAL. They used
             // to be an exact-address list loaded from per-token config, which
             // made a property of the script into a property of each token that
             // happened to reach it — and meant a sink was only known to the
-            // tokens somebody had already registered it against.
-            if matches!(
-                address_registry::lookup_payment_credential(&hex_lower(&cred)).map(|e| &e.category),
-                Some(address_registry::AddressCategory::Script(
-                    address_registry::ScriptCategory::Burn { .. }
-                ))
-            ) {
+            // tokens somebody had already registered it against. The table is
+            // hosted, so a new sink is a data change rather than a rebuild.
+            if registry
+                .uses(&hex_lower(&cred))
+                .iter()
+                .any(|use_of| use_of.category == Category::Burn)
+            {
                 return c(Cohort::Burn);
             }
             // Lock platforms glue a per-locker stake credential onto one shared

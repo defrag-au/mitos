@@ -32,6 +32,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "address-registry-schema"
+version = "0.1.0"
+source = "git+https://github.com/theyexist/address-registry?rev=45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995#45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3913,12 +3921,14 @@ dependencies = [
 name = "mitos-cohort"
 version = "0.0.1"
 dependencies = [
- "address-registry",
  "hex",
  "mitos-dex-decode",
  "mitos-launchpad-decode",
+ "mitos-registry",
  "mitos-vesting-decode",
  "pallas-addresses 1.4.0",
+ "pallas-codec 1.4.0",
+ "pallas-primitives 1.4.0",
 ]
 
 [[package]]
@@ -4184,6 +4194,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mitos-registry"
+version = "0.0.1"
+dependencies = [
+ "address-registry-schema",
 ]
 
 [[package]]

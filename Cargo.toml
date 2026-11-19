@@ -25,6 +25,10 @@ members = [
     # `mitos-pool-observe` links the chain-walk output shape.
     "crates/mitos-cohort",
     "crates/mitos-pool-observe",
+    # The address registry as mitos reads it: the hosted behaviour and
+    # stake-service tables, parsed and indexed. Pure, so a walk, a tool and a
+    # wasm module share one set of lookups.
+    "crates/mitos-registry",
     # A launch is a token's most consequential single event and rendered as a
     # transfer to an unnamed script until 2026-09-08. Beside the DEX decoders
     # rather than inside them: a bonding curve is not constant-product, its
@@ -230,6 +234,12 @@ chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9f
 # bump this `rev` and re-comment that block together, never one without the other.
 chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
 asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
+
+# The registry's SCHEMA, from its own repository. The DATA is hosted — the
+# behaviour and stake-service tables are fetched, or embedded at build time, from
+# the rev-pinned URL — so this pin moves when a FIELD changes, never when a
+# contract is added. That is the whole point of the split.
+address-registry-schema = { git = "https://github.com/theyexist/address-registry", rev = "45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
