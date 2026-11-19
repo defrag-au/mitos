@@ -1,6 +1,6 @@
 //! The on-disk contract: columns, and the stamp in the footer.
 
-use parquet::format::KeyValue;
+use parquet::file::metadata::KeyValue;
 
 use crate::{Error, Result};
 

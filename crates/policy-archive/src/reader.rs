@@ -56,7 +56,16 @@ pub fn footer_length(last_eight: &[u8]) -> Result<u64> {
         .get(last_eight.len().saturating_sub(8)..)
         .and_then(|s| s.try_into().ok())
         .ok_or(Error::TooShort(last_eight.len() as u64))?;
-    let meta = ParquetMetaDataReader::decode_footer_tail(&tail)?.metadata_length() as u64;
+    // Parquet's tail is a 4-byte little-endian metadata length followed by
+    // `PAR1`. parquet 0.60 dropped its thrift dependency and with it the
+    // public tail parser (`ParquetMetaDataReader::decode_footer_tail`), so the
+    // layout is read here — this is the whole of it, magic included.
+    if &tail[4..] != b"PAR1" {
+        return Err(Error::Parquet(parquet::errors::ParquetError::General(
+            "not a parquet file: the footer does not end in `PAR1`".to_owned(),
+        )));
+    }
+    let meta = u64::from(u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]));
     Ok(meta + FOOTER_TAIL)
 }
 

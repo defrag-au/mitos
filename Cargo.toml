@@ -284,8 +284,11 @@ libc = "0.2"
 reflink-copy = "0.1"
 
 # Embedded sqlite for the market-ledger walker's operational ledger. `bundled`
-# compiles sqlite from source (on-box build, no system dep).
-rusqlite = { version = "0.32", features = ["bundled"] }
+# compiles sqlite from source (on-box build, no system dep). 0.43 carries
+# libsqlite3-sys 0.39, which is what RUSTSEC-2026-0459 needs, and moved the
+# u64/usize `FromSql`/`ToSql` impls behind `fallible_uint` — the ledgers store
+# slot numbers as u64, so it is on.
+rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
 
 # Concurrent map for the dispatcher's per-Apply claim coordinator
 # (residual pass — see `docs/design/DOMAIN_REFACTOR.md`). Lock-free
@@ -300,8 +303,11 @@ config = { version = "0.14", default-features = false, features = ["toml"] }
 # HTTP client for the diff harness (polls both workers' read APIs).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 # S3-compatible client for R2 — the policy archive publisher (token-ledger).
-# `aws` only; no cloud SDK, no arrow.
-object_store = { version = "0.12", default-features = false, features = ["aws"] }
+# `aws` only; no cloud SDK, no arrow. 0.14 is the release that moved to
+# quick-xml 0.41, which is what RUSTSEC-2026-0194/0195 need — 0.13 still
+# resolves quick-xml 0.39. It brings its own reqwest 0.13 beside the
+# workspace's 0.12; they collapse when the rest of the tree moves.
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
 
 [profile.release]
 opt-level = 3

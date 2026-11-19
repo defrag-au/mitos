@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use cf_publish::{Client, ObjPath, Targets};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use crate::archive::{MANIFEST, Manifest};
 use crate::publish::PREFIX;

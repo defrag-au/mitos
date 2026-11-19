@@ -1,0 +1,122 @@
+# cargo-deny — the supply-chain gate. The same command CI runs, locally:
+#
+#   direnv exec . cargo deny --all-features check advisories bans sources
+#
+# The devshell ships cargo-deny 0.20.2 while `cargo-deny-action` ships 0.21, so
+# every lint level this repository relies on is written down here rather than
+# left to a default that moved under us.
+#
+# An entry in `ignore` is a decision, not a silence: it names the advisory, says
+# what holds it and what would release it. Revisit 2026-12-19.
+
+[advisories]
+version = 2
+
+# A yanked version still resolves, so it is a signal the bump is overdue rather
+# than a vulnerability. The first run found five — chacha20, fjall, lsm-tree,
+# lz4_flex, spin — and all five moved in the same lockfile update that cleared
+# the fixable advisories.
+yanked = "deny"
+
+ignore = [
+  # ── Unmaintained, and the advisory itself says so ──────────────────────
+  # Each of these is `unmaintained`, carries "No safe upgrade is available!"
+  # in the advisory, and is reached only transitively. There is no version to
+  # move to; the release is the parent crate's to make.
+  "RUSTSEC-2023-0089", # atomic-polyfill, via heapless 0.7 -> postcard
+  "RUSTSEC-2025-0141", # bincode 1.3.3, complete per its authors
+  "RUSTSEC-2026-0543", # chrono, unmaintained notice
+  "RUSTSEC-2026-0542", # humantime, unmaintained notice
+  "RUSTSEC-2025-0119", # number_prefix, via indicatif
+  "RUSTSEC-2024-0436", # paste, unmaintained notice
+  "RUSTSEC-2026-0441", # pin-utils, unmaintained notice
+  "RUSTSEC-2025-0134", # rustls-pemfile, superseded by rustls-pki-types
+  "RUSTSEC-2024-0449", # unsafe-libyaml, via serde_yaml
+
+  # ── Vulnerable, and held by a dependency this repository pins ──────────
+  # Each of these has a patched release, so these are open items rather than
+  # accepted risk: the bump named on each line is the fix, and the entry comes
+  # out when it lands. `cargo update --precise` reports exactly the requirement
+  # quoted here.
+  #
+  # webpki-roots >= 1.0.10, and neither holder can move to it today. Both were
+  # tried on 2026-11-19 and both are pinned upstream:
+  #   - tokio-tungstenite 0.30.0, the latest, still declares
+  #     `webpki-roots = "0.26.0"`;
+  #   - reqwest 0.12 stays because dolos, mithril-client and
+  #     opentelemetry-http require it, and opentelemetry-otlp turns on its
+  #     `rustls-tls-webpki-roots` feature, which turns on hyper-rustls' copy.
+  # The entry comes out when those two move; ours is not the constraint.
+  "RUSTSEC-2026-0381",
+]
+
+[bans]
+# The workspace accepts some duplication (pallas 0.32 and 1.4, tonic 0.12 and
+# 0.13, redb 2 and 3), most of it inherited from the dolos and mithril trees.
+# Warn now, ratchet to "deny" once the list is short enough to read.
+multiple-versions = "warn"
+# A literal wildcard lets `cargo update` cross a semver boundary. A path
+# dependency is also a `*` requirement, so this reports every internal
+# `{ path = ".." }` as well — which is why it is warn, not deny.
+wildcards = "warn"
+
+# cargo-deny 0.21 denies a crate one member declares directly and another
+# inherits, and any crate two members declare with no workspace entry at all.
+# `unused` false-positives on optional dependencies a consumer enables but no
+# member of this workspace does. Both are spelled out rather than left to the
+# 0.20 default, which is the disagreement that bit shared-crates first.
+[bans.workspace-dependencies]
+duplicates = "warn"
+unused = "warn"
+
+[sources]
+# Everything resolves from crates.io or one of these four git repositories.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  "https://github.com/defrag-au/pallas",
+  "https://github.com/defrag-au/shared-crates",
+  "https://github.com/theyexist/address-registry",
+  "https://github.com/txpipe/dolos",
+]
+
+# ── Licences are analysed here but deliberately NOT gated yet ───────────────
+# `licenses` is absent from the workflow's command. The allow-list below is
+# every licence expression in the resolved graph, read from the manifests, but
+# the check would still fail on crates this repository does not own: seven
+# `defrag-au/shared-crates` crates (cardano-assets, chain-events, chain-ledger,
+# chains, pipeline-types, tx_insights, wasm_safe_serde) and the six dolos
+# crates declare no licence at all. That is the same sweep shared-crates
+# describes; it belongs there, not here.
+#
+# The two crates here that were missing `license.workspace = true` — chain-sieve
+# and token-tape — have been given it.
+#
+# Deliberately outside the allow-list, and a decision rather than an oversight:
+#   GPL-2.0-only          ittapi / ittapi-sys, under wasmtime's profiling feature
+#   LGPL-2.1-or-later     r-efi, via getrandom's UEFI arm
+#   MPL-2.0               webpki-roots 0.26.8 — the same crate RUSTSEC-2026-0381
+#                         is waiting on hyper-rustls and tokio-tungstenite to leave
+# Add "licenses" to the workflow command once the unlicensed crates above carry
+# a licence expression, and settle those three at the same time.
+
+[licenses]
+version = 2
+
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "BlueOak-1.0.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0", # webpki-roots 1.x: root-certificate data, not code
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
