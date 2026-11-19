@@ -1,0 +1,29 @@
+[package]
+name = "mitos-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The address registry as mitos reads it: the behaviour and stake-service tables, loaded from the hosted artefacts, with the lookups every consumer needs. No I/O, so it links into wasm and native tools alike."
+
+[features]
+# Embed the pinned artefacts under `data/`. For a consumer that cannot fetch —
+# the wasm module — and for offline tests. Off by default: a native tool fetches
+# the same files at the rev-pinned URL and records what it read.
+pinned = []
+# Read the artefacts from a local `resolved/` directory and stamp them. No HTTP.
+local = ["dep:sha2"]
+# …and fetch them from the hosted repository when the directory is not named.
+fetch = ["local", "dep:reqwest"]
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+# The schema, not the data: `theyexist/address-registry` pins the shape of the
+# artefacts and this crate parses them. The data changes without a rev bump.
+address-registry-schema.workspace = true
+# `fetch` only. Blocking, because every caller is a command that fetches once.
+reqwest = { workspace = true, features = ["blocking"], optional = true }
+# `fetch` only: the stamp is the sha256 of the bytes read.
+sha2 = { version = "0.10", optional = true }

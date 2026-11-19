@@ -23,14 +23,25 @@ license.workspace = true
 # bindings return futures; `component-model` enables WIT-defined
 # components. We deliberately do NOT enable `component-model-async`
 # — that's the stream/future ABI which our WIT does not use and
-# wasmtime 44 documents as "_very_ incomplete".
-wasmtime = { version = "44", features = ["async", "component-model"] }
+# wasmtime documents as "_very_ incomplete".
+#
+# ⚠️ The major tracks the `wasi:cli` package version the Rust
+# toolchain's `wasm32-wasip2` std imports: wasmtime-wasi 44 speaks
+# `wasi:cli@0.2.6` and 48 speaks `0.2.12`, which is what the current
+# channel's std asks for. A toolchain bump that moves the WASI version to one
+# whose interfaces differ fails component instantiation with "component imports
+# instance `wasi:cli/exit@0.2.x`, but a matching implementation was not found" —
+# the same mismatch would stop the HOST loading a module this build
+# produced, so the two move together. The version is declared in
+# `wasmtime-wasi`'s `src/p2/wit/deps/cli.wit`; read it before moving
+# either side.
+wasmtime = { version = "48", features = ["async", "component-model"] }
 # WASI Preview 2 host impls. wasm32-wasip2 std lib imports
 # `wasi:io`, `wasi:cli`, `wasi:clocks` etc. by default; we don't
 # rely on any of them in the v1 ABI but the linker still needs
 # matching impls so component instantiation succeeds. We feed
 # every module a default WASI context (no real I/O surface).
-wasmtime-wasi = { version = "44" }
+wasmtime-wasi = { version = "48" }
 
 # Data plane — module host fns proxy through this for chain reads.
 mitos-data-plane = { path = "../mitos-data-plane" }

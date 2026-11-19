@@ -1661,6 +1661,8 @@ impl Scan<'_> {
                                 unit_amount: *qty,
                                 datum: datum.map(|d| d.to_vec()),
                                 decoded,
+                                output_index: Some(out.index),
+                                spent: false,
                             });
                         }
                     }
@@ -1674,6 +1676,32 @@ impl Scan<'_> {
                 let touches_us = !deltas.is_empty() || !net_mint.is_empty();
                 if !touches_us {
                     continue;
+                }
+                // SPENDS. Every input of a transaction that touched the policy
+                // is a position that no longer stands, and a lock claimed is
+                // exactly such an input. The descent is newest-first, so the
+                // spend is seen before the position it names; the reader joins
+                // the two by `tx_hash#index`, which is why the row carries no
+                // unit and no address of its own — only the position. Inputs
+                // of transactions that never touch the policy are not written:
+                // a position only this policy's walk recorded can only be
+                // spent by a transaction this walk sees.
+                if self.observations.is_some() {
+                    for inp in &dtx.inputs {
+                        seen.push(policy_archive::Observation {
+                            slot,
+                            block_time,
+                            tx_hash: inp.oref.0.to_vec(),
+                            address: String::new(),
+                            lovelace: 0,
+                            unit_name: Vec::new(),
+                            unit_amount: 0,
+                            datum: None,
+                            decoded: None,
+                            output_index: Some(inp.oref.1),
+                            spent: true,
+                        });
+                    }
                 }
                 // READ BEFORE — by an earlier pass or a detour. Its outputs
                 // have just resolved whatever was waiting on them; its rows

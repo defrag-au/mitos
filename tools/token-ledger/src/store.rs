@@ -1307,10 +1307,14 @@ impl Ledger {
     /// exposed as its own subcommand — registering a new sink or landing a new
     /// pool decoder should reclassify history without touching the chain.
     /// Returns the number of parties classified.
-    /// Sinks are no longer a parameter: they come from `address-registry` by
-    /// credential, inside `classify`. A sink is a property of the script, not
-    /// of the token that happened to reach it.
-    pub fn classify_parties(&mut self, lock_creds: &[[u8; 28]]) -> Result<usize> {
+    /// Sinks are no longer a parameter: they come from the hosted address
+    /// registry by credential, inside `classify`. A sink is a property of the
+    /// script, not of the token that happened to reach it.
+    pub fn classify_parties(
+        &mut self,
+        lock_creds: &[[u8; 28]],
+        registry: &mitos_registry::Registry,
+    ) -> Result<usize> {
         let pools = self.pool_addresses()?;
         let addresses: Vec<(i64, String)> = {
             let mut stmt = self.conn.prepare("SELECT party_id, address FROM party")?;
@@ -1323,7 +1327,7 @@ impl Ledger {
             let mut stmt =
                 tx.prepare("UPDATE party SET cohort = ?2, basis = ?3 WHERE party_id = ?1")?;
             for (id, address) in &addresses {
-                let c = mitos_cohort::classify(address, &pools, lock_creds);
+                let c = mitos_cohort::classify_with(address, &pools, lock_creds, registry);
                 stmt.execute(params![id, c.cohort.as_str(), c.basis])?;
             }
         }

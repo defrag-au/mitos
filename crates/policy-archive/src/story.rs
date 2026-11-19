@@ -768,6 +768,8 @@ mod tests {
                 reserve_source: "test".into(),
                 pricing: pricing::CONSTANT_PRODUCT.into(),
             }),
+            output_index: Some(0),
+            spent: false,
         }
     }
 

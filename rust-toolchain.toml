@@ -1,0 +1,21 @@
+# One compiler, named exactly, for CI and for anyone outside the Nix devshell.
+#
+# The channel is not a style choice. A toolchain's `wasm32-wasip2` std imports
+# one `wasi:cli@0.2.x`, and `wasmtime-wasi` implements exactly one. Wasmtime
+# resolves those imports by exact name, then by semver-compatible version, then
+# typechecks the interface — so a toolchain that moves to a version whose
+# interfaces *differ* stops every module instantiating. That is what
+# "component imports instance `wasi:cli/exit@0.2.12`, but a matching
+# implementation was not found in the linker" meant. Move this pin only
+# together with the `wasmtime` major in `crates/mitos-platform/Cargo.toml` —
+# `crates/mitos-platform/tests/wasi_linkage.rs` names both sides if they drift.
+#
+# CI pins the same number in `.github/workflows/ci.yaml` (the action takes the
+# version as an input, not from this file). The Nix devshell comes from
+# defrag-nix (`fenix.packages.<system>.stable`), so it is pinned by defrag-nix's
+# lock rather than here.
+
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown", "wasm32-wasip2"]

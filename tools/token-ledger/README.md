@@ -192,3 +192,14 @@ carrying them forward silently drops every movement graph.
 - **`Manifest` deserialises with serde ignoring unknown fields**, so an old
   binary reads a new manifest happily and then silently drops the new field on
   its next write. Stop the daemon, swap, start it — in that order.
+- **An archive walked before 2026-11-11 reads every lock as still standing.**
+  Spends are recorded as observation rows (`spent = true`) and joined by
+  `policy_archive::live`; a file without them has nothing to join, so a
+  claimed lock stays in the tip decomposition and the address's balance is
+  scaled across it. The fix is a re-walk (`rewalk-archives.sh`), not a refold.
+- **A pool's providers come from ANOTHER policy's archive** — its LP token's.
+  Until that is walked the summary reports the pool `unavailable` and every
+  provider reads zero (MEASURED 2026-11-11: $PERP's 61.2M pool units, to
+  nobody). `serve` now walks the LP policy whenever a fold finds it missing
+  and refolds the token when that walk lands; `summary` by hand only prints a
+  note, since there is no scheduler to queue it.

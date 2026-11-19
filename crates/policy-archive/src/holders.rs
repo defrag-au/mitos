@@ -304,9 +304,251 @@ impl HoldersFile {
     }
 }
 
+/// One party's balance at a reading, and what it held THROUGHOUT each window before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldThrough {
+    /// The party key, as [`key_of`] names it.
+    pub key: String,
+    /// The balance at the reading.
+    pub now: i64,
+    /// For each window asked, in the order asked: the lowest balance between the window's start and
+    /// the reading, inclusive — the units that were in the wallet the whole time. Never negative,
+    /// never more than `now`.
+    pub held: Vec<i64>,
+}
+
+/// What each party held throughout the `windows` (seconds) before `at_unix`, from movements alone.
+///
+/// The reading a maturity rule needs for a fungible token: a unit counts as held for a window only
+/// if the balance never dipped below it inside the window, so moving units out and back — or into
+/// a fresh wallet the day before a snapshot — does not age them. Settled 2026-11-11 for $PERP,
+/// which matures on the same schedule as a Perp.
+///
+/// A transaction's rows for one party are netted before they are applied: a wallet that rotates
+/// payment addresses inside one transaction did not, for a moment, hold less. Movements after
+/// `at_unix` are ignored. Parties whose balance at the reading is not positive are left out.
+pub fn held_through<'a>(
+    movements: impl Iterator<Item = &'a Movement>,
+    at_unix: u64,
+    windows: &[u64],
+) -> Vec<HeldThrough> {
+    // A transaction in the chain's own order: block time, slot, position, hash.
+    type TxOrder<'t> = (u64, u64, u32, &'t [u8]);
+    // Transaction → party → net.
+    let mut by_tx: std::collections::BTreeMap<TxOrder<'a>, HashMap<String, i64>> =
+        std::collections::BTreeMap::new();
+    let mut keys: HashMap<&'a str, String> = HashMap::new();
+    for m in movements {
+        if m.is_placeholder() || m.address.is_empty() || m.block_time > at_unix {
+            continue;
+        }
+        let key = keys
+            .entry(m.address.as_str())
+            .or_insert_with(|| key_of(&m.address))
+            .clone();
+        *by_tx
+            .entry((m.block_time, m.slot, m.tx_index, m.tx_hash.as_slice()))
+            .or_default()
+            .entry(key)
+            .or_default() += m.amount;
+    }
+    let starts: Vec<u64> = windows
+        .iter()
+        .map(|seconds| at_unix.saturating_sub(*seconds))
+        .collect();
+    // Party → (balance, the lowest balance seen since each window's start).
+    let mut state: HashMap<String, (i64, Vec<i64>)> = HashMap::new();
+    for ((time, ..), deltas) in by_tx {
+        for (key, delta) in deltas {
+            let (balance, lows) = state
+                .entry(key)
+                .or_insert_with(|| (0, vec![0; starts.len()]));
+            *balance += delta;
+            for (low, start) in lows.iter_mut().zip(&starts) {
+                if time <= *start {
+                    // Still before the window: its floor is the balance it opens with.
+                    *low = *balance;
+                } else {
+                    *low = (*low).min(*balance);
+                }
+            }
+        }
+    }
+    let mut out: Vec<HeldThrough> = state
+        .into_iter()
+        .filter(|(_, (balance, _))| *balance > 0)
+        .map(|(key, (now, lows))| HeldThrough {
+            key,
+            now,
+            held: lows.into_iter().map(|low| low.clamp(0, now)).collect(),
+        })
+        .collect();
+    out.sort_by(|a, b| b.now.cmp(&a.now).then(a.key.cmp(&b.key)));
+    out
+}
+
+/// One interval a party's balance stayed above zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldSpan {
+    /// The slot of the transaction that took the balance above zero.
+    pub from_slot: u64,
+    /// Its block time.
+    pub from_unix: u64,
+    /// The block time of the transaction that took it back to zero, or `None` while it is held.
+    pub to_unix: Option<u64>,
+}
+
+/// Every party's intervals of a balance above zero, oldest first, keyed as [`key_of`] names it.
+///
+/// The token's equivalent of a Perp's holding lots, for a predicate about holding it at all or for
+/// so long without a break: how much was held does not matter, only that some was. A transaction's
+/// rows for one party are netted first, as [`held_through`] nets them, so rotating addresses inside
+/// one transaction is not a break.
+pub fn held_spans<'a>(
+    movements: impl Iterator<Item = &'a Movement>,
+) -> std::collections::BTreeMap<String, Vec<HeldSpan>> {
+    type TxOrder<'t> = (u64, u64, u32, &'t [u8]);
+    let mut by_tx: std::collections::BTreeMap<TxOrder<'a>, HashMap<String, i64>> =
+        std::collections::BTreeMap::new();
+    let mut keys: HashMap<&'a str, String> = HashMap::new();
+    for m in movements {
+        if m.is_placeholder() || m.address.is_empty() {
+            continue;
+        }
+        let key = keys
+            .entry(m.address.as_str())
+            .or_insert_with(|| key_of(&m.address))
+            .clone();
+        *by_tx
+            .entry((m.block_time, m.slot, m.tx_index, m.tx_hash.as_slice()))
+            .or_default()
+            .entry(key)
+            .or_default() += m.amount;
+    }
+    let mut balances: HashMap<String, i64> = HashMap::new();
+    let mut spans: std::collections::BTreeMap<String, Vec<HeldSpan>> =
+        std::collections::BTreeMap::new();
+    for ((time, slot, ..), deltas) in by_tx {
+        for (key, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let balance = balances.entry(key.clone()).or_default();
+            let before = *balance;
+            *balance += delta;
+            let held = spans.entry(key).or_default();
+            if before <= 0 && *balance > 0 {
+                held.push(HeldSpan {
+                    from_slot: slot,
+                    from_unix: time,
+                    to_unix: None,
+                });
+            } else if before > 0
+                && *balance <= 0
+                && let Some(open) = held.last_mut()
+            {
+                open.to_unix = Some(time);
+            }
+        }
+    }
+    spans.retain(|_, held| !held.is_empty());
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Held, emptied, held again: two spans, the second still open. Moving part of the balance
+    /// out is not a break, and a rotation inside one transaction is not either.
+    #[test]
+    fn held_spans_break_only_when_the_balance_reaches_zero() {
+        let a = "addr_test_holder";
+        let row = |slot: u64, tx: u8, amount: i64| Movement {
+            slot,
+            block_time: 1_000 + slot,
+            tx_hash: vec![tx],
+            unit_name: b"U".to_vec(),
+            address: a.into(),
+            amount,
+            net_mint: 0,
+            tx_index: 0,
+        };
+        let rows = [
+            row(10, 1, 100),
+            row(20, 2, -40), // partial: still held
+            row(30, 3, -60), // empty
+            row(40, 4, 5),   // back
+            row(50, 5, -5),  // rotated out…
+            row(50, 5, 5),   // …and in, in the same transaction
+        ];
+        let spans = held_spans(rows.iter());
+        assert_eq!(
+            spans.get(a).map(Vec::as_slice),
+            Some(
+                &[
+                    HeldSpan {
+                        from_slot: 10,
+                        from_unix: 1_010,
+                        to_unix: Some(1_030)
+                    },
+                    HeldSpan {
+                        from_slot: 40,
+                        from_unix: 1_040,
+                        to_unix: None
+                    },
+                ][..]
+            )
+        );
+    }
+
+    /// A wallet that held 100 for months, received 50 three days ago, and briefly sent 30 away
+    /// and back six days ago: through four days it held 100, through eight only 70.
+    #[test]
+    fn held_through_is_the_lowest_balance_inside_each_window() {
+        let day = 86_400;
+        let at = 100 * day;
+        let a = "addr_test_holder";
+        let at_day = |d: u64, tx: u8, amount: i64| Movement {
+            slot: d,
+            block_time: at - d * day,
+            tx_hash: vec![tx],
+            unit_name: b"U".to_vec(),
+            address: a.into(),
+            amount,
+            net_mint: 0,
+            tx_index: 0,
+        };
+        let rows = [
+            at_day(90, 1, 100), // long held
+            at_day(6, 2, -30),  // out, six days ago
+            at_day(5, 3, 30),   // back the next day
+            at_day(3, 4, 50),   // new, three days ago
+        ];
+        let read = held_through(rows.iter(), at, &[4 * day, 8 * day]);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].now, 150);
+        assert_eq!(read[0].held, vec![100, 70]);
+        // A reading before the new arrival does not see it.
+        let earlier = held_through(rows.iter(), at - 4 * day, &[day]);
+        assert_eq!(earlier[0].now, 100);
+        // Rows netted within one transaction never dip.
+        let rotate = [
+            at_day(90, 1, 100),
+            Movement {
+                amount: -100,
+                ..at_day(2, 9, 0)
+            },
+            Movement {
+                amount: 100,
+                ..at_day(2, 9, 0)
+            },
+        ];
+        assert_eq!(
+            held_through(rotate.iter(), at, &[4 * day])[0].held,
+            vec![100]
+        );
+    }
 
     fn mv(addr: &str, amount: i64) -> Movement {
         Movement {

@@ -222,6 +222,48 @@ impl TerminalParty {
     }
 }
 
+/// The SHARED address registry for this run — the contracts and stake keys that
+/// are services rather than this project.
+///
+/// The data is hosted. `offline` means no network at all, so the bytes can then
+/// only come from `ADDRESS_REGISTRY_DIR`; otherwise a failed fetch falls back to
+/// the verified cache in `mitos_registry::source`, loudly.
+///
+/// The binary's pinned copy is deliberately not the fallback: a stale table that
+/// looks current is the failure this migration exists to remove.
+pub fn load_shared(offline: bool) -> Result<mitos_registry::Registry> {
+    use mitos_registry::source::Origin;
+
+    if offline && std::env::var_os("ADDRESS_REGISTRY_DIR").is_none() {
+        bail!(
+            "--offline needs ADDRESS_REGISTRY_DIR — the shared address registry is \
+             fetched, not compiled in"
+        );
+    }
+    let loaded = mitos_registry::source::load().context("loading the address registry")?;
+    match loaded.origin {
+        Origin::Fetched => {}
+        Origin::Dir => tracing::debug!(
+            rev = loaded.stamp.rev,
+            "address registry: read from ADDRESS_REGISTRY_DIR"
+        ),
+        Origin::Cache => tracing::warn!(
+            rev = loaded.stamp.rev,
+            generated_at = %loaded.stamp.generated_at,
+            "address registry: FETCH FAILED — using the cached copy. A contract added \
+             since it was written will read as unnamed"
+        ),
+    }
+    if let Some(reason) = &loaded.cache_note {
+        tracing::warn!(
+            reason,
+            "address registry: fetched, but the cache was NOT written — the next failed \
+             fetch has no fallback"
+        );
+    }
+    Ok(loaded.registry)
+}
+
 impl Registry {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -319,19 +361,28 @@ impl Registry {
     /// wallet alone holds over a thousand unspent fee UTxOs from unrelated
     /// collections. Knowing it once, centrally, means each new collection gets
     /// the guard for free instead of waiting for someone to notice.
-    pub fn terminal_parties(&self) -> impl Iterator<Item = Party> + '_ {
+    pub fn terminal_parties<'a>(
+        &'a self,
+        shared: &'a mitos_registry::Registry,
+    ) -> impl Iterator<Item = Party> + 'a {
         self.declared_terminal().chain(
-            address_registry::STAKE_REGISTRY
-                .keys()
-                .map(|s| Party::cardano_stake((*s).to_string())),
+            shared
+                .stakes()
+                .entries
+                .iter()
+                .map(|entry| Party::cardano_stake(entry.stake_address())),
         )
     }
 
     /// Known shared services seated automatically, with their registry labels.
-    pub fn registry_services() -> impl Iterator<Item = (String, &'static str)> {
-        address_registry::STAKE_REGISTRY
-            .entries()
-            .map(|(k, v)| ((*k).to_string(), v.label))
+    pub fn registry_services(
+        shared: &mitos_registry::Registry,
+    ) -> impl Iterator<Item = (String, &str)> + '_ {
+        shared
+            .stakes()
+            .entries
+            .iter()
+            .map(|entry| (entry.stake_address(), entry.label.as_str()))
     }
 }
 
@@ -477,14 +528,15 @@ mod tests {
     #[test]
     fn known_services_are_terminal_even_when_the_toml_declares_none() {
         let r = Registry::parse(EXAMPLE).unwrap();
+        let shared = mitos_registry::Registry::pinned();
         assert_eq!(r.declared_terminal().count(), 0, "the TOML declares none");
         assert!(
-            r.terminal_parties().count() > 0,
+            r.terminal_parties(&shared).count() > 0,
             "but the address registry's shared services are still seated terminal"
         );
         let anvil = "stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr";
         assert!(
-            r.terminal_parties().any(|p| p.key == anvil),
+            r.terminal_parties(&shared).any(|p| p.key == anvil),
             "Anvil (the mint provider) must never be expandable"
         );
     }

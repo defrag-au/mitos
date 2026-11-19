@@ -431,12 +431,22 @@ pub fn run(args: WalkArgs) -> Result<()> {
     if let Some(dir) = &args.events_out {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // One fetch for the whole run: every ledger this invocation builds is
+    // classified against the same bytes.
+    let loaded = crate::address_registry::load()?;
     for token in &tokens {
         let out = args
             .events_out
             .as_ref()
             .map(|dir| dir.join(format!("{}.ndjson", token.name)));
-        run_one(&args, &data_dir, token, &lock_creds, out.as_deref())?;
+        run_one(
+            &args,
+            &data_dir,
+            token,
+            &lock_creds,
+            &loaded.registry,
+            out.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -459,6 +469,7 @@ fn run_profile(args: &WalkArgs, path: &Path) -> Result<()> {
     if let Some(dir) = &args.events_out {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    let loaded = crate::address_registry::load()?;
 
     for collection in profile.collections() {
         let mut token = registry::policy_entry(&collection.policy)?;
@@ -487,7 +498,14 @@ fn run_profile(args: &WalkArgs, path: &Path) -> Result<()> {
             .events_out
             .as_ref()
             .map(|dir| dir.join(format!("{}.ndjson", collection.id)));
-        run_one(&one, &data_dir, &token, &[], out.as_deref())?;
+        run_one(
+            &one,
+            &data_dir,
+            &token,
+            &[],
+            &loaded.registry,
+            out.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -497,6 +515,7 @@ fn run_one(
     data_dir: &Path,
     token: &registry::TokenEntry,
     lock_creds: &[[u8; 28]],
+    registry: &mitos_registry::Registry,
     events_out: Option<&Path>,
 ) -> Result<()> {
     let policy = token.policy_bytes()?;
@@ -834,6 +853,7 @@ fn run_one(
                 let is_lock_platform = cred.as_ref().is_some_and(|c| {
                     mitos_vesting_decode::crowd_lock::is_crowd_lock(c)
                         || mitos_vesting_decode::snek_fun::is_snek_fun(c)
+                        || mitos_vesting_decode::perps_staking::is_perps_staking(c)
                 });
 
                 let (unlock_ts_ms, owner_pkh) = if is_lock_platform {
@@ -1056,7 +1076,7 @@ fn run_one(
 
     // Classify from the addresses just recorded. Derived, so it costs a pass
     // over the party table and never a re-walk.
-    let classified = ledger.classify_parties(lock_creds)?;
+    let classified = ledger.classify_parties(lock_creds, registry)?;
     tracing::info!(
         classified,
         lock_platforms = lock_creds.len(),
@@ -1140,10 +1160,11 @@ fn run_one(
 /// function of the stored address rather than something the walk decided.
 pub fn classify(db: &std::path::Path, tokens: &std::path::Path) -> Result<()> {
     let mut ledger = Ledger::open(db).with_context(|| format!("opening {}", db.display()))?;
-    // Sinks are no longer listed from config — they live in
-    // `address-registry`, by credential, and `classify` looks each party's own
-    // credential up. Nothing to enumerate here, and nothing to get out of step
-    // with what the classifier actually consults.
+    let loaded = crate::address_registry::load()?;
+    // Sinks are no longer listed from config — they live in the hosted address
+    // registry, by credential, and `classify` looks each party's own credential
+    // up. Nothing to enumerate here, and nothing to get out of step with what
+    // the classifier actually consults.
     let platforms = registry::load_lock_platforms(tokens)?;
     for p in &platforms {
         println!(
@@ -1157,7 +1178,7 @@ pub fn classify(db: &std::path::Path, tokens: &std::path::Path) -> Result<()> {
         .iter()
         .map(registry::LockPlatform::cred_bytes)
         .collect::<Result<_>>()?;
-    let n = ledger.classify_parties(&creds)?;
+    let n = ledger.classify_parties(&creds, &loaded.registry)?;
     println!(
         "classified {n} parties against the registry's burn sinks and {} lock platform(s)",
         creds.len()

@@ -2132,7 +2132,7 @@ fn fold(a: FoldArgs) -> Result<()> {
     // catalogue that publishes them pins the book's boundary. It is constructed
     // either way — `--book` is what makes it reachable from the walk, and an inert
     // pass costs one registry walk.
-    let mut offers = OfferPass::new();
+    let mut offers = OfferPass::load()?;
     // Reused across chunks: `fs::read` allocates and frees ~25 MB per chunk, and
     // glibc serves that from mmap, so every chunk re-faults 6,400 pages. Keeping
     // the buffer mapped pays that once.
@@ -2812,7 +2812,7 @@ fn pilot(a: PilotArgs) -> Result<()> {
 
     let mut sink = PilotSink {
         book: Book::create(&a.book, a.book_compact_mb * 1024 * 1024)?,
-        offers: OfferPass::new(),
+        offers: OfferPass::load()?,
         plan: BlockPlan::default(),
         dec: DecodeStats::default(),
         hashes: Vec::new(),
@@ -7372,7 +7372,7 @@ mod tests {
 
         // A candidate sits at a real venue: jpg's collection-offer address, taken from
         // the registry, so a change there cannot leave this test asserting a string.
-        let venue = offers::venues()
+        let venue = offers::venues(&mitos_registry::Registry::pinned())
             .into_iter()
             .find(|v| v.address.is_some())
             .expect("an address-shaped venue is registered");
@@ -7383,7 +7383,7 @@ mod tests {
         let cancelled = (Hash::<32>::from([8u8; 32]), 1);
 
         let mut book = Book::create(&dir, 1 << 20).expect("create");
-        let mut pass = OfferPass::new();
+        let mut pass = OfferPass::pinned();
         {
             let mut sink = Sink::Book(&mut book, &mut pass);
             sink.witness(hash, &cbor);

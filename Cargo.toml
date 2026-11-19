@@ -25,6 +25,10 @@ members = [
     # `mitos-pool-observe` links the chain-walk output shape.
     "crates/mitos-cohort",
     "crates/mitos-pool-observe",
+    # The address registry as mitos reads it: the hosted behaviour and
+    # stake-service tables, parsed and indexed. Pure, so a walk, a tool and a
+    # wasm module share one set of lookups.
+    "crates/mitos-registry",
     # A launch is a token's most consequential single event and rendered as a
     # transfer to an unnamed script until 2026-09-08. Beside the DEX decoders
     # rather than inside them: a bonding curve is not constant-product, its
@@ -175,8 +179,6 @@ license = "Apache-2.0"
 dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
-dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 # CARE: the transitive `utxorpc-spec` is pinned to 0.19.0 in Cargo.lock. dolos
 # v1.2.0's gRPC `v1beta/watch` builds against 0.19.0, but 0.19.2 made
@@ -221,15 +223,23 @@ pallas-crypto = "1.4.0"
 pallas-network = "1.4.0"
 
 # shared-crates
-cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
-pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
-chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3", features = ["cip14", "cip25"] }
+pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
+chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
 # The chain-neutral event vocabulary. `be4544a2` predates the crate, so this resolves
 # through the `[patch]` block at the bottom while the branch that carries it is local —
 # bump this `rev` and re-comment that block together, never one without the other.
-chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
-asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "0beb2274394099d1a1e36382af7558f0d19dce0f" }
+chain-events = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
+asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
+
+# The registry's SCHEMA, from its own repository. The DATA is hosted — the
+# behaviour and stake-service tables are fetched, or embedded at build time, from
+# the rev-pinned URL — so this pin moves when a FIELD changes, never when a
+# contract is added. That is the whole point of the split.
+#
+# The compiled `shared-crates/address-registry` crate this replaced is gone:
+# every consumer reads these tables through `crates/mitos-registry`.
+address-registry-schema = { git = "https://github.com/theyexist/address-registry", rev = "45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995" }
 
 # Async runtime + HTTP server.
 tokio = { version = "1", features = ["full"] }
@@ -328,7 +338,6 @@ strip = "symbols"
 # cardano-assets = { path = "../shared-crates/cardano-assets" }
 # pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
 # chain-ledger = { path = "../shared-crates/chain-ledger" }
-# address-registry = { path = "../shared-crates/address-registry" }
 # chain-events = { path = "../shared-crates/chain/chain-events" }
 
 # `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which

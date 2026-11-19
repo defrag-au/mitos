@@ -28,24 +28,87 @@ use policy_archive::summary::{
 };
 use policy_archive::{Observation, holders};
 
-use crate::archive::{History, holders_from, load_manifest, policy_dir, read_observations};
+use crate::archive::{
+    History, LockFor, holders_from, load_manifest, policy_dir, read_observations,
+};
 
 /// Build the tip decomposition for one policy.
 ///
 /// `movements` must already be filtered to user units, and `as_of` is the
 /// summary's `settled_to`.
+///
+/// `lock`, when given, is taken for the LP policy while its archive is read:
+/// that archive has a tail of its own, rewritten under its own landing lock.
 pub fn build(
     dir: &Path,
     as_of: u64,
     observations: &[Observation],
     movements: &[policy_archive::Movement],
+    lock: Option<LockFor>,
+    registry: &mitos_registry::Registry,
 ) -> Segmentation {
     let by_payment = payment_map(movements);
     let by_address = address_balances(movements);
     let by_key = representative_addresses(movements);
-    let vests = vesting(observations, &by_payment, &by_key, &by_address);
-    let lp = lp_decomposition(dir, observations, &by_address);
+    let vests = vesting(observations, &by_payment, &by_key, &by_address, registry);
+    let lp = lp_decomposition(dir, observations, &by_address, lock);
     Segmentation { as_of, vests, lp }
+}
+
+/// An LP policy this policy's decomposition needs and does not have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LpWanted {
+    /// The LP token's policy, hex.
+    pub policy: String,
+    /// A slot at or below the LP token's first mint, for when the policy index
+    /// does not know it: a day below the pool's first sighting here. A pool's LP
+    /// is minted in the transaction that creates the pool, so the first datum
+    /// naming that LP policy is at or after the mint, and a day under-shoots
+    /// it. A floor too high would produce a short archive that calls itself
+    /// complete — see the README's traps.
+    pub floor: u64,
+}
+
+/// One day of slots: how far [`LpWanted::floor`] under-shoots the first pool
+/// sighting.
+const LP_FLOOR_MARGIN_SLOTS: u64 = 86_400;
+
+/// The LP policy this archive's pool names, when that policy has no complete
+/// archive beside this one.
+///
+/// Without it the decomposition reports the pool `Unavailable` and every
+/// provider reads zero — MEASURED 2026-11-11 on $PERP: 61.2M units in the CSwap
+/// pool attributed to nobody, because nothing had ever walked its LP token.
+/// Walking it is small (50 transactions there), so the fold asks for it rather
+/// than leaving it to someone to notice.
+pub fn lp_wanted(dir: &Path, observations: &[Observation]) -> Option<LpWanted> {
+    let (_, datum) = latest_cswap_pool(observations)?;
+    if datum.lp_policy.is_empty() {
+        return None;
+    }
+    let policy = hex::encode(&datum.lp_policy);
+    let walked = dir
+        .parent()
+        .and_then(|root| load_manifest(&policy_dir(root, &policy)).ok().flatten())
+        .is_some_and(|m| m.completeness() == policy_archive::Completeness::Complete);
+    if walked {
+        return None;
+    }
+    let first_sighting = observations
+        .iter()
+        .filter(|o| o.address == cswap::POOL_SCRIPT_ADDR)
+        .filter(|o| {
+            o.datum
+                .as_deref()
+                .and_then(cswap::decode_pool_datum)
+                .is_some_and(|d| d.lp_policy == datum.lp_policy)
+        })
+        .map(|o| o.slot)
+        .min()?;
+    Some(LpWanted {
+        policy,
+        floor: first_sighting.saturating_sub(LP_FLOOR_MARGIN_SLOTS),
+    })
 }
 
 /// A lock observation, before its address's current balance is applied.
@@ -54,6 +117,33 @@ struct PendingVest {
     amount: u64,
     unlock_ts_ms: u64,
     style: VestStyle,
+    /// Unix seconds the position's output appeared: when it was opened.
+    opened_unix: u64,
+}
+
+/// One live lock or staking position, its amount scaled to what its address still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Position {
+    pub owner: String,
+    pub lock_address: String,
+    pub amount: u64,
+    pub unlock_ts_ms: u64,
+    pub style: VestStyle,
+    /// Unix seconds the position was opened. A maturity rule reads this: a position opened
+    /// inside its window is new, whatever its owner held before.
+    pub opened_unix: u64,
+}
+
+/// Every live position the archive observed, attributed to its owner — what [`build`]'s vests
+/// group by owner, flat and with each position's opening time.
+pub fn positions(
+    observations: &[Observation],
+    movements: &[policy_archive::Movement],
+    registry: &mitos_registry::Registry,
+) -> Vec<Position> {
+    let by_payment = payment_map(movements);
+    let by_address = address_balances(movements);
+    scaled_positions(observations, &by_payment, &by_address, registry)
 }
 
 fn payment_map(movements: &[policy_archive::Movement]) -> HashMap<String, String> {
@@ -122,16 +212,52 @@ fn vesting(
     by_payment: &HashMap<String, String>,
     by_key: &HashMap<String, String>,
     by_address: &HashMap<&str, i64>,
+    registry: &mitos_registry::Registry,
 ) -> Vec<VestOwner> {
+    let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
+    for position in scaled_positions(observations, by_payment, by_address, registry) {
+        let owner = owners
+            .entry(position.owner.clone())
+            .or_insert_with(|| VestOwner {
+                key: position.owner,
+                address: String::new(),
+                amount: 0,
+                locks: Vec::new(),
+            });
+        owner.amount = owner.amount.saturating_add(position.amount);
+        owner.locks.push(VestLock {
+            amount: position.amount,
+            unlock_ts_ms: position.unlock_ts_ms,
+            lock_address: position.lock_address,
+            style: position.style,
+        });
+    }
+    // The address each owner is named by, where the policy's movements saw one.
+    for owner in owners.values_mut() {
+        if let Some(address) = by_key.get(&owner.key) {
+            owner.address.clone_from(address);
+        }
+    }
+    owners.into_values().collect()
+}
+
+/// Every lock observation attributed to its owner, each address's set scaled to what the address
+/// still holds — a claimed lock's share leaves with it.
+fn scaled_positions(
+    observations: &[Observation],
+    by_payment: &HashMap<String, String>,
+    by_address: &HashMap<&str, i64>,
+    registry: &mitos_registry::Registry,
+) -> Vec<Position> {
     let mut pending: BTreeMap<String, Vec<PendingVest>> = BTreeMap::new();
     for o in observations {
-        let Some(style) = vest_style(&o.address) else {
+        let Some((style, shape)) = vest_style(&o.address, registry) else {
             continue;
         };
         let Some(datum) = o.datum.as_deref() else {
             continue;
         };
-        let Some(decoded) = mitos_vesting_decode::decode_vesting_datum(datum) else {
+        let Some((owner_pkh_hex, unlock_ts_ms)) = position_datum(shape, datum) else {
             continue;
         };
         let amount = u64::try_from(o.unit_amount).unwrap_or(0);
@@ -142,14 +268,15 @@ fn vesting(
             .entry(o.address.clone())
             .or_default()
             .push(PendingVest {
-                owner: owner_key(&o.address, &decoded.owner_pkh_hex, by_payment),
+                owner: owner_key(&o.address, &owner_pkh_hex, by_payment),
                 amount,
-                unlock_ts_ms: decoded.unlock_ts_ms,
+                unlock_ts_ms,
                 style,
+                opened_unix: o.block_time,
             });
     }
 
-    let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
+    let mut out: Vec<Position> = Vec::new();
     for (address, items) in pending {
         let current = by_address
             .get(address.as_str())
@@ -166,30 +293,17 @@ fn vesting(
             if amount == 0 {
                 continue;
             }
-            let owner = owners
-                .entry(item.owner.clone())
-                .or_insert_with(|| VestOwner {
-                    key: item.owner,
-                    address: String::new(),
-                    amount: 0,
-                    locks: Vec::new(),
-                });
-            owner.amount = owner.amount.saturating_add(amount);
-            owner.locks.push(VestLock {
+            out.push(Position {
+                owner: item.owner,
+                lock_address: address.clone(),
                 amount,
                 unlock_ts_ms: item.unlock_ts_ms,
-                lock_address: address.clone(),
                 style: item.style,
+                opened_unix: item.opened_unix,
             });
         }
     }
-    // The address each owner is named by, where the policy's movements saw one.
-    for owner in owners.values_mut() {
-        if let Some(address) = by_key.get(&owner.key) {
-            owner.address.clone_from(address);
-        }
-    }
-    owners.into_values().collect()
+    out
 }
 
 /// Scale observed amounts down to `current`, preserving their sum exactly.
@@ -225,16 +339,68 @@ fn scale_to(current: u64, observed: u64, amounts: Vec<u64>) -> Vec<u64> {
     out
 }
 
-fn vest_style(address: &str) -> Option<VestStyle> {
+fn vest_style(
+    address: &str,
+    registry: &mitos_registry::Registry,
+) -> Option<(VestStyle, DatumShape)> {
     let cred = mitos_cohort::payment_cred(address)?;
     if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred) {
-        Some(VestStyle::CrowdLock)
+        Some((VestStyle::CrowdLock, DatumShape::Timed))
     } else if mitos_vesting_decode::snek_fun::is_snek_fun(&cred) {
-        Some(VestStyle::SnekFun)
-    } else if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Vesting {
-        Some(VestStyle::Other)
+        Some((VestStyle::SnekFun, DatumShape::Timed))
+    } else if mitos_vesting_decode::perps_staking::is_perps_staking(&cred) {
+        // Staked, not vesting: its datum's date is when it was staked. `Other` keeps the
+        // summary's wire format, and the owner is what a reader of the vests needs.
+        Some((VestStyle::Other, DatumShape::Timed))
+    } else if mitos_vesting_decode::tsuru_staking::is_tsuru_staking(&cred) {
+        // Staked, and the datum carries NO date at all — the owner-only shape.
+        Some((VestStyle::Other, DatumShape::OwnerOnly))
+    } else if registry.uses(&hex::encode(cred)).iter().any(|use_of| {
+        matches!(
+            use_of.category,
+            mitos_registry::Category::Vesting
+                | mitos_registry::Category::Lock
+                // A registered staking site is the same claim as a registered
+                // lock: the units at it belong to whoever the datum names.
+                | mitos_registry::Category::Staking
+        )
+    }) {
+        // Registered, but no decoder here reads it: still a position, with no
+        // schedule — the same weaker evidence the cohort records.
+        Some((VestStyle::Other, DatumShape::Timed))
     } else {
         None
+    }
+}
+
+/// Which decoder reads a position's datum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatumShape {
+    /// The lock family: a timestamp and an owner. Its date is a deadline for a
+    /// lock and, at a staking site, when the position was staked — never a
+    /// maturity the decoder invents.
+    Timed,
+    /// An owner and nothing else: a staking site that records no date at all.
+    OwnerOnly,
+}
+
+/// The owner a position's datum names, and the timestamp it carries when it
+/// carries one.
+///
+/// An owner-only position reports `unlock_ts_ms = 0`, which is what a
+/// `VestStyle::Other` row without a schedule already carries. The contract says
+/// nothing about unlocking; the style is what tells a reader not to take a date
+/// off the row rather than the decoder supplying a wrong one.
+fn position_datum(shape: DatumShape, cbor: &[u8]) -> Option<(String, u64)> {
+    match shape {
+        DatumShape::Timed => {
+            let decoded = mitos_vesting_decode::decode_vesting_datum(cbor)?;
+            Some((decoded.owner_pkh_hex, decoded.unlock_ts_ms))
+        }
+        DatumShape::OwnerOnly => {
+            let decoded = mitos_vesting_decode::decode_owner_only_datum(cbor)?;
+            Some((decoded.owner_pkh_hex, 0))
+        }
     }
 }
 
@@ -282,6 +448,7 @@ fn lp_decomposition(
     dir: &Path,
     observations: &[Observation],
     by_address: &HashMap<&str, i64>,
+    lock: Option<LockFor>,
 ) -> Option<LpDecomposition> {
     let (pool_address, datum) = latest_cswap_pool(observations)?;
     let reserve = by_address
@@ -309,6 +476,15 @@ fn lp_decomposition(
         return Some(unavailable("the archive has no root directory".into()));
     };
     let lp_dir = policy_dir(root, &lp_policy);
+    // Held until the LP archive's reads below are done: the manifest, the
+    // holder fold and the farm's observations all name its tip pass. Never for
+    // this archive itself: the caller holds that lock and it is not re-entrant.
+    let landing = lock
+        .filter(|_| lp_dir != dir)
+        .map(|lock_for| lock_for(&lp_policy));
+    let _held = landing
+        .as_ref()
+        .map(|l| l.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let Some(manifest) = load_manifest(&lp_dir).ok().flatten() else {
         return Some(unavailable(format!(
             "the LP policy {lp_policy} has not been walked"
@@ -480,6 +656,158 @@ fn lp_amounts(
 mod tests {
     use super::*;
 
+    /// The $PERP staking site, and two real positions on it (2026-11-10):
+    /// 1,035,179 owned by `cce969f5…` and 328,938 by `8974b7a4…`.
+    const SITE: &str = "addr1zyzayvten00vtt9tz0n8pdqs0kq62ujcznpdu7gq6s30md5uwrkupakg244k2dedgyzg0r6k0wgyplm2qdq0trqny98qv0xlua";
+    const POSITION_A: &str =
+        "d879821b0000019c247836ec581ccce969f5c0a16d5735feb093b883e4656f0dd4eb377dbc5d787391bf";
+    const POSITION_B: &str =
+        "d879821b0000019c247b4650581c8974b7a444f372d07f15abcc0ecd9729e79f9e196b72a0bb3fc5410c";
+
+    fn position(slot: u64, tx: u8, datum: &str, amount: i64) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![tx; 32],
+            address: SITE.into(),
+            lovelace: 1_400_750,
+            unit_name: b"PERP COIN".to_vec(),
+            unit_amount: amount,
+            datum: Some(hex::decode(datum).unwrap()),
+            decoded: None,
+            output_index: Some(0),
+            spent: false,
+        }
+    }
+
+    /// The $TOOL staking site, and a real position on it captured from chain
+    /// 2026-11-19 (42,568 $TOOL owned by `6ec2284b…`). Its datum is the
+    /// owner-only shape — one hash, no date.
+    const TOOL_SITE: &str = "addr1wxcwhhtgh5q08f3nc5yhlcpy845lkfat4ntld9vma33uf3q4fagjy";
+    const TOOL_POSITION: &str =
+        "d87981581c6ec2284b5cd330d2c140b8472cd8ff71ccb2c66d50e563f51d8c710f";
+    const TOOL_OWNER_PKH: &str = "6ec2284b5cd330d2c140b8472cd8ff71ccb2c66d50e563f51d8c710f";
+
+    /// The site holds 44.2% of supply as one row unless its positions are read.
+    /// Reading them needs the owner-only decoder; the lock family's decoder
+    /// must not be what answers here, because it would demand a date the datum
+    /// does not carry.
+    #[test]
+    fn an_owner_only_staking_position_is_attributed_to_its_owner() {
+        let mut o = position(100, 3, TOOL_POSITION, 42_568);
+        o.address = TOOL_SITE.into();
+        let balances = HashMap::from([(TOOL_SITE, 42_568)]);
+        let by_payment = HashMap::from([(TOOL_OWNER_PKH.to_string(), "owner".to_string())]);
+        let owners = vesting(
+            &[o],
+            &by_payment,
+            &HashMap::new(),
+            &balances,
+            &mitos_registry::Registry::pinned(),
+        );
+
+        assert_eq!(owners.len(), 1);
+        let only = &owners[0];
+        assert_eq!(only.key, "owner", "the datum's owner is the party");
+        assert_eq!(only.amount, 42_568);
+        assert_eq!(only.locks[0].style, VestStyle::Other);
+        assert_eq!(
+            only.locks[0].unlock_ts_ms, 0,
+            "the datum carries no date, and none is invented"
+        );
+    }
+
+    /// A site reads the shape it declares and nothing else: the two decoders
+    /// must not stand in for each other.
+    #[test]
+    fn a_site_reads_only_the_datum_shape_it_declares() {
+        let timed = hex::decode(POSITION_A).unwrap();
+        let owner_only = hex::decode(TOOL_POSITION).unwrap();
+        assert!(position_datum(DatumShape::Timed, &owner_only).is_none());
+        assert!(position_datum(DatumShape::OwnerOnly, &timed).is_none());
+        assert_eq!(
+            position_datum(DatumShape::OwnerOnly, &owner_only),
+            Some((TOOL_OWNER_PKH.to_string(), 0))
+        );
+    }
+
+    fn spend_of(slot: u64, position: &Observation) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: position.tx_hash.clone(),
+            address: String::new(),
+            lovelace: 0,
+            unit_name: Vec::new(),
+            unit_amount: 0,
+            datum: None,
+            decoded: None,
+            output_index: position.output_index,
+            spent: true,
+        }
+    }
+
+    /// Before spends were recorded, a claimed lock stayed in the archive and
+    /// the site's live balance was scaled across every position ever seen —
+    /// an active staker credited less than they hold, and a former one
+    /// credited something. With the spend recorded and joined, the claimed
+    /// position is gone and the survivor keeps its whole amount.
+    #[test]
+    fn a_claimed_lock_drops_out_and_the_survivor_is_not_scaled() {
+        let a = position(100, 1, POSITION_A, 1_035_179);
+        let b = position(110, 2, POSITION_B, 328_938);
+        // B was claimed: the site now holds only A's amount.
+        let rows = policy_archive::live(vec![spend_of(200, &b), a.clone(), b]);
+        let balances = HashMap::from([(SITE, 1_035_179)]);
+        let owners = vesting(
+            &rows,
+            &HashMap::new(),
+            &HashMap::new(),
+            &balances,
+            &mitos_registry::Registry::pinned(),
+        );
+
+        assert_eq!(owners.len(), 1, "the claimed position names no owner");
+        let only = &owners[0];
+        assert_eq!(only.amount, 1_035_179, "the whole position, unscaled");
+        assert_eq!(only.locks.len(), 1);
+        assert_eq!(only.locks[0].style, VestStyle::Other);
+    }
+
+    /// The same two positions with no spend recorded: the old reading, kept so
+    /// the scale-down is known to still cover an archive written before the
+    /// column existed. Both owners resolve, and the site's balance is split
+    /// across both positions — the claimed one credited something it no longer
+    /// holds, the survivor credited less than it does.
+    #[test]
+    fn without_a_recorded_spend_the_balance_is_still_scaled_across_both() {
+        let a = position(100, 1, POSITION_A, 1_035_179);
+        let b = position(110, 2, POSITION_B, 328_938);
+        let balances = HashMap::from([(SITE, 1_035_179)]);
+        // The owners' payment keys, as the movement rows would have resolved them.
+        let by_payment = HashMap::from([
+            (
+                "cce969f5c0a16d5735feb093b883e4656f0dd4eb377dbc5d787391bf".to_string(),
+                "owner-a".to_string(),
+            ),
+            (
+                "8974b7a444f372d07f15abcc0ecd9729e79f9e196b72a0bb3fc5410c".to_string(),
+                "owner-b".to_string(),
+            ),
+        ]);
+        let owners = vesting(
+            &[a, b],
+            &by_payment,
+            &HashMap::new(),
+            &balances,
+            &mitos_registry::Registry::pinned(),
+        );
+        assert_eq!(owners.len(), 2);
+        let total: u64 = owners.iter().map(|o| o.amount).sum();
+        assert_eq!(total, 1_035_179, "scaled to the balance, sum preserved");
+        assert!(owners.iter().all(|o| o.amount < 1_035_179));
+    }
+
     #[test]
     fn observed_locks_scale_down_to_the_current_balance_and_keep_their_sum() {
         assert_eq!(scale_to(50, 100, vec![60, 40]), vec![30, 20]);
@@ -510,5 +838,68 @@ mod tests {
         let (out, residual) = lp_amounts(1_000, 1_000, BTreeMap::new());
         assert!(out.is_empty());
         assert_eq!(residual, 1_000);
+    }
+
+    /// $PERP's CSwap pool and its LP token, as the pool datum names them.
+    const PERP_POLICY: &str = "d9d59e71eb99e653a493956a6826a406060706bd8c9a2427b3564f64";
+    const LP_POLICY: &str = "f1dfb5314d99902d370e059a4851095646bfe8db57fb0d72a2d106fc";
+
+    /// A CSwap pool datum (`Constr 0`, eight fields) for the ADA × $PERP pool.
+    fn perp_pool_datum(total_lp: u32) -> Vec<u8> {
+        let perp_name = hex::encode("PERP COIN");
+        let lp_name = hex::encode("C-LP: ADA x PERP COIN");
+        // Constr 0, indefinite list: total LP (u32), fee 85 bps, quote = ADA
+        // (two empty byte strings), base policy and name, LP policy and name.
+        let fields = [
+            format!("1a{total_lp:08x}"),
+            "1855".to_string(),
+            "40".to_string(),
+            "40".to_string(),
+            format!("581c{PERP_POLICY}"),
+            format!("49{perp_name}"),
+            format!("581c{LP_POLICY}"),
+            format!("55{lp_name}"),
+        ];
+        hex::decode(format!("d8799f{}ff", fields.concat())).unwrap()
+    }
+
+    fn pool_sighting(slot: u64, total_lp: u32) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: vec![slot as u8; 32],
+            address: cswap::POOL_SCRIPT_ADDR.into(),
+            lovelace: 1_000_000,
+            unit_name: b"PERP COIN".to_vec(),
+            unit_amount: 61_177_936,
+            datum: Some(perp_pool_datum(total_lp)),
+            decoded: None,
+            output_index: Some(0),
+            spent: false,
+        }
+    }
+
+    /// MEASURED 2026-11-11: $PERP's pool held 61.2M units attributed to nobody
+    /// because its LP token had never been walked. The fold now names it, with
+    /// a floor a day below the pool's FIRST sighting — never its latest, which
+    /// would cut off every LP movement before it.
+    #[test]
+    fn an_unwalked_lp_policy_is_asked_for_with_a_floor_below_the_first_sighting() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = policy_dir(root.path(), PERP_POLICY);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(cswap::decode_pool_datum(&perp_pool_datum(1)).is_some());
+        let rows = vec![
+            pool_sighting(172_600_000, 838_040_878),
+            pool_sighting(172_500_000, 1_000),
+        ];
+        assert_eq!(
+            lp_wanted(&dir, &rows),
+            Some(LpWanted {
+                policy: LP_POLICY.into(),
+                floor: 172_500_000 - LP_FLOOR_MARGIN_SLOTS,
+            })
+        );
+        assert_eq!(lp_wanted(&dir, &[]), None, "no pool, nothing to walk");
     }
 }

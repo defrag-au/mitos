@@ -78,7 +78,12 @@ pub const SUMMARY: &str = "summary.bin";
 /// version-3 read by this build would drift by four bytes per provider and then
 /// read the rest of the summary against the wrong offsets. Refused on byte zero
 /// like the rest, and the next fold rewrites it.
-pub const SUMMARY_FORMAT: u8 = 4;
+///
+/// ⚠️ **5 adds [`TopHolder::staked`].** Version 4's `TopHolder` has no field
+/// between `vested` and the end of the struct, so a version-4 file read by this
+/// build would shift `staked` into the next holder's `key` and take the rest of
+/// the table with it. Refused on byte zero like the rest.
+pub const SUMMARY_FORMAT: u8 = 5;
 /// The directory, beside the manifest, holding one file per checkpoint.
 pub const CHECKPOINTS: &str = "checkpoints";
 /// Bumped whenever [`Checkpoint`] changes shape.
@@ -219,16 +224,32 @@ pub struct TopHolder {
     /// [`Segmentation::lp`]'s `residual` for the pool's side.
     #[serde(default)]
     pub lp_amount: u64,
-    /// Locked units beneficially owned by this party. ⚠️ **A SUBSET** of
-    /// [`TopHolder::amount`]: a CrowdLock address delegates to its owner's
-    /// stake credential, so the holder fold already counts the locked units in
-    /// the row. `free = amount - vested`.
+    /// Locked units beneficially owned by this party whose lock address keys to
+    /// THIS party — so the holder fold already counts them in `amount`.
+    /// `free = amount - vested`.
     ///
-    /// Joined from the owner's stake credential where the lock delegates, and
-    /// from [`VestLock::lock_address`] where it does not — a script that holds
-    /// its own units is keyed by its address, not by the owner's credential.
+    /// Joined by the lock ADDRESS rather than by the owner's credential: a
+    /// script that holds its units itself is keyed by its address, and only
+    /// that comparison says whether the balance is already in this row or on
+    /// the site's (see [`TopHolder::staked`]).
     #[serde(default)]
     pub vested: u64,
+    /// Units this party owns at a lock or staking site that does NOT delegate
+    /// to it: the site keeps its own row, so these are not in
+    /// [`TopHolder::amount`]. ⚠️ **ADDITIVE**, like `lp_amount`.
+    ///
+    /// The same units appear as `vested` on the row that KEEPS them (the site),
+    /// so a reader must never sum a site's row and its owners — the same warning
+    /// [`TopHolder::lp_amount`] carries for a pool. On this row the arithmetic
+    /// is `holding = amount + staked + lp_amount`; `free = amount - vested` is
+    /// that other row's business.
+    ///
+    /// Before this field existed the two cases were conflated and the additive
+    /// part was clamped to the free balance: on $TOOL the map showed 167
+    /// stakers' 302,972,337 units as at most the few thousand each held free,
+    /// and omitted the 104 who held nothing free at all.
+    #[serde(default)]
+    pub staked: u64,
 }
 
 /// A lock platform, for the vesting detail.
@@ -433,67 +454,92 @@ impl Summary {
                     .collect()
             })
             .unwrap_or_default();
-        let vests: HashMap<&str, u64> = seg
-            .vests
-            .iter()
-            .map(|v| (v.key.as_str(), v.amount))
-            .collect();
-        // A lock script that does NOT delegate holds its units itself, so the
-        // holder fold keys that row by the script ADDRESS while the vest scan
-        // attributes the lock to the OWNER's stake credential. The lock address
-        // is the join left over; sum per address, because one script may serve
-        // several owners. A row that matched by key never consults this, which
-        // is what keeps a delegating CrowdLock from being counted twice.
-        let vests_by_lock: HashMap<&str, u64> =
-            seg.vests
-                .iter()
-                .flat_map(|v| v.locks.iter())
-                .fold(HashMap::new(), |mut out, lock| {
-                    *out.entry(lock.lock_address.as_str()).or_default() += lock.amount;
-                    out
-                });
+        // Where a position's units actually SIT in the holder fold. A lock
+        // address that keys to its owner is already inside the owner's balance;
+        // one that keys to somebody else — a CrowdLock script delegating to the
+        // platform, a staking site's own address — is inside THAT party's row.
+        // The address is the only thing that tells the two apart, and getting it
+        // wrong is what made every non-delegating position read as a subset of
+        // a balance it was never part of.
+        //
+        // A position booked elsewhere is therefore recorded TWICE, on purpose:
+        // additive as `staked` on the owner who can claim it, and as `vested` on
+        // the row that keeps the units, so `free = amount - vested` stays true
+        // for that row. Same shape as an LP pool and its providers, and the
+        // same warning applies: never sum the keeping row and the owners.
+        //
+        // (subset, additive) per party key.
+        let mut owned: HashMap<String, (u64, u64)> = HashMap::new();
+        for v in &seg.vests {
+            for lock in &v.locks {
+                let booked_to = crate::holders::key_of(&lock.lock_address);
+                if booked_to == v.key {
+                    owned.entry(v.key.clone()).or_default().0 += lock.amount;
+                } else {
+                    owned.entry(v.key.clone()).or_default().1 += lock.amount;
+                    owned.entry(booked_to).or_default().0 += lock.amount;
+                }
+            }
+        }
         for h in &mut self.top {
             h.lp_amount = lp.get(h.key.as_str()).map_or(0, |(amount, _)| *amount);
-            let vested = vests
-                .get(h.key.as_str())
-                .copied()
-                .or_else(|| vests_by_lock.get(h.address.as_str()).copied())
-                .unwrap_or(0);
+            let (subset, additive) = owned.get(h.key.as_str()).copied().unwrap_or_default();
             // Keeping `vested` within `amount` is what makes
             // `free = amount - vested` true, and it stops a lock that outlived
-            // its units from wrapping.
-            h.vested = vested.min(h.amount);
+            // its units from wrapping. `staked` needs no clamp: by construction
+            // it was never in `amount`.
+            h.vested = subset.min(h.amount);
+            h.staked = additive;
         }
 
-        // A provider can hold LP and no units of the token itself, and then the
+        // A party can hold a position and no units of its own — an LP provider
+        // whose units are in a pool, a staker whose units are at a site. The
         // holder fold has no row for it: `distribution` ranks parties by
         // BALANCE and skips a non-positive one. Appended here rather than kept
         // there, because such a party is not a holder of this token and must
         // not move `parties`, the share bands or the role totals — but it does
-        // have a position, and a table that omits it says the pool's reserve
-        // came from nowhere.
+        // have a position, and a table that omits it says the position came
+        // from nowhere. On $TOOL that was 104 of 167 stakers.
         //
-        // ⚠️ These rows are why a reader selects on `amount > 0 || lp_amount > 0`
-        // and never on `amount > 0` alone.
+        // ⚠️ These rows are why a reader selects on
+        // `amount > 0 || lp_amount > 0 || staked > 0` and never on `amount > 0`
+        // alone.
         //
-        // The address comes from the provider, not from this token's fold: a
-        // party with no balance here has no address HERE, and the LP policy's
-        // fold is the only place its address exists. It is what `/api/handles`
+        // The address comes from the position, not from this token's fold: a
+        // party with no balance here has no address HERE, and the LP or vest
+        // scan is the only place its address exists. It is what `/api/handles`
         // is asked about, so a row this appends is namable rather than a
         // shortened credential that can never resolve.
         let known: HashSet<&str> = self.top.iter().map(|h| h.key.as_str()).collect();
-        let mut missing: Vec<(&str, (u64, &str))> = lp
+        let vests_by_owner: HashMap<&str, &str> = seg
+            .vests
             .iter()
-            .filter(|(key, (amount, _))| *amount > 0 && !known.contains(*key))
-            .map(|(key, provider)| (*key, *provider))
+            .map(|v| (v.key.as_str(), v.address.as_str()))
             .collect();
-        // Biggest pool position first, then the key. `lp` is a HashMap, so
+        let mut missing: HashMap<&str, (u64, u64, &str)> = HashMap::new();
+        for (key, (amount, address)) in &lp {
+            if *amount > 0 && !known.contains(*key) {
+                missing.entry(*key).or_insert((0, 0, address)).0 = *amount;
+            }
+        }
+        for (key, (_, additive)) in &owned {
+            if *additive > 0 && !known.contains(key.as_str()) {
+                let address = vests_by_owner.get(key.as_str()).copied().unwrap_or("");
+                missing.entry(key.as_str()).or_insert((0, 0, address)).1 = *additive;
+            }
+        }
+        // Biggest position first, then the key. Both sources are HashMaps, so
         // emitting these in arrival order would not be byte-stable.
-        missing.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+        let mut missing: Vec<(&str, (u64, u64, &str))> = missing.into_iter().collect();
+        missing.sort_by(|a, b| {
+            (b.1.0 + b.1.1)
+                .cmp(&(a.1.0 + a.1.1))
+                .then_with(|| a.0.cmp(b.0))
+        });
         self.top.extend(
             missing
                 .into_iter()
-                .map(|(key, (lp_amount, address))| TopHolder {
+                .map(|(key, (lp_amount, staked, address))| TopHolder {
                     key: key.to_string(),
                     address: address.to_string(),
                     amount: 0,
@@ -502,6 +548,7 @@ impl Summary {
                     movements: 0,
                     lp_amount,
                     vested: 0,
+                    staked,
                 }),
         );
 
@@ -928,6 +975,7 @@ fn distribution(parties: &HashMap<String, Party>) -> (Distribution, Vec<TopHolde
             movements: p.movements,
             lp_amount: 0,
             vested: 0,
+            staked: 0,
         })
         .collect();
 
@@ -1217,7 +1265,11 @@ mod tests {
                 locks: vec![VestLock {
                     amount: 40,
                     unlock_ts_ms: 1_800_000_000_000,
-                    lock_address: "addr_lock".into(),
+                    // The lock address keys to the HOLDER here, which is what
+                    // makes the units a subset of their balance. A lock address
+                    // that keys elsewhere is a site's row, not this one's — see
+                    // `a_non_delegating_position_is_staked_on_its_owner`.
+                    lock_address: A.into(),
                     style: VestStyle::CrowdLock,
                 }],
             }],
@@ -1346,7 +1398,12 @@ mod tests {
                 key: crate::holders::key_of(A),
                 address: A.into(),
                 amount: 999,
-                locks: Vec::new(),
+                locks: vec![VestLock {
+                    amount: 999,
+                    unlock_ts_ms: 0,
+                    lock_address: A.into(),
+                    style: VestStyle::CrowdLock,
+                }],
             }],
             lp: None,
         });
@@ -1385,6 +1442,46 @@ mod tests {
             .expect("the script's row");
         assert_eq!(row.vested, 4_063_508);
         assert_eq!(row.amount - row.vested, 0, "no free part");
+    }
+
+    /// The owner's side of that same lock: the units are NOT in their balance,
+    /// so they are `staked` — additive — and the row is appended even though
+    /// they hold nothing free. Without this, a staker is invisible in the map:
+    /// on $TOOL, 104 of 167 were.
+    #[test]
+    fn a_non_delegating_position_is_staked_on_its_owner() {
+        const SCRIPT: &str = "addr_vesting_script";
+        let movements = vec![mv(1, 10, 1, SCRIPT, 4_063_508)];
+        let (mut s, _) = summary(&movements, &Series::default(), true);
+        let parties = s.distribution.parties;
+        s.apply_segmentation(Segmentation {
+            as_of: 10,
+            vests: vec![VestOwner {
+                key: crate::holders::key_of(A),
+                address: A.into(),
+                amount: 4_063_508,
+                locks: vec![VestLock {
+                    amount: 4_063_508,
+                    unlock_ts_ms: 0,
+                    lock_address: SCRIPT.into(),
+                    style: VestStyle::SnekFun,
+                }],
+            }],
+            lp: None,
+        });
+        let owner = s
+            .top
+            .iter()
+            .find(|h| h.key == crate::holders::key_of(A))
+            .expect("the owner's row, though they hold nothing free");
+        assert_eq!(owner.amount, 0);
+        assert_eq!(owner.address, A);
+        assert_eq!(owner.staked, 4_063_508);
+        assert_eq!(owner.vested, 0, "the units are not in this row's balance");
+        assert_eq!(
+            s.distribution.parties, parties,
+            "a position does not make its owner a holder in the distribution"
+        );
     }
 
     /// The fallback must not ADD to a key match: a delegating CrowdLock is

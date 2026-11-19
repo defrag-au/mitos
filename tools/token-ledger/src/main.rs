@@ -15,6 +15,7 @@
 //! - `stats` — derived balances at tip, for reconciliation against a known total
 //! - `export`/`serve` — later; see the design doc's three-tier artifact
 
+mod address_registry;
 mod ambiguous;
 mod archive;
 mod book_prices;
@@ -87,6 +88,12 @@ enum Command {
     /// the distribution and balance checkpoints — and say what is in it. A
     /// completed walk writes one; this forces it.
     Summary(archive::SummaryArgs),
+    /// What each holder held throughout the days before a reading — wallet and live positions —
+    /// for a maturity rule. One line per holder: `<key> <now> <held per window…>`.
+    HeldThrough(archive::HeldThroughArgs),
+    /// Every interval each holder held the token at all — wallet and live positions — as NDJSON,
+    /// for an achievement fold (`holder-behaviour`'s `replay --token`).
+    HeldSpans(archive::HeldSpansArgs),
     /// Write a policy's history as `token-tape` files: stable party numbers,
     /// and day chunks of market, transfer and order events.
     Pack(pack::PackArgs),
@@ -209,6 +216,8 @@ fn main() -> Result<()> {
         Command::Archive(args) => archive::inspect(args),
         Command::Graph(args) => archive::graph(args),
         Command::Summary(args) => archive::summary(args),
+        Command::HeldThrough(args) => archive::held_through(args),
+        Command::HeldSpans(args) => archive::held_spans(args),
         Command::Pack(args) => pack::pack(args),
         Command::Names(args) => names::names(args),
         Command::Ambiguous(args) => ambiguous::ambiguous(args),

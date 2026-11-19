@@ -191,7 +191,8 @@ impl Lines {
 /// One file or stdin, served in ascending chain order.
 struct FileFeed {
     lines: Lines,
-    /// Events read while the direction was being decided — at most two, and empty after.
+    /// Events read while the direction was being decided — the first block's, and the first
+    /// event past it — and empty after.
     pending: VecDeque<ChainEvent>,
     /// A newest-first source, read whole and sorted.
     buffered: Option<std::vec::IntoIter<ChainEvent>>,
@@ -210,8 +211,24 @@ impl FileFeed {
             first = Some(order_of(&event));
             pending.push_back(event);
         }
+        // The direction is read from the first event that sorts differently from the first.
+        // Events in one block tie, so a source whose first block holds several says nothing
+        // until it leaves that block: deciding on the second event alone read a newest-first
+        // archive whose newest block had two transfers as ascending, and refused it at its
+        // third line (2026-11-16: the Perps archive's newest block held two transfers).
+        let mut second = None;
+        if let Some(first_order) = first {
+            while let Some(event) = lines.next_event()? {
+                if order_of(&event) == first_order {
+                    pending.push_back(event);
+                } else {
+                    second = Some(event);
+                    break;
+                }
+            }
+        }
         if let Some(first_order) = first
-            && let Some(second) = lines.next_event()?
+            && let Some(second) = second
         {
             if order_of(&second) < first_order {
                 // Newest-first: the smallest event is the LAST line, so the whole source

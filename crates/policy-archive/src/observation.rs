@@ -37,6 +37,30 @@
 //! Measured precedent for why this matters: $Dong's pooled share went from
 //! 1.48% to 11.32% purely from recognising a second Splash contract, and
 //! nothing errored in between.
+//!
+//! # A spend is a row too
+//!
+//! An observation says a position was created. It cannot say the position is
+//! still there, and for a lock that is the whole question: a claimed lock
+//! reads as still locked. Measured on the $PERP staking site (2026-11-11): the
+//! archive held 382 positions against 250 live, and the tip decomposition
+//! scaled the site's balance across all of them — every active staker
+//! credited less than they held, sixty former stakers credited 97M between
+//! them.
+//!
+//! So the walk also writes a row for every INPUT of a transaction that touched
+//! the policy: `spent = true`, the spent position's `tx_hash#output_index`,
+//! the spending transaction's slot, and nothing else. [`live`] joins the two,
+//! dropping each spend and the position it names. The join needs no forward
+//! memory, which matters because the production walk descends newest-first
+//! and meets a spend before the position it closes.
+//!
+//! Spend rows are inputs the walk cannot classify — it does not know what the
+//! spent output held — so they are only meaningful through the join. Every
+//! reader that wants holdings goes through [`live`]; a reader of pool STATE
+//! (the price series, the story) drops them and is otherwise unaffected. Both
+//! columns are trailing and optional, so a file written before them reads with
+//! every position standing, which is the reading it gave before.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -84,6 +108,8 @@ pub const MESSAGE_TYPE: &str = "
         OPTIONAL INT64 total_lp;
         OPTIONAL BYTE_ARRAY reserve_source;
         OPTIONAL BYTE_ARRAY pricing;
+        OPTIONAL INT64 output_index;
+        OPTIONAL INT64 spent;
     }
 ";
 
@@ -181,6 +207,22 @@ pub struct Observation {
     /// with no datum is not a pool anybody can read.
     pub datum: Option<Vec<u8>>,
     pub decoded: Option<Decoded>,
+    /// The output's index in its transaction, so a position is addressable as
+    /// `tx_hash#index`. `None` on a row written before the column existed,
+    /// which is the only reason it is optional: such a row cannot be matched
+    /// to a spend, and reads as never spent.
+    pub output_index: Option<u32>,
+    /// This row records the SPEND of the position at `tx_hash#output_index`,
+    /// not a holding: `slot` is the spending transaction's, `unit_amount` is
+    /// 0, and there is no datum. Written by the walk for every input of a
+    /// transaction that touched the policy, so a reader can tell a lock that
+    /// was claimed from one that still stands without a forward index.
+    ///
+    /// A reader wanting what is HELD must drop these and the positions they
+    /// name — [`live`] does both — or every claimed lock reads as still locked,
+    /// which is what scaled the $PERP staking site's live balance across 382
+    /// positions when 250 stood.
+    pub spent: bool,
 }
 
 impl Observation {
@@ -189,6 +231,34 @@ impl Observation {
     pub fn is_candidate(&self) -> bool {
         self.decoded.is_none()
     }
+
+    /// The position this row is about, when the file recorded one.
+    pub fn position(&self) -> Option<(&[u8], u32)> {
+        self.output_index
+            .map(|index| (self.tx_hash.as_slice(), index))
+    }
+}
+
+/// The observations that record a holding still standing at the end of
+/// `rows`: spend rows dropped, and with them every position a spend names.
+///
+/// A position with no `output_index` predates the column and can never be
+/// matched, so it is kept — the reading the file gave before spends existed.
+/// `rows` need not be ordered: a spend after its position in the file and a
+/// spend before it (the reverse walk emits them newest-first) are the same.
+pub fn live(rows: Vec<Observation>) -> Vec<Observation> {
+    let spent: std::collections::HashSet<(Vec<u8>, u32)> = rows
+        .iter()
+        .filter(|o| o.spent)
+        .filter_map(|o| o.output_index.map(|i| (o.tx_hash.clone(), i)))
+        .collect();
+    rows.into_iter()
+        .filter(|o| !o.spent)
+        .filter(|o| {
+            o.output_index
+                .is_none_or(|i| !spent.contains(&(o.tx_hash.clone(), i)))
+        })
+        .collect()
 }
 
 fn schema() -> Result<Arc<Type>> {
@@ -371,8 +441,13 @@ fn write_group<W: Write + Send>(
         .decoded
         .as_ref()
         .map(|d| ByteArray::from(d.pricing.as_bytes())));
+    opt_i64!(|r: &Observation| r.output_index.map(i64::from));
+    // Written only when true, so an unspent row carries a null rather than a
+    // zero and a reader of the previous layout is not handed a column it
+    // would misread as a value.
+    opt_i64!(|r: &Observation| r.spent.then_some(1));
 
-    debug_assert_eq!(col, 20, "every schema column must be written");
+    debug_assert_eq!(col, 22, "every schema column must be written");
     rg.close()?;
     Ok(())
 }
@@ -394,6 +469,8 @@ pub fn read_all(bytes: &[u8]) -> Result<Vec<Observation>> {
             unit_amount: 0,
             datum: None,
             decoded: None,
+            output_index: None,
+            spent: false,
         };
         let mut d = Decoded::default();
         let mut any_decode = false;
@@ -431,6 +508,10 @@ pub fn read_all(bytes: &[u8]) -> Result<Vec<Observation>> {
                 ("pricing", Field::Bytes(b)) => {
                     d.pricing = String::from_utf8_lossy(b.data()).into_owned()
                 }
+                ("output_index", Field::Long(v)) => {
+                    o.output_index = u32::try_from(*v).ok();
+                }
+                ("spent", Field::Long(v)) => o.spent = *v != 0,
                 _ => {}
             }
         }
@@ -470,7 +551,52 @@ mod tests {
             unit_amount: 500,
             datum: Some(vec![0xd8, 0x79, 0x80]),
             decoded: None,
+            output_index: Some(0),
+            spent: false,
         }
+    }
+
+    /// The spend of `position`, at `slot`.
+    fn spend(slot: u64, position: &Observation) -> Observation {
+        Observation {
+            slot,
+            block_time: 1_700_000_000 + slot,
+            tx_hash: position.tx_hash.clone(),
+            address: position.address.clone(),
+            lovelace: 0,
+            unit_name: position.unit_name.clone(),
+            unit_amount: 0,
+            datum: None,
+            decoded: None,
+            output_index: position.output_index,
+            spent: true,
+        }
+    }
+
+    #[test]
+    fn a_spend_round_trips_and_live_drops_it_with_its_position() {
+        let mut a = candidate(5);
+        a.tx_hash = vec![1; 32];
+        let mut b = candidate(6);
+        b.tx_hash = vec![2; 32];
+        let mut c = candidate(7);
+        c.tx_hash = vec![3; 32];
+        c.output_index = None; // written before the column existed
+        let spend_a = spend(9, &a);
+        let got = round_trip(vec![spend_a.clone(), a.clone(), b.clone(), c.clone()]);
+        assert_eq!(
+            got,
+            vec![spend_a, a, b.clone(), c.clone()],
+            "the spend row survives the file"
+        );
+        assert!(got[0].spent);
+        assert_eq!(got[0].unit_amount, 0);
+        let standing = live(got);
+        assert_eq!(
+            standing,
+            vec![b, c],
+            "a is gone with its spend; c cannot be matched and stays"
+        );
     }
 
     fn decoded(slot: u64) -> Observation {

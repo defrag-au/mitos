@@ -25,10 +25,10 @@ path = "src/main.rs"
 # the entry shape, the directory fill and the policy table live there.
 live-book = { path = "../../crates/live-book" }
 # The offer pass's two registries of truth: which marketplace contracts carry
-# collection offers (the registry, shared with the frontend and the ledger tool)
+# collection offers (the hosted address registry, shared with the ledger tools)
 # and how each venue's datum reads (the decode crate, shared with the backfill).
 # `OFFER_INDEX_FORMAT.md` §7 step 3 is what they are here for.
-address-registry = { workspace = true }
+mitos-registry = { path = "../../crates/mitos-registry", features = ["fetch", "pinned"] }
 mitos-marketplace-decode = { path = "../../crates/mitos-marketplace-decode" }
 # Structured timing, so a number this tool prints can be compared with one another
 # tool prints — one vocabulary of operation names, one report shape.

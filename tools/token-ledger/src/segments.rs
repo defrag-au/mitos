@@ -1275,6 +1275,8 @@ mod tests {
                 unit_amount: 1_000,
                 datum: None,
                 decoded: None,
+                output_index: Some(0),
+                spent: false,
             });
             w.close().unwrap();
 

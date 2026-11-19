@@ -167,14 +167,18 @@ fn stale(root: &Path) -> Result<Vec<String>> {
                 continue;
             }
         };
-        let published = match publish::load_record(&dir) {
-            Ok(r) => r.map(|r| r.manifest_updated_unix),
+        let record = match publish::load_record(&dir) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(policy, error = %format!("{e:#}"), "sync: published.json unreadable — republishing");
                 None
             }
         };
-        if needs_publish(published, manifest.updated_unix) {
+        let published = record.as_ref().map(|r| r.manifest_updated_unix);
+        let refolded = record
+            .as_ref()
+            .is_some_and(|r| derived_since(&dir, r.published_unix));
+        if needs_publish(published, manifest.updated_unix) || refolded {
             out.push(policy);
         }
     }
@@ -192,6 +196,30 @@ fn needs_publish(published: Option<u64>, manifest: u64) -> bool {
     published != Some(manifest)
 }
 
+/// The derived artefacts sync carries that are written WITHOUT the manifest
+/// moving.
+const DERIVED: [&str; 2] = ["summary.bin", "graph.bin"];
+
+/// Was a derived artefact written after the last publish?
+///
+/// A refold rewrites `summary.bin` and leaves the manifest alone — the archive
+/// did not change, what was read from it did. The scheduler refolds a token
+/// when its pool's LP archive lands, and on a quiet token nothing else moves
+/// the manifest, so the new summary sat unpublished. MEASURED 2026-11-11:
+/// $PERP's LP providers stayed unpublished until a hand `publish`.
+///
+/// Whole seconds against whole seconds: a write in the same second as the
+/// publish is not seen, and the next manifest move carries it.
+fn derived_since(dir: &Path, published_unix: u64) -> bool {
+    DERIVED.iter().any(|name| {
+        std::fs::metadata(dir.join(name))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|t| t.as_secs() > published_unix)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +234,24 @@ mod tests {
         assert!(
             !needs_publish(Some(7), 7),
             "a record naming the current manifest is what published means"
+        );
+    }
+
+    #[test]
+    fn a_summary_refolded_after_the_last_publish_is_stale_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !derived_since(dir.path(), 0),
+            "nothing derived, nothing to carry"
+        );
+        std::fs::write(dir.path().join("summary.bin"), b"folded").unwrap();
+        assert!(
+            derived_since(dir.path(), 0),
+            "written after a publish at the epoch"
+        );
+        assert!(
+            !derived_since(dir.path(), u64::MAX / 2),
+            "a publish after the fold already carried it"
         );
     }
 }

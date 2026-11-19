@@ -31,10 +31,6 @@ tx-index = { path = "../../crates/tx-index" }
 policy-archive = { path = "../../crates/policy-archive" }
 # The compact binary history a replay reads (`pack`).
 token-tape = { path = "../../crates/token-tape" }
-# Burn sinks, by CREDENTIAL. The ORIGIN totals them so exactly one place knows
-# which addresses are sinks — a second copy in the gateway would be a second
-# thing to update when a sink is added, and they would disagree in between.
-address-registry = { workspace = true }
 # WHAT COUNTS AS A UNIT of a collection — `AssetRole::of_bytes`. A policy's
 # on-chain asset list is not its supply: CIP-68 mints a reference twin per
 # collectible and CIP-27 adds a royalty token, so counting the raw list
@@ -96,6 +92,9 @@ chain-events-cardano = { path = "../../crates/chain-events-cardano" }
 # policy's first mint. Shared with project-ledger so the MINIMUM-creation rule
 # has one home.
 mitos-koios = { path = "../../crates/mitos-koios" }
+# The address registry: behaviour and stake services, fetched at the pinned rev.
+# `fetch` is the only part of the crate that does I/O; the lookups are pure.
+mitos-registry = { path = "../../crates/mitos-registry", features = ["fetch", "pinned"] }
 # The LOCAL floor probe: (policy → first chunk) in ~3 µs, against a Koios
 # round-trip. Koios stays as the fallback for a policy the index has not
 # reached, so the walk never depends on the index existing.

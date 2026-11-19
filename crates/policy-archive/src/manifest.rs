@@ -187,8 +187,30 @@ pub struct Manifest {
     /// were none" from "this is a collection and we did not keep them".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<crate::profile::Profile>,
+    /// The address-registry bytes this archive's summary was classified with.
+    ///
+    /// Additive and optional: an archive folded before the registry was hosted
+    /// has none, and a reader that does not know the field ignores it. The
+    /// digests are what let an answer be traced to the registry version that
+    /// produced it — the table changes without a rebuild, so a cohort can change
+    /// with nothing in this repository changing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryStamp>,
     pub passes: Vec<PassEntry>,
     pub updated_unix: u64,
+}
+
+/// The registry revision and bytes a summary was classified with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryStamp {
+    /// The `theyexist/address-registry` rev the artefacts were read at.
+    pub rev: String,
+    /// sha256 of `resolved/behaviour.bin`, lowercase hex.
+    pub behaviour_sha256: String,
+    /// sha256 of `resolved/stake-services.bin`, lowercase hex.
+    pub stakes_sha256: String,
+    /// The behaviour file's own `generated_at`.
+    pub generated_at: String,
 }
 
 impl Manifest {
@@ -205,6 +227,7 @@ impl Manifest {
             rollup_seq: 0,
             pending: None,
             profile: None,
+            registry: None,
             passes: Vec::new(),
             updated_unix: 0,
         }

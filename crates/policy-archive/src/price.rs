@@ -281,6 +281,8 @@ mod tests {
                 reserve_source: "value".into(),
                 pricing: model.into(),
             }),
+            output_index: Some(0),
+            spent: false,
         }
     }
 
