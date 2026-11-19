@@ -39,10 +39,14 @@ ignore = [
   # out when it lands. `cargo update --precise` reports exactly the requirement
   # quoted here.
   #
-  # webpki-roots >= 1.0.10, and only the 1.0 line has it — the 0.26.8 here is
-  # reached through hyper-rustls 0.27.5 (reqwest 0.12) and tokio-tungstenite
-  # 0.26.2 (mitos-core, mitos-tail, axum). Both have to move to webpki-roots
-  # 1.x: reqwest 0.13 and tokio-tungstenite 0.30.
+  # webpki-roots >= 1.0.10, and neither holder can move to it today. Both were
+  # tried on 2026-11-19 and both are pinned upstream:
+  #   - tokio-tungstenite 0.30.0, the latest, still declares
+  #     `webpki-roots = "0.26.0"`;
+  #   - reqwest 0.12 stays because dolos, mithril-client and
+  #     opentelemetry-http require it, and opentelemetry-otlp turns on its
+  #     `rustls-tls-webpki-roots` feature, which turns on hyper-rustls' copy.
+  # The entry comes out when those two move; ours is not the constraint.
   "RUSTSEC-2026-0381",
 ]
 
