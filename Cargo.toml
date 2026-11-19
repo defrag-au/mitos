@@ -179,8 +179,6 @@ license = "Apache-2.0"
 dolos = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 dolos-core = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 dolos-cardano = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
-dolos-redb3 = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
-dolos-fjall = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 dolos-minibf = { git = "https://github.com/txpipe/dolos", tag = "v1.2.0" }
 # CARE: the transitive `utxorpc-spec` is pinned to 0.19.0 in Cargo.lock. dolos
 # v1.2.0's gRPC `v1beta/watch` builds against 0.19.0, but 0.19.2 made

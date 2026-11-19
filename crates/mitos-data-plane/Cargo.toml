@@ -19,7 +19,6 @@ license.workspace = true
 # strings — strong-typed I/O is the defining property of this
 # crate.
 cardano-assets = { workspace = true }
-pipeline-types = { workspace = true }
 
 # The live book, for `BookDataPlane`. Light — memmap2, anyhow and pallas-addresses
 # — and deliberately narrower than the dolos half of this crate: the book-backed
