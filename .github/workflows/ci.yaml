@@ -13,6 +13,13 @@ env:
   CARGO_INCREMENTAL: 1
   CARGO_PROFILE_DEV_DEBUG: 0
 
+# The Rust version is pinned rather than `@stable`. A toolchain's
+# `wasm32-wasip2` std imports one `wasi:cli@0.2.x` and `wasmtime-wasi`
+# implements exactly one; when the interfaces differ, no module
+# instantiates. The same number lives in rust-toolchain.toml — move both
+# together with the `wasmtime` major in crates/mitos-platform/Cargo.toml.
+# `@rev` cannot carry a `with:` input, so the version is passed to `@master`.
+# `@master`.
 jobs:
   # ----------------------------------------------------------------
   # Fast-fail gate. fmt is seconds; everything heavy hangs off it so
@@ -25,8 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -42,8 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           components: clippy
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -59,7 +68,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # `wasm32-wasip2` for tests/wasi_linkage.rs: the toolchain/WASI
+          # linkage is checked here rather than after 20 module builds.
+          toolchain: "1.100.0"
+          targets: wasm32-wasip2
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -86,7 +100,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -125,8 +141,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           targets: wasm32-wasip2
 
       - name: Rust Cache

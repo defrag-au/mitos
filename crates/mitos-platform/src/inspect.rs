@@ -124,6 +124,49 @@ impl DataPlaneFacade for NullDataPlane {
     }
 }
 
+/// The engine the inspector and the production runtime share.
+///
+/// Every switch here is a property a module may rely on, so the inspector
+/// must not build a laxer engine than the host it stands in for.
+fn inspection_engine() -> Result<Engine, InspectError> {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    Engine::new(&config).map_err(|e| InspectError::Engine(e.to_string()))
+}
+
+/// The linker a module is instantiated against: WASI Preview 2, then this
+/// platform's own host functions.
+fn inspection_linker(engine: &Engine) -> Result<Linker<HostStateV2>, InspectError> {
+    let mut linker = Linker::<HostStateV2>::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|e| InspectError::Load(format!("wasi linker: {e}")))?;
+    MitosModuleV2::add_to_linker::<_, HasSelf<HostStateV2>>(&mut linker, |s| s)
+        .map_err(|e| InspectError::Load(format!("platform linker: {e}")))?;
+    Ok(linker)
+}
+
+/// A store under the default resource budget, with a data plane that answers
+/// nothing.
+fn inspection_store(engine: &Engine) -> Result<Store<HostStateV2>, InspectError> {
+    let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
+    let kv = state_kv::ModuleKv::new_in_memory();
+    let (sink, _events) = emit::EventSink::new();
+    // The inspector loads a module to read its ABI, never to run it, so it serves no
+    // artifact: `fold-data` answering `none` is honest here and keeps the inspect path
+    // independent of whatever this host happens to be serving.
+    let host_state = HostStateV2::new("__inspect__".to_owned(), dp, kv, sink, None);
+
+    let mut store = Store::new(engine, host_state);
+    let budget = ResourceBudget::default();
+    store
+        .set_fuel(budget.fuel_per_call)
+        .map_err(|e| InspectError::Instantiate(e.to_string()))?;
+    store.set_epoch_deadline(budget.epoch_deadline_ticks);
+    Ok(store)
+}
+
 /// Load a wasm component, instantiate against the platform's
 /// linker, call the two metadata-bearing exports
 /// (`module-version`, `trap-policy`), return the values.
@@ -140,39 +183,17 @@ impl DataPlaneFacade for NullDataPlane {
 pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError> {
     // Build the same engine the production runtime uses so
     // anything that passes here also passes there.
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(true);
-    config.epoch_interruption(true);
-    let engine = Engine::new(&config).map_err(|e| InspectError::Engine(e.to_string()))?;
+    let engine = inspection_engine()?;
 
     let component =
         Component::from_file(&engine, wasm_path).map_err(|e| InspectError::Load(e.to_string()))?;
 
-    let mut linker = Linker::<HostStateV2>::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-        .map_err(|e| InspectError::Load(format!("wasi linker: {e}")))?;
-    MitosModuleV2::add_to_linker::<_, HasSelf<HostStateV2>>(&mut linker, |s| s)
-        .map_err(|e| InspectError::Load(format!("platform linker: {e}")))?;
-
-    let dp: Arc<dyn DataPlaneFacade> = Arc::new(NullDataPlane);
-    let kv = state_kv::ModuleKv::new_in_memory();
-    let (sink, _events) = emit::EventSink::new();
-    // The inspector loads a module to read its ABI, never to run it, so it serves no
-    // artifact: `fold-data` answering `none` is honest here and keeps the inspect path
-    // independent of whatever this host happens to be serving.
-    let host_state = HostStateV2::new("__inspect__".to_owned(), dp, kv, sink, None);
-
-    let mut store = Store::new(&engine, host_state);
-    let budget = ResourceBudget::default();
-    store
-        .set_fuel(budget.fuel_per_call)
-        .map_err(|e| InspectError::Instantiate(e.to_string()))?;
-    store.set_epoch_deadline(budget.epoch_deadline_ticks);
+    let linker = inspection_linker(&engine)?;
+    let mut store = inspection_store(&engine)?;
 
     let bindings = MitosModuleV2::instantiate_async(&mut store, &component, &linker)
         .await
-        .map_err(|e| InspectError::Instantiate(e.to_string()))?;
+        .map_err(|e| instantiate_error(&component, &engine, e))?;
 
     let (major, minor) = bindings
         .call_module_version(&mut store)
@@ -191,6 +212,68 @@ pub async fn dry_inspect(wasm_path: &Path) -> Result<InspectResult, InspectError
         trap_max_retries: retry.max_retries,
         trap_backoff_cap_ms: retry.backoff_cap_ms,
     })
+}
+
+/// Instantiate a `wasm32-wasip2` component against the platform's linker and
+/// nothing else, returning the `wasi:*` interfaces it imported.
+///
+/// `dry_inspect` can only be pointed at a real module, because it asks the
+/// component to export the platform ABI. This is the same instantiation with
+/// no export requirement, which is what lets `tests/wasi_linkage.rs` check the
+/// linker against a ten-line artifact: the toolchain's `std` and this host's
+/// `wasmtime-wasi` must agree on `wasi:cli@0.2.x`, and a disagreement fails
+/// here in seconds instead of once per module in CI.
+///
+/// The returned names carry the version (`wasi:cli/exit@0.2.12`), so a caller
+/// can assert that the probe still exercises what it claims to.
+pub async fn link_probe(wasm_path: &Path) -> Result<Vec<String>, InspectError> {
+    let engine = inspection_engine()?;
+    let component =
+        Component::from_file(&engine, wasm_path).map_err(|e| InspectError::Load(e.to_string()))?;
+    let linker = inspection_linker(&engine)?;
+    let mut store = inspection_store(&engine)?;
+
+    linker
+        .instantiate_async(&mut store, &component)
+        .await
+        .map_err(|e| instantiate_error(&component, &engine, e))?;
+
+    Ok(wasi_imports(&component, &engine))
+}
+
+/// The `wasi:*` interfaces a component imports, sorted and deduplicated.
+///
+/// A component built by a toolchain whose `wasm32-wasip2` std has moved to a
+/// `wasi:cli@0.2.x` whose interfaces this host's `wasmtime-wasi` does not
+/// implement cannot link, and wasmtime's own message says only that "a
+/// matching implementation was not found". The imported names carry the
+/// version, so they are what the error should name.
+fn wasi_imports(component: &Component, engine: &Engine) -> Vec<String> {
+    let ty = component.component_type();
+    let mut names: Vec<String> = ty
+        .imports(engine)
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("wasi:"))
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The instantiation error, with the imports that explain it attached.
+fn instantiate_error(component: &Component, engine: &Engine, err: wasmtime::Error) -> InspectError {
+    let imports = wasi_imports(component, engine);
+    if imports.is_empty() {
+        return InspectError::Instantiate(err.to_string());
+    }
+    InspectError::Instantiate(format!(
+        "{err}\n  the component imports {} — this host provides the `wasi:cli` interfaces \
+         its `wasmtime-wasi` ships, so one whose shape differs cannot be linked here. Move the \
+         two together: bump `wasmtime`/`wasmtime-wasi` in crates/mitos-platform/Cargo.toml, or \
+         pin the toolchain (rust-toolchain.toml) to one whose std agrees with them.",
+        imports.join(", ")
+    ))
 }
 
 /// Wasmtime refused the bytes as a component.

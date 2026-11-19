@@ -1,0 +1,4 @@
+# Built by ../../wasi_linkage.rs into a temporary target directory; the lock
+# file lands here because cargo puts it beside the manifest.
+Cargo.lock
+target

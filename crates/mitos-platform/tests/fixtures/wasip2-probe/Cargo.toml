@@ -1,0 +1,15 @@
+# Not a workspace member, and not published: this crate exists only to be
+# compiled to `wasm32-wasip2` by `../../wasi_linkage.rs`, and its entire value
+# is that it depends on nothing. `[workspace]` keeps it out of the mitos
+# workspace.
+[package]
+name = "wasip2-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "wasip2-probe"
+path = "src/main.rs"
