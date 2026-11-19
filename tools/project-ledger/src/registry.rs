@@ -222,6 +222,48 @@ impl TerminalParty {
     }
 }
 
+/// The SHARED address registry for this run — the contracts and stake keys that
+/// are services rather than this project.
+///
+/// The data is hosted. `offline` means no network at all, so the bytes can then
+/// only come from `ADDRESS_REGISTRY_DIR`; otherwise a failed fetch falls back to
+/// the verified cache in `mitos_registry::source`, loudly.
+///
+/// The binary's pinned copy is deliberately not the fallback: a stale table that
+/// looks current is the failure this migration exists to remove.
+pub fn load_shared(offline: bool) -> Result<mitos_registry::Registry> {
+    use mitos_registry::source::Origin;
+
+    if offline && std::env::var_os("ADDRESS_REGISTRY_DIR").is_none() {
+        bail!(
+            "--offline needs ADDRESS_REGISTRY_DIR — the shared address registry is \
+             fetched, not compiled in"
+        );
+    }
+    let loaded = mitos_registry::source::load().context("loading the address registry")?;
+    match loaded.origin {
+        Origin::Fetched => {}
+        Origin::Dir => tracing::debug!(
+            rev = loaded.stamp.rev,
+            "address registry: read from ADDRESS_REGISTRY_DIR"
+        ),
+        Origin::Cache => tracing::warn!(
+            rev = loaded.stamp.rev,
+            generated_at = %loaded.stamp.generated_at,
+            "address registry: FETCH FAILED — using the cached copy. A contract added \
+             since it was written will read as unnamed"
+        ),
+    }
+    if let Some(reason) = &loaded.cache_note {
+        tracing::warn!(
+            reason,
+            "address registry: fetched, but the cache was NOT written — the next failed \
+             fetch has no fallback"
+        );
+    }
+    Ok(loaded.registry)
+}
+
 impl Registry {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)

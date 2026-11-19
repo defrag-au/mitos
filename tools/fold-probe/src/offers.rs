@@ -224,8 +224,27 @@ pub struct OfferPass {
 impl OfferPass {
     /// The pass over the HOSTED registry's venues — fetched once, so a venue or
     /// a corrected contract is readable without a rebuild.
+    ///
+    /// A failed fetch falls back to the verified cache, and says so: the venue
+    /// list is what decides which outputs are read as offers, so a cached list
+    /// that is a notification behind is a number worth questioning.
     pub fn load() -> Result<OfferPass> {
         let loaded = mitos_registry::source::load().context("loading the address registry")?;
+        match loaded.origin {
+            mitos_registry::source::Origin::Fetched => {}
+            mitos_registry::source::Origin::Dir => eprintln!(
+                "note: address registry read from ADDRESS_REGISTRY_DIR ({})",
+                loaded.stamp.rev
+            ),
+            mitos_registry::source::Origin::Cache => eprintln!(
+                "note: the address registry could not be fetched — reading the cached copy \
+                 (generated_at {}). A venue added since then is not read here.",
+                loaded.stamp.generated_at
+            ),
+        }
+        if let Some(reason) = &loaded.cache_note {
+            eprintln!("note: the address registry was fetched but not cached: {reason}");
+        }
         Ok(OfferPass::over(venues(&loaded.registry)))
     }
 

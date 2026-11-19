@@ -9,13 +9,44 @@
 //! or a cache — and keeps a run offline. Without it the two files are fetched.
 
 use anyhow::{Context, Result};
-use mitos_registry::source::Loaded;
+use mitos_registry::source::{Loaded, Origin};
 
 pub use mitos_registry::source::Stamp;
 
 /// The registry this run classifies with, and the stamp for its bytes.
 pub fn load() -> Result<Loaded> {
-    mitos_registry::source::load().context("loading the address registry")
+    let loaded = mitos_registry::source::load().context("loading the address registry")?;
+    note(&loaded);
+    Ok(loaded)
+}
+
+/// Say how the bytes arrived, when it is not the plain fetch.
+///
+/// A CACHED answer is a real one and must be loud: the contracts are the same
+/// revision this build pins, but anything added to the registry since the cache
+/// was written is invisible, and an unnamed DEX reads as income. A cache that
+/// cannot be written is the same failure one outage earlier.
+fn note(loaded: &Loaded) {
+    match loaded.origin {
+        Origin::Fetched => {}
+        Origin::Dir => tracing::debug!(
+            rev = loaded.stamp.rev,
+            "address registry: read from ADDRESS_REGISTRY_DIR"
+        ),
+        Origin::Cache => tracing::warn!(
+            rev = loaded.stamp.rev,
+            generated_at = %loaded.stamp.generated_at,
+            "address registry: FETCH FAILED — classifying with the cached copy. A contract \
+             added to the registry since it was written will read as unnamed"
+        ),
+    }
+    if let Some(reason) = &loaded.cache_note {
+        tracing::warn!(
+            reason,
+            "address registry: fetched, but the cache was NOT written — the next failed \
+             fetch has no fallback"
+        );
+    }
 }
 
 /// A use's display label: its own name, else the category. The old compiled

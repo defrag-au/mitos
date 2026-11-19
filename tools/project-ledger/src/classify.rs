@@ -173,8 +173,8 @@ fn payment_credential(address: &str) -> Option<[u8; 28]> {
 
 pub fn run(args: &ClassifyArgs) -> Result<()> {
     let mut ledger = Ledger::open(&args.db)?;
-    let loaded = mitos_registry::source::load()?;
-    let registry = &loaded.registry;
+    let shared = crate::registry::load_shared(false)?;
+    let registry = &shared;
 
     // Everything this pass writes is re-derived from the ledger and the
     // registry, so start clean. Without this, a FIXED rule cannot retract what

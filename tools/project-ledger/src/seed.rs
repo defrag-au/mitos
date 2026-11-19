@@ -94,25 +94,6 @@ pub struct SeedArgs {
     project_side: Vec<String>,
 }
 
-/// The SHARED address registry for this run — the stake keys that are services
-/// rather than this project.
-///
-/// The data is hosted, so `--offline` (no network) can only be honoured with
-/// `ADDRESS_REGISTRY_DIR` naming a local `resolved/`. The binary's pinned copy
-/// is deliberately not the fallback: a stale table that looks current is the
-/// failure this migration exists to remove.
-fn load_shared(offline: bool) -> Result<mitos_registry::Registry> {
-    if offline && std::env::var_os("ADDRESS_REGISTRY_DIR").is_none() {
-        bail!(
-            "--offline needs ADDRESS_REGISTRY_DIR — the shared address registry is \
-             fetched, not compiled in"
-        );
-    }
-    Ok(mitos_registry::source::load()
-        .context("loading the address registry")?
-        .registry)
-}
-
 pub fn run(args: SeedArgs) -> Result<()> {
     let registry = Registry::load(&args.registry)?;
     let mut ledger = Ledger::open(&args.db)?;
@@ -151,7 +132,7 @@ pub fn run(args: SeedArgs) -> Result<()> {
 
     // The SHARED registry: which stake keys are services rather than this
     // project. Hosted data, read once for the run.
-    let shared = load_shared(args.offline)?;
+    let shared = crate::registry::load_shared(args.offline)?;
 
     // --- frontier --------------------------------------------------------------
     let mut frontier = Frontier::new(registry.thresholds(), registry.terminal_parties(&shared));
