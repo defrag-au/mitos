@@ -1791,7 +1791,7 @@ pub fn tail_series(
 /// instead, so this wrapper is not in the shipped binary.
 #[cfg(test)]
 pub fn write_derived(dir: &Path) -> Result<()> {
-    write_derived_at(dir, None, None).map(|_| ())
+    write_derived_at(dir, None, None, &mitos_registry::Registry::pinned(), None).map(|_| ())
 }
 
 /// A policy's landing lock, by policy hex — `Scheduler::lock_for` in `serve`.
@@ -1822,13 +1822,15 @@ pub fn write_derived_at(
     dir: &Path,
     decimals: Option<u8>,
     lock: Option<LockFor>,
+    registry: &mitos_registry::Registry,
+    stamp: Option<&crate::address_registry::Stamp>,
 ) -> Result<Option<crate::segmentation::LpWanted>> {
     let policy = policy_of(dir);
     let landing = lock.map(|lock_for| lock_for(&policy));
     let _held = landing
         .as_ref()
         .map(|l| l.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-    let Some(manifest) = load_manifest(dir)? else {
+    let Some(mut manifest) = load_manifest(dir)? else {
         return Ok(None);
     };
     let Some(mut history) = History::open(dir)? else {
@@ -1881,15 +1883,30 @@ pub fn write_derived_at(
             immutable_to: key,
             complete,
             decimals,
-            classify: &classify_holder,
+            classify: &|address| classify_holder(address, registry),
         });
     // The tip decomposition is a re-read of the archive's own observations, so
     // the summary and the holder table cannot disagree about what is locked or
     // how much LP a provider owns.
-    let segmentation =
-        crate::segmentation::build(dir, summary.settled_to, &observations, movements, lock);
+    let segmentation = crate::segmentation::build(
+        dir,
+        summary.settled_to,
+        &observations,
+        movements,
+        lock,
+        registry,
+    );
     summary.apply_segmentation(segmentation);
     store_summary(dir, &summary, &checkpoints)?;
+    if let Some(stamp) = stamp {
+        manifest.registry = Some(policy_archive::manifest::RegistryStamp {
+            rev: stamp.rev.to_string(),
+            behaviour_sha256: stamp.behaviour_sha256.clone(),
+            stakes_sha256: stamp.stakes_sha256.clone(),
+            generated_at: stamp.generated_at.clone(),
+        });
+        store_manifest(dir, &manifest)?;
+    }
     Ok(crate::segmentation::lp_wanted(dir, &observations))
 }
 
@@ -1907,45 +1924,70 @@ fn policy_of(dir: &Path) -> String {
 ///
 /// WHAT, never WHO. A service run from an ordinary wallet (an exchange's hot
 /// wallet, a minting provider, a staking programme) is a claim about people,
-/// kept in the published stake-service table (`address_registry::published`)
-/// and applied by whoever DRAWS the summary, so a correction reaches every
-/// screen without rewriting a summary. This used to name such wallets from
-/// the compiled stake table and store them as venues, which put a person's
-/// wallet (listed once as Wayup) in summaries as a venue, and would have
-/// stored `$perpstaking` as one too.
-pub fn classify_holder(address: &str) -> (policy_archive::summary::Role, Option<String>) {
-    use address_registry::registry::{
-        AddressCategory as AC, RegistryNetwork, ScriptCategory as SC, lookup_address_match,
-        lookup_payment_credential,
-    };
+/// kept in the stake-service table and applied by whoever DRAWS the summary, so
+/// a correction reaches every screen without rewriting a summary. This used to
+/// name such wallets from the compiled stake table and store them as venues,
+/// which put a person's wallet (listed once as Wayup) in summaries as a venue,
+/// and would have stored `$perpstaking` as one too.
+pub fn classify_holder(
+    address: &str,
+    registry: &mitos_registry::Registry,
+) -> (policy_archive::summary::Role, Option<String>) {
     use policy_archive::summary::Role;
 
     let parts = policy_archive::trade::address_parts(address);
-    let by_credential = parts
-        .as_ref()
-        .and_then(|(pay, _)| lookup_payment_credential(pay))
-        .map(|e| (&e.category, e.category.to_string()));
-    let by_address = || {
-        lookup_address_match(address, RegistryNetwork::Mainnet)
-            .map(|(cat, _)| (cat, cat.to_string()))
+    // The exact address first: jpg.store's V1 sale and collection-offer
+    // contracts are one script under two delegation forms, and only the
+    // address tells them apart. A credential match is the weaker statement.
+    let exact = registry
+        .at_address(address)
+        .and_then(|(_, use_of)| role_of(use_of).map(|role| (role, use_of)));
+    let by_credential = || {
+        parts.as_ref().and_then(|(pay, _)| {
+            registry
+                .uses(pay)
+                .iter()
+                .filter_map(|use_of| role_of(use_of).map(|role| (role, use_of)))
+                .min_by_key(|(role, _)| rank(*role))
+        })
     };
-    if let Some((category, label)) = by_credential.or_else(by_address) {
-        let role = match category {
-            AC::Script(SC::Burn { .. }) => Some(Role::Burn),
-            AC::Script(SC::Vesting { .. }) => Some(Role::Lock),
-            AC::Script(SC::Staking { .. }) => Some(Role::Staking),
-            AC::Marketplace(_) | AC::Script(_) => Some(Role::Venue),
-            AC::Unknown => None,
-        };
-        if let Some(role) = role {
-            return (role, Some(label));
-        }
+    if let Some((role, use_of)) = exact.or_else(by_credential) {
+        return (role, Some(crate::address_registry::label(use_of)));
     }
     let stake = parts.as_ref().and_then(|(_, stake)| stake.as_deref());
-    let script = address_registry::registry::payment_credential_is_script(address);
+    let script = mitos_cohort::is_script_address(address);
     match (script, stake) {
         (true, None) => (Role::Contract, None),
         _ => (Role::Person, None),
+    }
+}
+
+/// What a registry use makes its holder. `Wallet` is a named service wallet —
+/// the only kind the registry carries — so it is a venue like the old compiled
+/// table's `Marketplace` rows were; an unnamed wallet is not registered at all.
+fn role_of(use_of: &mitos_registry::Contract) -> Option<policy_archive::summary::Role> {
+    use mitos_registry::Category;
+    use policy_archive::summary::Role;
+    match use_of.category {
+        Category::Burn => Some(Role::Burn),
+        Category::Vesting | Category::Lock => Some(Role::Lock),
+        Category::Staking => Some(Role::Staking),
+        Category::Wallet => use_of.label.as_ref().map(|_| Role::Venue),
+        _ => Some(Role::Venue),
+    }
+}
+
+/// Which role wins when one credential carries several. Burn outranks every
+/// claim about what a script is FOR, exactly as `mitos_cohort` orders it.
+fn rank(role: policy_archive::summary::Role) -> u8 {
+    use policy_archive::summary::Role;
+    match role {
+        Role::Burn => 0,
+        Role::Lock => 1,
+        Role::Staking => 2,
+        Role::Venue => 3,
+        Role::Contract => 4,
+        Role::Person => 5,
     }
 }
 
@@ -2056,7 +2098,13 @@ pub fn held_through(args: HeldThroughArgs) -> Result<()> {
         false => args.days.clone(),
     };
     let windows: Vec<u64> = days.iter().map(|d| d * 86_400).collect();
-    let Some(table) = held_through_table(&dir, args.at, &windows)? else {
+    let Some(table) = held_through_table(
+        &dir,
+        args.at,
+        &windows,
+        &crate::address_registry::load()?.registry,
+    )?
+    else {
         bail!("no archive at {}", dir.display());
     };
     let at = table.at_unix;
@@ -2139,7 +2187,11 @@ pub fn held_spans(args: HeldSpansArgs) -> Result<()> {
     let mut movements = history.all_movements()?.to_vec();
     movements.retain(|m| is_user_unit(&m.unit_name));
     let observations = read_observations(&dir, &manifest)?;
-    let positions = crate::segmentation::positions(&observations, &movements);
+    let positions = crate::segmentation::positions(
+        &observations,
+        &movements,
+        &crate::address_registry::load()?.registry,
+    );
     let table = fold_held_spans(&movements, &positions);
 
     let mut text = String::new();
@@ -2194,9 +2246,7 @@ pub fn fold_held_spans(
             .entry(position.owner.clone())
             .or_default()
             .push(HeldSpan {
-                from_slot: position
-                    .opened_unix
-                    .saturating_sub(MAINNET_SLOT_ZERO_UNIX),
+                from_slot: position.opened_unix.saturating_sub(MAINNET_SLOT_ZERO_UNIX),
                 from_unix: position.opened_unix,
                 to_unix: None,
             });
@@ -2251,6 +2301,7 @@ pub fn held_through_table(
     dir: &Path,
     at: Option<u64>,
     windows: &[u64],
+    registry: &mitos_registry::Registry,
 ) -> Result<Option<HeldThroughTable>> {
     let Some(manifest) = load_manifest(dir)? else {
         return Ok(None);
@@ -2262,7 +2313,7 @@ pub fn held_through_table(
     movements.retain(|m| is_user_unit(&m.unit_name));
     let observations = read_observations(dir, &manifest)?;
     let at_unix = at.unwrap_or_else(|| movements.iter().map(|m| m.block_time).max().unwrap_or(0));
-    let positions = crate::segmentation::positions(&observations, &movements);
+    let positions = crate::segmentation::positions(&observations, &movements, registry);
     Ok(Some(HeldThroughTable {
         at_unix,
         rows: fold_held_through(&movements, &positions, at_unix, windows),
@@ -2342,8 +2393,9 @@ pub fn summary(args: SummaryArgs) -> Result<()> {
     let dir = policy_dir(&args.archive_dir, &args.policy.to_lowercase());
     let started = std::time::Instant::now();
     let decimals = crate::registry::decimals(&args.tokens, &args.policy)?;
+    let loaded = crate::address_registry::load()?;
     if let Some(crate::segmentation::LpWanted { policy: lp, floor }) =
-        write_derived_at(&dir, decimals, None)?
+        write_derived_at(&dir, decimals, None, &loaded.registry, Some(&loaded.stamp))?
     {
         // By hand there is no scheduler to queue it; serve does this itself.
         eprintln!(
@@ -3641,7 +3693,7 @@ mod tests {
             "stake1uxwcw3rr36r8q9e5egy3e74cmazpjvx4t5ajsq50xhm568celda4g",
         ] {
             assert_eq!(
-                classify_holder(&wallet_under(stake)),
+                classify_holder(&wallet_under(stake), &mitos_registry::Registry::pinned(),),
                 (policy_archive::summary::Role::Person, None),
                 "{stake}"
             );
@@ -4462,7 +4514,13 @@ mod tests {
                     asked.lock().unwrap().push(p.to_string());
                     Arc::clone(&landing)
                 };
-                let out = write_derived_at(&dir, None, Some(&lock_for));
+                let out = write_derived_at(
+                    &dir,
+                    None,
+                    Some(&lock_for),
+                    &mitos_registry::Registry::pinned(),
+                    None,
+                );
                 done.store(true, Ordering::SeqCst);
                 out
             })

@@ -226,7 +226,6 @@ pallas-network = "1.4.0"
 
 # shared-crates
 cardano-assets = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3", features = ["cip14", "cip25"] }
-address-registry = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
 pipeline-types = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
 chain-ledger = { git = "https://github.com/defrag-au/shared-crates", rev = "aa9fe4ab6813576345e9036a9aff2bc3793518e3" }
 # The chain-neutral event vocabulary. `be4544a2` predates the crate, so this resolves
@@ -239,6 +238,9 @@ asset-metadata-index = { git = "https://github.com/defrag-au/shared-crates", rev
 # behaviour and stake-service tables are fetched, or embedded at build time, from
 # the rev-pinned URL — so this pin moves when a FIELD changes, never when a
 # contract is added. That is the whole point of the split.
+#
+# The compiled `shared-crates/address-registry` crate this replaced is gone:
+# every consumer reads these tables through `crates/mitos-registry`.
 address-registry-schema = { git = "https://github.com/theyexist/address-registry", rev = "45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995" }
 
 # Async runtime + HTTP server.
@@ -338,7 +340,6 @@ strip = "symbols"
 # cardano-assets = { path = "../shared-crates/cardano-assets" }
 # pipeline-types = { path = "../shared-crates/pipeline/pipeline-types" }
 # chain-ledger = { path = "../shared-crates/chain-ledger" }
-# address-registry = { path = "../shared-crates/address-registry" }
 # chain-events = { path = "../shared-crates/chain/chain-events" }
 
 # `pallas-validate`'s Conway phase-1 resolves UTxOs with `as_conway`, which

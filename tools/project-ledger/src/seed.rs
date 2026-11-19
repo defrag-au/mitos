@@ -60,7 +60,9 @@ pub struct SeedArgs {
     #[arg(long)]
     floor: Option<u64>,
 
-    /// Don't call Koios; requires `--floor` or a `floor` in the registry.
+    /// No network at all. The floor must then come from `--floor` or the
+    /// registry, and the shared address registry from `ADDRESS_REGISTRY_DIR`
+    /// (a checkout's `resolved/`) rather than the hosted repository.
     #[arg(long)]
     offline: bool,
 
@@ -90,6 +92,25 @@ pub struct SeedArgs {
     /// only that a command line asserted it.
     #[arg(long = "project-side", value_name = "STAKE")]
     project_side: Vec<String>,
+}
+
+/// The SHARED address registry for this run — the stake keys that are services
+/// rather than this project.
+///
+/// The data is hosted, so `--offline` (no network) can only be honoured with
+/// `ADDRESS_REGISTRY_DIR` naming a local `resolved/`. The binary's pinned copy
+/// is deliberately not the fallback: a stale table that looks current is the
+/// failure this migration exists to remove.
+fn load_shared(offline: bool) -> Result<mitos_registry::Registry> {
+    if offline && std::env::var_os("ADDRESS_REGISTRY_DIR").is_none() {
+        bail!(
+            "--offline needs ADDRESS_REGISTRY_DIR — the shared address registry is \
+             fetched, not compiled in"
+        );
+    }
+    Ok(mitos_registry::source::load()
+        .context("loading the address registry")?
+        .registry)
 }
 
 pub fn run(args: SeedArgs) -> Result<()> {
@@ -128,8 +149,12 @@ pub fn run(args: SeedArgs) -> Result<()> {
     };
     let walk_start = floor.saturating_sub(args.margin);
 
+    // The SHARED registry: which stake keys are services rather than this
+    // project. Hosted data, read once for the run.
+    let shared = load_shared(args.offline)?;
+
     // --- frontier --------------------------------------------------------------
-    let mut frontier = Frontier::new(registry.thresholds(), registry.terminal_parties());
+    let mut frontier = Frontier::new(registry.thresholds(), registry.terminal_parties(&shared));
     for w in &registry.wallets {
         frontier
             .seed(stake_party(&w.stake), Role::Declared, walk_start)
@@ -153,7 +178,7 @@ pub fn run(args: SeedArgs) -> Result<()> {
     // like. Seated terminal for every project automatically, so a new
     // collection does not have to rediscover that its mint provider is not
     // part of the project.
-    for (stake, label) in crate::registry::Registry::registry_services() {
+    for (stake, label) in Registry::registry_services(&shared) {
         frontier.seed_terminal(stake_party(&stake), walk_start);
         tracing::info!(%stake, %label, "seed: shared service seated terminal from the address registry");
     }

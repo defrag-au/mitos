@@ -255,6 +255,8 @@ pub fn pack(args: PackArgs) -> Result<()> {
     let Some(manifest) = load_manifest(&dir)? else {
         bail!("no archive at {}", dir.display());
     };
+    let loaded = crate::address_registry::load()?;
+    let registry = &loaded.registry;
     if manifest.completeness() != Completeness::Complete {
         bail!(
             "{policy}: the archive does not reach back to the first mint, so a party's \
@@ -517,7 +519,7 @@ pub fn pack(args: PackArgs) -> Result<()> {
             // payouts are already read as distributions.
             Kind::UnclaimedScript { address, .. } => {
                 let airdrop = mitos_cohort::payment_cred(address)
-                    .is_some_and(|c| crate::policy_api::airdropper(&c).is_some());
+                    .is_some_and(|c| crate::policy_api::airdropper(&c, registry).is_some());
                 if airdrop {
                     skipped.airdrop += 1;
                 } else {
@@ -576,7 +578,7 @@ pub fn pack(args: PackArgs) -> Result<()> {
             _ => {}
         }
     }
-    let roles = roles_file(&mut parties, &movements, &pools);
+    let roles = roles_file(&mut parties, &movements, &pools, registry);
     write(token_tape::ROLES_PATH, &roles.encode())?;
     // The pages: what a replay fetches, one request each.
     let grid = token_tape::grid(
@@ -797,6 +799,7 @@ fn roles_file(
     parties: &mut Parties,
     movements: &[Movement],
     pools: &[token_tape::Pool],
+    registry: &mitos_registry::Registry,
 ) -> token_tape::Roles {
     use token_tape::Role;
     let mut sample: BTreeMap<u32, &str> = BTreeMap::new();
@@ -827,7 +830,7 @@ fn roles_file(
         ) {
             (true, _) => Some(Role::Pool),
             (_, true) => Some(Role::Venue),
-            _ => sample.get(&party).and_then(|a| role_of(a, key)),
+            _ => sample.get(&party).and_then(|a| role_of(a, key, registry)),
         };
         if let Some(role) = role {
             entries.push((party, role));
@@ -838,54 +841,75 @@ fn roles_file(
 
 /// What kind of holder `address` (one of `key`'s) is, or `None` for a
 /// person. Mirrors the arena's `story::role_of`; see it for the cases.
-fn role_of(address: &str, key: &PartyKey) -> Option<token_tape::Role> {
-    use address_registry::{
-        AddressCategory as AC, MatchKind, RegistryNetwork, ScriptCategory as SC,
-        StakeServiceKind as SK,
-    };
+fn role_of(
+    address: &str,
+    key: &PartyKey,
+    registry: &mitos_registry::Registry,
+) -> Option<token_tape::Role> {
+    use mitos_registry::{Category, StakeServiceKind};
     use token_tape::Role;
-    let by_class = |cat: &AC| match cat {
-        AC::Script(SC::Burn { .. }) => Some(Role::Burn),
-        AC::Script(SC::Vesting { .. }) => Some(Role::Lock),
-        AC::Script(SC::Staking { .. }) => Some(Role::Staking),
-        _ => None,
+    let for_use = |use_of: &mitos_registry::Contract| match use_of.category {
+        Category::Burn => Some(Role::Burn),
+        Category::Vesting | Category::Lock => Some(Role::Lock),
+        Category::Staking => Some(Role::Staking),
+        // A named wallet is a service the registry attributes to an operator;
+        // an unnamed one is not registered at all.
+        Category::Wallet => use_of.label.as_ref().map(|_| Role::Venue),
+        Category::Exchange
+        | Category::Marketplace
+        | Category::Launchpad
+        | Category::Minter
+        | Category::Defi
+        | Category::Airdropper => Some(Role::Venue),
     };
-    // The WHOLE address, stake included: the registered entity's.
-    let hit = address_registry::lookup_address_match(address, RegistryNetwork::Mainnet);
-    if let Some((cat, MatchKind::Exact)) = hit {
-        return match cat {
-            AC::Unknown => None,
-            AC::Marketplace(_) | AC::Script(_) => by_class(cat).or(Some(Role::Venue)),
-        };
+    // The WHOLE address, stake included: the registered entity's. Exact first,
+    // because one script can serve two jobs under two delegation forms.
+    if let Some((_, use_of)) = registry.at_address(address) {
+        return for_use(use_of);
     }
     // The SCRIPT only: a sink or a lock whatever stake it carries; a venue's
     // script only when the stake is not a wallet's (a wallet's stake on a
     // venue script is that wallet's listing or order, and still the wallet's).
-    let script = match hit {
-        Some((cat, MatchKind::VariableStakePrefix)) => Some(cat),
-        _ => policy_archive::trade::address_parts(address)
-            .and_then(|(cred, _)| address_registry::lookup_payment_credential(&cred))
-            .map(|e| &e.category),
-    };
     let wallet_stake = matches!(key, PartyKey::StakeKey(_));
-    if let Some(cat) = script {
-        if let Some(role) = by_class(cat) {
-            return Some(role);
-        }
-        if matches!(cat, AC::Marketplace(_) | AC::Script(_)) && !wallet_stake {
-            return Some(Role::Venue);
+    if let Some((cred, _)) = policy_archive::trade::address_parts(address) {
+        let strongest = registry
+            .uses(&cred)
+            .iter()
+            .filter_map(|use_of| for_use(use_of).map(|role| (rank(role), role)))
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, role)| role);
+        match strongest {
+            Some(Role::Venue) if wallet_stake => {}
+            Some(role) => return Some(role),
+            None => {}
         }
     }
     if let Some(stake) = stake_address(key)
-        && let Some(service) = address_registry::lookup_stake(&stake)
+        && let Some(service) = registry.stake(&stake)
     {
         return Some(match service.kind {
-            SK::Exchange | SK::Marketplace | SK::MintingProvider => Role::Venue,
-            SK::Staking => Role::Staking,
+            StakeServiceKind::Exchange
+            | StakeServiceKind::Marketplace
+            | StakeServiceKind::MintingProvider => Role::Venue,
+            StakeServiceKind::Staking => Role::Staking,
         });
     }
     let script_payment = mitos_cohort::is_script_address(address);
     (script_payment && matches!(key, PartyKey::Address(_))).then_some(Role::Contract)
+}
+
+/// Burn outranks every claim about what a script is FOR, as the classifier
+/// orders it; the rest only need to be deterministic.
+fn rank(role: token_tape::Role) -> u8 {
+    use token_tape::Role;
+    match role {
+        Role::Burn => 0,
+        Role::Lock => 1,
+        Role::Staking => 2,
+        Role::Venue => 3,
+        Role::Pool => 4,
+        Role::Contract => 5,
+    }
 }
 
 /// A stake-keyed party's stake address (`stake1…`), as the registry keys its

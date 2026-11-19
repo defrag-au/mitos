@@ -45,11 +45,12 @@ pub fn build(
     observations: &[Observation],
     movements: &[policy_archive::Movement],
     lock: Option<LockFor>,
+    registry: &mitos_registry::Registry,
 ) -> Segmentation {
     let by_payment = payment_map(movements);
     let by_address = address_balances(movements);
     let by_key = representative_addresses(movements);
-    let vests = vesting(observations, &by_payment, &by_key, &by_address);
+    let vests = vesting(observations, &by_payment, &by_key, &by_address, registry);
     let lp = lp_decomposition(dir, observations, &by_address, lock);
     Segmentation { as_of, vests, lp }
 }
@@ -138,10 +139,11 @@ pub struct Position {
 pub fn positions(
     observations: &[Observation],
     movements: &[policy_archive::Movement],
+    registry: &mitos_registry::Registry,
 ) -> Vec<Position> {
     let by_payment = payment_map(movements);
     let by_address = address_balances(movements);
-    scaled_positions(observations, &by_payment, &by_address)
+    scaled_positions(observations, &by_payment, &by_address, registry)
 }
 
 fn payment_map(movements: &[policy_archive::Movement]) -> HashMap<String, String> {
@@ -210,9 +212,10 @@ fn vesting(
     by_payment: &HashMap<String, String>,
     by_key: &HashMap<String, String>,
     by_address: &HashMap<&str, i64>,
+    registry: &mitos_registry::Registry,
 ) -> Vec<VestOwner> {
     let mut owners: BTreeMap<String, VestOwner> = BTreeMap::new();
-    for position in scaled_positions(observations, by_payment, by_address) {
+    for position in scaled_positions(observations, by_payment, by_address, registry) {
         let owner = owners
             .entry(position.owner.clone())
             .or_insert_with(|| VestOwner {
@@ -244,10 +247,11 @@ fn scaled_positions(
     observations: &[Observation],
     by_payment: &HashMap<String, String>,
     by_address: &HashMap<&str, i64>,
+    registry: &mitos_registry::Registry,
 ) -> Vec<Position> {
     let mut pending: BTreeMap<String, Vec<PendingVest>> = BTreeMap::new();
     for o in observations {
-        let Some(style) = vest_style(&o.address) else {
+        let Some(style) = vest_style(&o.address, registry) else {
             continue;
         };
         let Some(datum) = o.datum.as_deref() else {
@@ -335,7 +339,7 @@ fn scale_to(current: u64, observed: u64, amounts: Vec<u64>) -> Vec<u64> {
     out
 }
 
-fn vest_style(address: &str) -> Option<VestStyle> {
+fn vest_style(address: &str, registry: &mitos_registry::Registry) -> Option<VestStyle> {
     let cred = mitos_cohort::payment_cred(address)?;
     if mitos_vesting_decode::crowd_lock::is_crowd_lock(&cred) {
         Some(VestStyle::CrowdLock)
@@ -345,7 +349,14 @@ fn vest_style(address: &str) -> Option<VestStyle> {
         // Staked, not vesting: its datum's date is when it was staked. `Other` keeps the
         // summary's wire format, and the owner is what a reader of the vests needs.
         Some(VestStyle::Other)
-    } else if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Vesting {
+    } else if registry.uses(&hex::encode(cred)).iter().any(|use_of| {
+        matches!(
+            use_of.category,
+            mitos_registry::Category::Vesting | mitos_registry::Category::Lock
+        )
+    }) {
+        // Registered as a lock whose datum no decoder here reads: still a vest,
+        // with no schedule — the same weaker evidence the cohort records.
         Some(VestStyle::Other)
     } else {
         None
@@ -656,7 +667,13 @@ mod tests {
         // B was claimed: the site now holds only A's amount.
         let rows = policy_archive::live(vec![spend_of(200, &b), a.clone(), b]);
         let balances = HashMap::from([(SITE, 1_035_179)]);
-        let owners = vesting(&rows, &HashMap::new(), &HashMap::new(), &balances);
+        let owners = vesting(
+            &rows,
+            &HashMap::new(),
+            &HashMap::new(),
+            &balances,
+            &mitos_registry::Registry::pinned(),
+        );
 
         assert_eq!(owners.len(), 1, "the claimed position names no owner");
         let only = &owners[0];
@@ -686,7 +703,13 @@ mod tests {
                 "owner-b".to_string(),
             ),
         ]);
-        let owners = vesting(&[a, b], &by_payment, &HashMap::new(), &balances);
+        let owners = vesting(
+            &[a, b],
+            &by_payment,
+            &HashMap::new(),
+            &balances,
+            &mitos_registry::Registry::pinned(),
+        );
         assert_eq!(owners.len(), 2);
         let total: u64 = owners.iter().map(|o| o.amount).sum();
         assert_eq!(total, 1_035_179, "scaled to the balance, sum preserved");

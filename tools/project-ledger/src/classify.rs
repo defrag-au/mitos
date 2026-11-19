@@ -31,10 +31,6 @@
 
 use std::path::PathBuf;
 
-use address_registry::{
-    AddressCategory, MatchKind, RegistryNetwork, ScriptCategory, StakeServiceKind,
-    lookup_address_match, lookup_stake, payment_credential_is_script,
-};
 use anyhow::Result;
 use chain_ledger::{Basis, ProviderCapability};
 
@@ -103,39 +99,35 @@ pub struct ClassifyArgs {
     pub sweep_min_relays: u32,
 }
 
-/// Map a registry category onto the kinds this ledger cares about.
+/// Map a registry use onto the kinds this ledger cares about.
 ///
 /// Deliberately coarse. The question here is "did this value come back from a
 /// service rather than from a person", and a pool, a batcher and an order
 /// contract all answer it the same way.
-fn kind_of(cat: &AddressCategory) -> Option<(ProviderCapability, Option<String>)> {
-    match cat {
+fn kind_of(use_of: &mitos_registry::Contract) -> Option<(ProviderCapability, Option<String>)> {
+    use mitos_registry::Category;
+    match use_of.category {
         // The registry's `Exchange` means an ON-CHAIN venue — every entry is a
-        // DEX, an AMM or an aggregator (Minswap, Splash, CSWAP, DexHunter). It
-        // never means a centralised exchange, which has no script address to
-        // register. That distinction is not pedantry: a DEX is a round trip and
-        // a CEX is a boundary, and confusing them either erases real income or
-        // invents it.
-        AddressCategory::Script(ScriptCategory::Exchange { label }) => {
-            Some((ProviderCapability::Dex, Some((*label).to_string())))
-        }
-        AddressCategory::Script(ScriptCategory::Marketplace { marketplace, .. }) => Some((
+        // DEX, an AMM or an aggregator. It never means a centralised exchange,
+        // which has no script address to register. That distinction is not
+        // pedantry: a DEX is a round trip and a CEX is a boundary, and
+        // confusing them either erases real income or invents it.
+        Category::Exchange => Some((ProviderCapability::Dex, use_of.label.clone())),
+        Category::Marketplace => Some((
             ProviderCapability::Marketplace,
-            Some(format!("{marketplace:?}")),
+            use_of.label.clone().or_else(|| use_of.market.clone()),
         )),
-        AddressCategory::Script(ScriptCategory::DeFi { label, .. }) => {
-            Some((ProviderCapability::Lending, Some((*label).to_string())))
-        }
+        Category::Defi => Some((ProviderCapability::Lending, use_of.label.clone())),
         _ => None,
     }
 }
 
 /// Whether a registry hit may NAME the party it was found on.
 ///
-/// A prefix hit identified only the payment SCRIPT — order and listing
-/// contracts keep the CUSTOMER's staking credential on the script address, so
-/// for a stake-keyed party the hit may mean "this person once placed a Splash
-/// order", not "this is Splash". The discriminator is the party's other
+/// A hit from the payment SCRIPT only identified the contract — order and
+/// listing contracts keep the CUSTOMER's staking credential on the script
+/// address, so for a stake-keyed party it may mean "this person once placed a
+/// Splash order", not "this is Splash". The discriminator is the party's other
 /// addresses: a venue's stake credential lives exclusively behind scripts,
 /// while a person also owns ordinary key-payment addresses. Getting this wrong
 /// named 168 Mekka customers "Splash" and fed their real marketplace purchases
@@ -144,15 +136,45 @@ fn kind_of(cat: &AddressCategory) -> Option<(ProviderCapability, Option<String>)
 /// Known residue: a party seen ONLY via its order-script address still passes,
 /// but such a party has no key-payment footprint in this ledger, so every leg
 /// it touches is genuinely DEX-shaped anyway.
-fn hit_names_the_party(match_kind: MatchKind, addrs: &[String]) -> bool {
-    match match_kind {
-        MatchKind::Exact => true,
-        MatchKind::VariableStakePrefix => addrs.iter().all(|a| payment_credential_is_script(a)),
+fn hit_names_the_party(exact: bool, addrs: &[String]) -> bool {
+    exact || addrs.iter().all(|a| payment_credential_is_script(a))
+}
+
+/// Whether an address pays to a script — a contract rather than somebody's
+/// wallet. Also answers for a party key, which may be a stake address.
+///
+/// A PREFIX test, deliberately: the type nibble that says "script payment"
+/// lands in the first character after the human-readable part (`z`, `x`, `2`
+/// and `w` are the script-payment types), and this is asked of every address of
+/// every counterparty. The addresses come from decoded chain output, so they
+/// are valid bech32 by construction and a decode would buy nothing but a parse.
+/// The one thing it must not do is guess: a stake key, a Byron address or
+/// anything else answers false.
+fn payment_credential_is_script(address: &str) -> bool {
+    let data = address
+        .strip_prefix("addr1")
+        .or_else(|| address.strip_prefix("addr_test1"));
+    matches!(
+        data.and_then(|d| d.chars().next()),
+        Some('z' | 'x' | '2' | 'w')
+    )
+}
+
+/// The payment credential an address pays to, for the registry's script lookup.
+fn payment_credential(address: &str) -> Option<[u8; 28]> {
+    match pallas_addresses::Address::from_bech32(address).ok()? {
+        pallas_addresses::Address::Shelley(sh) => match sh.payment() {
+            pallas_addresses::ShelleyPaymentPart::Key(h)
+            | pallas_addresses::ShelleyPaymentPart::Script(h) => Some(**h),
+        },
+        _ => None,
     }
 }
 
 pub fn run(args: &ClassifyArgs) -> Result<()> {
     let mut ledger = Ledger::open(&args.db)?;
+    let loaded = mitos_registry::source::load()?;
+    let registry = &loaded.registry;
 
     // Everything this pass writes is re-derived from the ledger and the
     // registry, so start clean. Without this, a FIXED rule cannot retract what
@@ -187,11 +209,20 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
         // First address the registry recognises wins; a party's addresses all
         // belong to one wallet, so two answers would be a registry conflict
         // rather than something to average.
-        if let Some((addr, match_kind, (cap, label))) = addrs.iter().find_map(|a| {
-            lookup_address_match(a, RegistryNetwork::Mainnet)
-                .and_then(|(c, mk)| kind_of(c).map(|k| (a.clone(), mk, k)))
+        if let Some((addr, exact, (cap, label))) = addrs.iter().find_map(|a| {
+            // Exact first: one script can serve two jobs under two delegation
+            // forms, and only the address tells them apart.
+            if let Some((_, use_of)) = registry.at_address(a) {
+                return kind_of(use_of).map(|kind| (a.clone(), true, kind));
+            }
+            let cred = payment_credential(a)?;
+            let hex = hex::encode(cred);
+            registry
+                .uses(&hex)
+                .iter()
+                .find_map(|use_of| kind_of(use_of).map(|kind| (a.clone(), false, kind)))
         }) {
-            if hit_names_the_party(match_kind, &addrs) {
+            if hit_names_the_party(exact, &addrs) {
                 caps.push((cap, Basis::Asserted));
                 name = label;
                 sources.push(format!("address-registry: {}", elide(&addr)));
@@ -207,31 +238,37 @@ pub fn run(args: &ClassifyArgs) -> Result<()> {
         // Asserted, and it may name the party: unlike a script-prefix hit,
         // this credential belongs to the service itself, so there is no
         // customer to mislabel.
-        if let Some(svc) = lookup_stake(&key) {
+        if let Some(svc) = registry.stake(&key) {
             caps.push((
-                // EXHAUSTIVE on purpose — no `_` arm. `address-registry` adds
-                // a variant when a new class of shared service is named, and a
-                // catch-all would silently classify it as something it is not.
-                // A compile error is the correct outcome: it puts the decision
-                // in front of someone.
+                // EXHAUSTIVE on purpose — no `_` arm. The registry's kind
+                // vocabulary grows deliberately, and a catch-all would silently
+                // classify a new class of shared service as something it is
+                // not. A compile error is the correct outcome: it puts the
+                // decision in front of someone.
                 match svc.kind {
-                    StakeServiceKind::MintingProvider => ProviderCapability::Minting,
+                    mitos_registry::StakeServiceKind::MintingProvider => {
+                        ProviderCapability::Minting
+                    }
                     // Both share the holder problem the registry exists to
                     // solve: liquidity and listings sit at their addresses, so
                     // they top every holder list. Naming them is what stops a
                     // walk expanding into thousands of unrelated sellers.
-                    StakeServiceKind::Marketplace => ProviderCapability::Marketplace,
-                    StakeServiceKind::Exchange => ProviderCapability::Dex,
+                    mitos_registry::StakeServiceKind::Marketplace => {
+                        ProviderCapability::Marketplace
+                    }
+                    mitos_registry::StakeServiceKind::Exchange => ProviderCapability::Dex,
                     // A staking programme run from a wallet, for tokens or
                     // NFTs: holders send it their assets and get them back,
                     // so value from it is their own returning (a round trip),
                     // and what it holds is theirs, pooled.
-                    StakeServiceKind::Staking => ProviderCapability::Staking,
+                    mitos_registry::StakeServiceKind::Staking => ProviderCapability::Staking,
                 },
                 Basis::Asserted,
             ));
-            name = Some(svc.label.to_string());
-            sources.push(format!("stake-registry: {}", svc.source));
+            name = Some(svc.label.clone());
+            // The stake lookup carries no prose: the evidence lives in the
+            // registry row and is published in `stake-services.json`.
+            sources.push(format!("stake-registry: {}", svc.stake_address()));
         }
         // Minting is ADDITIVE, not an alternative. `bank.pillar` is both a
         // mint provider and (elsewhere) a payout service, and the old
@@ -516,8 +553,6 @@ fn elide(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use address_registry::lookup_address;
-
     use super::*;
 
     /// The treasury pattern is MAJORITY OF VALUE across a real number of
@@ -564,7 +599,7 @@ mod tests {
             // their order UTxO — Splash script, THEIR stake credential
             "addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207qd7c9k425ezp5cw8a3ssg".to_string(),
         ];
-        assert!(!hit_names_the_party(MatchKind::VariableStakePrefix, &addrs));
+        assert!(!hit_names_the_party(false, &addrs));
     }
 
     /// A pool's stake credential exists only behind script addresses, so the
@@ -573,9 +608,9 @@ mod tests {
     #[test]
     fn an_all_script_party_is_still_the_venue() {
         let addrs = vec!["addr1z9ryamhgnuz6lau86sqytte2gz5rlktv2yce05e0h3207qpoolcred".to_string()];
-        assert!(hit_names_the_party(MatchKind::VariableStakePrefix, &addrs));
+        assert!(hit_names_the_party(false, &addrs));
         // and a full-address registry entry vouches for its stake itself
-        assert!(hit_names_the_party(MatchKind::Exact, &addrs));
+        assert!(hit_names_the_party(true, &addrs));
     }
 
     /// The off-ramp verdict, on the measured shapes: dwess's real exit (one
@@ -618,8 +653,11 @@ mod tests {
     #[test]
     fn the_registry_names_the_minswap_batcher_as_a_dex() {
         let addr = "addr1w8p79rpkcdz8x9d6tft0x0dx5mwuzac2sa4gm8cvkw5hcnqst2ctf";
-        let cat = lookup_address(addr).expect("batcher is in the registry");
-        let (cap, label) = kind_of(cat).expect("a venue");
+        let registry = mitos_registry::Registry::pinned();
+        let (_, use_of) = registry
+            .at_address(addr)
+            .expect("batcher is in the registry");
+        let (cap, label) = kind_of(use_of).expect("a venue");
         // DEX, emphatically not CEX: a swap is a round trip, an exchange
         // withdrawal is money from outside. Conflating them either erases real
         // income or invents it.
@@ -634,7 +672,12 @@ mod tests {
     #[test]
     fn a_plain_wallet_is_left_unnamed() {
         let addr = "stake1u98f5mr0mn8tv2kqndk5cwen4uasc7cewlzdklz6y664zacl9lvjz";
-        assert!(lookup_address(addr).and_then(kind_of).is_none());
+        assert!(
+            mitos_registry::Registry::pinned()
+                .at_address(addr)
+                .is_none(),
+            "a stake address is not an output address"
+        );
     }
 
     /// A mint provider and an exchange are both high-fan-out services that must

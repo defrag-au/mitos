@@ -312,6 +312,10 @@ pub struct PolicyHub {
     /// `scheduler.rs`.
     pub(crate) sched: crate::scheduler::Scheduler,
     bearer: Option<String>,
+    /// The address registry, loaded once at startup, and the stamp for its
+    /// bytes. Read by every role/label/cohort lookup; recorded in each summary.
+    pub registry: mitos_registry::Registry,
+    pub stamp: crate::address_registry::Stamp,
     /// policy → (the archive's `updated_unix` it was folded at, the table).
     ///
     /// # ⚠️ Cached because the fold pages EVERY movement row
@@ -395,6 +399,10 @@ pub struct HubConfig {
     /// How many workers of each kind.
     pub pool: crate::scheduler::Pool,
     pub bearer: Option<String>,
+    /// The address registry, loaded once at startup, and the stamp for its
+    /// bytes — every summary this process folds records both.
+    pub registry: mitos_registry::Registry,
+    pub stamp: crate::address_registry::Stamp,
 }
 
 impl PolicyHub {
@@ -407,6 +415,8 @@ impl PolicyHub {
             policy_index_dir,
             pool,
             bearer,
+            registry,
+            stamp,
         } = cfg;
         let index = tx_index_dir.and_then(|dir| {
             match tx_index::IndexHandle::open(&dir, &data_dir.join("immutable")) {
@@ -463,6 +473,8 @@ impl PolicyHub {
             policy_index_dir,
             sched: crate::scheduler::Scheduler::new(),
             bearer,
+            registry,
+            stamp,
             holders: Mutex::new(HashMap::new()),
             series: Mutex::new(HashMap::new()),
             held_through: Mutex::new(HashMap::new()),
@@ -1484,19 +1496,28 @@ impl UnrecognisedKind {
     ///
     /// Burn first, as `mitos_cohort::classify` orders it: provably gone
     /// outranks every claim about what a script is FOR.
-    fn of(address: &str, cred: Option<&[u8; 28]>) -> (Self, Option<&'static str>) {
+    fn of(
+        address: &str,
+        cred: Option<&[u8; 28]>,
+        registry: &mitos_registry::Registry,
+    ) -> (Self, Option<String>) {
         use mitos_dex_decode::venue::{SNEK_FUN, SiteRole, site_of};
-        if mitos_cohort::classify(address, &[], &[]).cohort == mitos_cohort::Cohort::Burn {
+        if mitos_cohort::classify_with(address, &[], &[], registry).cohort
+            == mitos_cohort::Cohort::Burn
+        {
             return (UnrecognisedKind::Burn, None);
         }
         let stake = mitos_cohort::stake_cred(address);
         if let Some(site) = site_of(address, cred, stake.as_ref()) {
             return match site.role {
-                SiteRole::Pool => (UnrecognisedKind::UndecodedPool, Some(site.venue)),
+                SiteRole::Pool => (
+                    UnrecognisedKind::UndecodedPool,
+                    Some(site.venue.to_string()),
+                ),
                 // An order book's resting orders and its escrows hold
                 // traders' assets, as an order contract does: not a gap.
                 SiteRole::Order | SiteRole::Book | SiteRole::Escrow => {
-                    (UnrecognisedKind::Order, Some(site.venue))
+                    (UnrecognisedKind::Order, Some(site.venue.to_string()))
                 }
             };
         }
@@ -1506,34 +1527,36 @@ impl UnrecognisedKind {
         if mitos_launchpad_decode::is_snek_fun_curve(cred) {
             // The bonding curve IS decoded as a pool; one that was not is the
             // same gap as any other undecoded pool.
-            (UnrecognisedKind::UndecodedPool, Some(SNEK_FUN))
+            (UnrecognisedKind::UndecodedPool, Some(SNEK_FUN.to_string()))
         } else if mitos_launchpad_decode::is_snek_fun_order(cred) {
-            (UnrecognisedKind::Order, Some(SNEK_FUN))
+            (UnrecognisedKind::Order, Some(SNEK_FUN.to_string()))
         } else if mitos_vesting_decode::crowd_lock::is_crowd_lock(cred) {
-            (UnrecognisedKind::Lock, Some("crowdlock"))
+            (UnrecognisedKind::Lock, Some("crowdlock".to_string()))
         } else if mitos_vesting_decode::snek_fun::is_snek_fun(cred) {
-            (UnrecognisedKind::Lock, Some(SNEK_FUN))
+            (UnrecognisedKind::Lock, Some(SNEK_FUN.to_string()))
         } else if mitos_vesting_decode::perps_staking::is_perps_staking(cred) {
-            (UnrecognisedKind::Lock, Some("perps-staking"))
-        } else if let Some(label) = airdropper(cred) {
-            // "Unknown" is the registry saying nobody is named: no operator.
-            (
-                UnrecognisedKind::Airdrop,
-                (label != "Unknown").then_some(label),
-            )
+            (UnrecognisedKind::Lock, Some("perps-staking".to_string()))
+        } else if let Some(drop) = airdropper(cred, registry) {
+            // An airdropper whose operator nobody named carries no label — the
+            // old compiled table spelled that `"Unknown"`, the authored one
+            // simply omits it. Both mean the same thing here.
+            let operator = drop.label.clone().filter(|label| label != "Unknown");
+            (UnrecognisedKind::Airdrop, operator)
         } else {
             (UnrecognisedKind::UnknownScript, None)
         }
     }
 }
 
-/// The operator label of a script the address registry calls an airdropper.
-pub(crate) fn airdropper(cred: &[u8; 28]) -> Option<&'static str> {
-    use address_registry::{AddressCategory, ScriptCategory};
-    match address_registry::registry::lookup_payment_credential(&hex::encode(cred))?.category {
-        AddressCategory::Script(ScriptCategory::Airdropper { label }) => Some(label),
-        _ => None,
-    }
+/// The airdropper row for a script, when the registry has one.
+pub(crate) fn airdropper<'a>(
+    cred: &[u8; 28],
+    registry: &'a mitos_registry::Registry,
+) -> Option<&'a mitos_registry::Contract> {
+    registry
+        .uses(&hex::encode(cred))
+        .iter()
+        .find(|use_of| use_of.category == mitos_registry::Category::Airdropper)
 }
 
 /// Unrecognised outputs, by what they are — `PolicyPoolsResponse::unrecognised`.
@@ -1574,7 +1597,7 @@ pub struct UnrecognisedScriptDto {
     /// launchpad for a pool or order, the platform for a lock (`crowdlock`,
     /// `snek.fun`). Absent for a burn sink and an unknown script.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub venue: Option<&'static str>,
+    pub venue: Option<String>,
     /// The payment credential, hex. Absent for an address that has none (not
     /// Shelley), which is then its own entry.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1592,10 +1615,13 @@ pub struct UnrecognisedScriptDto {
 /// Every unrecognised output grouped by script and classified, in priority
 /// order: kind, then most outputs, then credential and address, so the order
 /// is stable.
-fn unrecognised_scripts(rows: &[policy_archive::Observation]) -> Vec<UnrecognisedScriptDto> {
+fn unrecognised_scripts(
+    rows: &[policy_archive::Observation],
+    registry: &mitos_registry::Registry,
+) -> Vec<UnrecognisedScriptDto> {
     struct Seen<'a> {
         kind: UnrecognisedKind,
-        venue: Option<&'static str>,
+        venue: Option<String>,
         credential: Option<String>,
         outputs: usize,
         newest: (u64, &'a str),
@@ -1608,7 +1634,7 @@ fn unrecognised_scripts(rows: &[policy_archive::Observation]) -> Vec<Unrecognise
         // Keyed by credential; an address with none keys on itself.
         let key = credential.clone().unwrap_or_else(|| o.address.clone());
         let seen = by.entry(key).or_insert_with(|| {
-            let (kind, venue) = UnrecognisedKind::of(&o.address, cred.as_ref());
+            let (kind, venue) = UnrecognisedKind::of(&o.address, cred.as_ref(), registry);
             Seen {
                 kind,
                 venue,
@@ -1708,7 +1734,7 @@ pub async fn unrecognised(
         Some(m) => crate::archive::read_observations(&dir, m).map_err(internal)?,
         None => Vec::new(),
     };
-    let mut scripts = unrecognised_scripts(&rows);
+    let mut scripts = unrecognised_scripts(&rows, &hub.registry);
     let (outputs, by_kind) = unrecognised_totals(&scripts);
     if let Some(kind) = q.kind {
         scripts.retain(|s| s.kind == kind);
@@ -1760,7 +1786,7 @@ pub async fn pools(
     let walked_to = manifest.as_ref().and_then(|m| m.walk_to());
     let at = judged_at(walked_to, &rows);
     let mut table = pools_of(policy.clone(), manifest.is_some(), &view, at);
-    table.unrecognised = unrecognised_summary(unrecognised_scripts(&rows));
+    table.unrecognised = unrecognised_summary(unrecognised_scripts(&rows, &hub.registry));
     let job = hub.get(&policy);
     table.status = walk_status(manifest.is_some(), hub.walking(&policy), job.as_ref());
     table.walked_from = manifest.as_ref().and_then(|m| m.walk_from());
@@ -2249,7 +2275,7 @@ pub async fn live(
     // existed — never a failed document.
     let (burned, stats) = match live_folds(&hub, &policy) {
         Ok((fold, series)) => (
-            burn_split(&fold).0,
+            burn_split(&fold, &hub.registry).0,
             Some(StatsDto::from(series.stats(crate::reverse::now_unix()))),
         ),
         Err(e) => {
@@ -2614,11 +2640,14 @@ pub(crate) fn warm(hub: &PolicyHub, policy: &str) {
 /// a `CredentialEntry`. `lookup_address_match` does not see it: asked about
 /// `$burnsnek` it returned nothing while happily naming venue addresses, which
 /// reported `burned: 0` on a token whose sink holds 13.4% of supply.
-fn burn_split(fold: &policy_archive::holders::Fold) -> (i64, i64) {
+fn burn_split(
+    fold: &policy_archive::holders::Fold,
+    registry: &mitos_registry::Registry,
+) -> (i64, i64) {
     let burned: i64 = fold
         .holders
         .iter()
-        .filter(|h| is_burn_sink(&h.address))
+        .filter(|h| is_burn_sink(&h.address, registry))
         .map(|h| h.amount)
         .sum();
     (burned, fold.held - burned)
@@ -2632,16 +2661,14 @@ fn unix_now() -> u64 {
 }
 
 /// Is this address a registered burn sink?
-fn is_burn_sink(address: &str) -> bool {
+fn is_burn_sink(address: &str, registry: &mitos_registry::Registry) -> bool {
     let Some((pay, _)) = policy_archive::trade::address_parts(address) else {
         return false;
     };
-    matches!(
-        address_registry::registry::lookup_payment_credential(&pay).map(|e| &e.category),
-        Some(address_registry::registry::AddressCategory::Script(
-            address_registry::registry::ScriptCategory::Burn { .. }
-        ))
-    )
+    registry
+        .uses(&pay)
+        .iter()
+        .any(|use_of| use_of.category == mitos_registry::Category::Burn)
 }
 
 pub async fn holders(
@@ -2681,7 +2708,7 @@ pub async fn holders(
     // ⚠️ Totalled over EVERY holder, then the list is truncated — never the
     // other way round. A sink ranked below the limit would otherwise drop out
     // and `circulating` would depend on the page size, which is not a number.
-    let (burned, circulating) = burn_split(&fold);
+    let (burned, circulating) = burn_split(&fold, &hub.registry);
 
     // The tip decomposition is the summary's, not a second fold of the archive:
     // `/summary` serves the same facts, and a provider or a lock read here must
@@ -2736,18 +2763,18 @@ pub async fn holders(
         .take(limit)
         .map(|h| {
             let cred = policy_archive::trade::address_parts(&h.address).map(|(pay, _)| pay);
-            let entry = cred
-                .as_deref()
-                .and_then(address_registry::registry::lookup_payment_credential);
-            // Credential first, then the address tables — the credential is
-            // the more specific statement where both have something to say.
-            let label = entry.map(|e| e.category.to_string()).or_else(|| {
-                address_registry::registry::lookup_address_match(
-                    &h.address,
-                    address_registry::registry::RegistryNetwork::Mainnet,
-                )
-                .map(|(cat, _)| cat.to_string())
-            });
+            // The exact address first, then the credential: jpg.store's sale
+            // and offer are one script under two forms, and only the address
+            // tells them apart.
+            let label = hub
+                .registry
+                .at_address(&h.address)
+                .map(|(_, use_of)| crate::address_registry::label(use_of))
+                .or_else(|| {
+                    cred.as_deref()
+                        .and_then(|cred| hub.registry.uses(cred).first())
+                        .map(crate::address_registry::label)
+                });
             // Clamped to the row, so `free = amount − vested` cannot wrap on a
             // lock observation that outlived its units.
             let vested = vested_by_key
@@ -2757,7 +2784,7 @@ pub async fn holders(
                 .unwrap_or(0)
                 .min(u64::try_from(h.amount).unwrap_or(0));
             HolderDto {
-                burn_sink: is_burn_sink(&h.address),
+                burn_sink: is_burn_sink(&h.address, &hub.registry),
                 lp_amount: lp_by_key
                     .get(h.key.as_str())
                     .copied()
@@ -2939,7 +2966,7 @@ fn held_through_of(
     }
     let dir = hub.policy_dir(policy);
     let table = Arc::new(
-        archive::held_through_table(&dir, Some(version), windows)?.unwrap_or(
+        archive::held_through_table(&dir, Some(version), windows, &hub.registry)?.unwrap_or(
             archive::HeldThroughTable {
                 at_unix: version,
                 rows: Vec::new(),
@@ -3785,11 +3812,11 @@ mod pools_tests {
             seen(40, "addr1pool", b"deep", 900, Some(26_000_000_000), true),
         ];
         assert_eq!(
-            unrecognised_scripts(&rows),
+            unrecognised_scripts(&rows, &mitos_registry::Registry::pinned()),
             vec![
                 UnrecognisedScriptDto {
                     kind: UnrecognisedKind::UndecodedPool,
-                    venue: Some("cswap"),
+                    venue: Some("cswap".to_string()),
                     credential: mitos_cohort::payment_cred(cswap::POOL_SCRIPT_ADDR)
                         .map(hex::encode),
                     address: cswap::POOL_SCRIPT_ADDR.into(),
@@ -3817,7 +3844,7 @@ mod pools_tests {
                 },
                 UnrecognisedScriptDto {
                     kind: UnrecognisedKind::Order,
-                    venue: Some("splash"),
+                    venue: Some("splash".to_string()),
                     credential: Some(hex::encode(order)),
                     address: bob.clone(),
                     addresses: 3,
@@ -3874,8 +3901,8 @@ mod pools_tests {
         for (address, kind, by) in cases {
             let cred = mitos_cohort::payment_cred(address);
             assert_eq!(
-                UnrecognisedKind::of(address, cred.as_ref()),
-                (kind, by),
+                UnrecognisedKind::of(address, cred.as_ref(), &mitos_registry::Registry::pinned()),
+                (kind, by.map(str::to_string)),
                 "{address}"
             );
         }
@@ -3891,7 +3918,10 @@ mod pools_tests {
         let order = mitos_dex_decode::splash::ORDER_CRED;
         rows.push(unread(99, &script_at(order, 0xa1)));
         rows.push(unread(98, &script_at(order, 0xb2)));
-        let summary = unrecognised_summary(unrecognised_scripts(&rows));
+        let summary = unrecognised_summary(unrecognised_scripts(
+            &rows,
+            &mitos_registry::Registry::pinned(),
+        ));
         assert_eq!(summary.outputs, 17);
         assert_eq!(
             summary.by_kind,

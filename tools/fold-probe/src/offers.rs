@@ -38,14 +38,12 @@
 
 use std::collections::HashMap;
 
-use address_registry::registry::{
-    AddressCategory, Marketplace, MarketplacePurpose, RegistryNetwork, ScriptCategory,
-    all_known_addresses, all_known_credentials, lookup_address_match,
-};
+use anyhow::{Context, Result};
 use live_book::address::{self, Kind};
 use live_book::publish::OfferAssociation;
 use live_book::row::Datum;
 use mitos_marketplace_decode::OfferDecode;
+use mitos_registry::{Category, MarketplacePurpose, Registry};
 use pallas_addresses::Address;
 use pallas_codec::minicbor::Decoder;
 use pallas_primitives::Hash;
@@ -99,68 +97,69 @@ impl Venue {
 /// Which decoder reads a marketplace's collection offers. `None` for a marketplace
 /// with no offer decoder — the registry may know its contract, but there is nothing
 /// here to read it with, and an outref nobody can interpret is not an answer.
-fn decode_for(marketplace: Marketplace) -> Option<OfferDecode> {
-    match marketplace {
-        Marketplace::JpgStore => Some(OfferDecode::Jpg),
-        Marketplace::Wayup => Some(OfferDecode::Wayup),
-        Marketplace::Unknown | Marketplace::Abandonware => None,
+fn decode_for(market: &str) -> Option<OfferDecode> {
+    match market {
+        "jpg.store" => Some(OfferDecode::Jpg),
+        "wayup" => Some(OfferDecode::Wayup),
+        _ => None,
     }
 }
 
 /// Every offer contract the registry knows and this build can decode.
-pub fn venues() -> Vec<Venue> {
+///
+/// The registry is passed in rather than compiled in: a venue added there is
+/// readable here without a rebuild.
+pub fn venues(registry: &Registry) -> Vec<Venue> {
     let mut out: Vec<Venue> = Vec::new();
 
-    for addr in all_known_addresses() {
-        let Some((cat, _)) = lookup_address_match(addr, RegistryNetwork::Mainnet) else {
+    for (credential, uses) in &registry.behaviour().contracts {
+        let Some(cred) = parse_credential(credential) else {
             continue;
         };
-        let AddressCategory::Script(ScriptCategory::Marketplace {
-            marketplace,
-            purpose: MarketplacePurpose::Offer,
-            ..
-        }) = cat
-        else {
-            continue;
-        };
-        let (Some(decode), Ok(bytes)) = (decode_for(*marketplace), bech32_bytes(addr)) else {
-            continue;
-        };
-        let Some(credential) = payment_credential(&bytes) else {
-            continue;
-        };
-        out.push(Venue {
-            label: marketplace.to_string(),
-            credential,
-            address: Some(bytes),
-            decode,
-        });
-    }
+        for use_of in uses {
+            if use_of.category != Category::Marketplace
+                || use_of.purpose != Some(MarketplacePurpose::Offer)
+            {
+                continue;
+            }
+            let Some(decode) = use_of.market.as_deref().and_then(decode_for) else {
+                continue;
+            };
+            let label = use_of
+                .label
+                .clone()
+                .or_else(|| use_of.market.clone())
+                .unwrap_or_else(|| "offer contract".to_string());
+            let declared: Vec<&str> = use_of.addresses().collect();
 
-    // A venue with no address anywhere in the registry — Wayup locks each offer under
-    // the bidder's own staking part, so the credential is the whole address class.
-    for (hex, entry) in all_known_credentials() {
-        let AddressCategory::Script(ScriptCategory::Marketplace {
-            marketplace,
-            purpose: MarketplacePurpose::Offer,
-            ..
-        }) = &entry.category
-        else {
-            continue;
-        };
-        let (Some(decode), Some(credential)) = (decode_for(*marketplace), parse_credential(hex))
-        else {
-            continue;
-        };
-        if out.iter().any(|v| v.credential == credential) {
-            continue;
+            // A venue with no address anywhere in the registry — Wayup locks each
+            // offer under the bidder's own staking part, so the credential is the
+            // whole address class.
+            if declared.is_empty() {
+                if out.iter().any(|v| v.credential == cred) {
+                    continue;
+                }
+                out.push(Venue {
+                    label,
+                    credential: cred,
+                    address: None,
+                    decode,
+                });
+                continue;
+            }
+
+            for address in declared {
+                let Ok(bytes) = bech32_bytes(address) else {
+                    continue;
+                };
+                out.push(Venue {
+                    label: label.clone(),
+                    credential: cred,
+                    address: Some(bytes),
+                    decode,
+                });
+            }
         }
-        out.push(Venue {
-            label: marketplace.to_string(),
-            credential,
-            address: None,
-            decode,
-        });
     }
 
     out
@@ -223,9 +222,18 @@ pub struct OfferPass {
 }
 
 impl OfferPass {
-    /// The pass over the registry's venues.
-    pub fn new() -> OfferPass {
-        OfferPass::over(venues())
+    /// The pass over the HOSTED registry's venues — fetched once, so a venue or
+    /// a corrected contract is readable without a rebuild.
+    pub fn load() -> Result<OfferPass> {
+        let loaded = mitos_registry::source::load().context("loading the address registry")?;
+        Ok(OfferPass::over(venues(&loaded.registry)))
+    }
+
+    /// The pass over the registry embedded in this binary — the tests' entry,
+    /// so a test run is offline and pinned.
+    #[cfg(test)]
+    pub fn pinned() -> OfferPass {
+        OfferPass::over(venues(&Registry::pinned()))
     }
 
     /// The pass over a given venue list — the tests' entry, and the one that lets a
@@ -357,14 +365,14 @@ mod tests {
     const JPG_CO: &str = "addr1xxgx3far7qygq0k6epa0zcvcvrevmn0ypsnfsue94nsn3tfvjel5h55fgjcxgchp830r7h2l5msrlpt8262r3nvr8eks2utwdd";
 
     fn registry_jpg() -> Venue {
-        venues()
+        venues(&Registry::pinned())
             .into_iter()
             .find(|v| v.address.is_some())
             .expect("jpg's offer contract is registered with an address")
     }
 
     fn registry_wayup() -> Venue {
-        venues()
+        venues(&Registry::pinned())
             .into_iter()
             .find(|v| v.address.is_none())
             .expect("Wayup's offer contract is registered as a credential")
@@ -372,7 +380,7 @@ mod tests {
 
     #[test]
     fn the_registry_gives_both_venues_and_no_credential_twice() {
-        let found = venues();
+        let found = venues(&Registry::pinned());
         let jpg = registry_jpg();
         assert_eq!(jpg.decode, OfferDecode::Jpg);
         assert_eq!(
@@ -453,7 +461,7 @@ mod tests {
         assert_eq!(pass.associations[0].outref, ([0xAB; 32], 7));
 
         // The same output with nothing revealed: counted, not guessed at.
-        let mut cold = OfferPass::over(venues());
+        let mut cold = OfferPass::over(venues(&Registry::pinned()));
         cold.output(
             (Hash::from([0xAB; 32]), 7),
             &address,
@@ -466,7 +474,7 @@ mod tests {
     #[test]
     fn an_inline_datum_needs_no_reveal_and_a_spent_offer_can_be_filtered_out() {
         let (cbor, _) = offer_datum([0x22; 28]);
-        let mut pass = OfferPass::over(venues());
+        let mut pass = OfferPass::over(venues(&Registry::pinned()));
         pass.output(
             (Hash::from([0xCD; 32]), 1),
             &registry_jpg().address.unwrap(),

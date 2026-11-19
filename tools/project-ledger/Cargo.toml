@@ -21,8 +21,10 @@ path = "src/main.rs"
 mitos-chain-walk = { path = "../mitos-chain-walk" }
 # Pure wallet-flow model + the frontier state machine.
 chain-ledger = { workspace = true }
-# Known DEX / marketplace / aggregator contract addresses, for `classify`.
-address-registry = { workspace = true }
+# The address registry as mitos reads it — the hosted behaviour and
+# stake-service tables. `classify` names counterparties with it and `seed`
+# seats the shared services terminal.
+mitos-registry = { path = "../../crates/mitos-registry", features = ["fetch", "pinned"] }
 # The Koios client this tool used to carry inline, and the floor rule with it.
 mitos-koios = { path = "../../crates/mitos-koios" }
 

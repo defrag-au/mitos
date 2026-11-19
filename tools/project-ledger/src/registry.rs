@@ -319,19 +319,28 @@ impl Registry {
     /// wallet alone holds over a thousand unspent fee UTxOs from unrelated
     /// collections. Knowing it once, centrally, means each new collection gets
     /// the guard for free instead of waiting for someone to notice.
-    pub fn terminal_parties(&self) -> impl Iterator<Item = Party> + '_ {
+    pub fn terminal_parties<'a>(
+        &'a self,
+        shared: &'a mitos_registry::Registry,
+    ) -> impl Iterator<Item = Party> + 'a {
         self.declared_terminal().chain(
-            address_registry::STAKE_REGISTRY
-                .keys()
-                .map(|s| Party::cardano_stake((*s).to_string())),
+            shared
+                .stakes()
+                .entries
+                .iter()
+                .map(|entry| Party::cardano_stake(entry.stake_address())),
         )
     }
 
     /// Known shared services seated automatically, with their registry labels.
-    pub fn registry_services() -> impl Iterator<Item = (String, &'static str)> {
-        address_registry::STAKE_REGISTRY
-            .entries()
-            .map(|(k, v)| ((*k).to_string(), v.label))
+    pub fn registry_services(
+        shared: &mitos_registry::Registry,
+    ) -> impl Iterator<Item = (String, &str)> + '_ {
+        shared
+            .stakes()
+            .entries
+            .iter()
+            .map(|entry| (entry.stake_address(), entry.label.as_str()))
     }
 }
 
@@ -477,14 +486,15 @@ mod tests {
     #[test]
     fn known_services_are_terminal_even_when_the_toml_declares_none() {
         let r = Registry::parse(EXAMPLE).unwrap();
+        let shared = mitos_registry::Registry::pinned();
         assert_eq!(r.declared_terminal().count(), 0, "the TOML declares none");
         assert!(
-            r.terminal_parties().count() > 0,
+            r.terminal_parties(&shared).count() > 0,
             "but the address registry's shared services are still seated terminal"
         );
         let anvil = "stake1uy50zl7a9k9c74v66c0gn833at5sh83qnjldk8hg4rrv05g3mmskr";
         assert!(
-            r.terminal_parties().any(|p| p.key == anvil),
+            r.terminal_parties(&shared).any(|p| p.key == anvil),
             "Anvil (the mint provider) must never be expandable"
         );
     }

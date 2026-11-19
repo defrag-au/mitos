@@ -77,10 +77,11 @@ impl LockPlatform {
 
 // An address tokens can reach but never leave.
 //
-// `SinkEntry` lived here until 2026-09-08. Its rule — that `evidence` is
+// `SinkEntry` lived here until 2026-09-08. Its rule — that the evidence is
 // mandatory, because "provably unspendable" and "believed unspendable" are
 // different claims about an address that removes supply from the float —
-// survives intact as `address_registry::ScriptCategory::Burn { evidence }`.
+// survives as the address registry's `category = "burn"` row, whose `source`
+// carries the evidence and whose credential is the sink itself.
 // It stopped being a per-token concern the moment two walked tokens were found
 // sending supply to the same script.
 

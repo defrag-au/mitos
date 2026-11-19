@@ -19,6 +19,8 @@ pub use address_registry_schema::{
     Behaviour, Category, Contract, DerivedFrom, MarketplacePurpose, Shape, StakeLabel, StakeLabels,
     StakeServiceKind,
 };
+#[cfg(feature = "local")]
+pub mod source;
 use address_registry_schema::{BehaviourError, StakeTableError};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -151,6 +153,11 @@ impl Registry {
 
     pub fn behaviour(&self) -> &Behaviour {
         &self.behaviour
+    }
+
+    /// The publisher's claim about when the behaviour table was made.
+    pub fn generated_at(&self) -> &str {
+        &self.behaviour.generated_at
     }
 
     pub fn stakes(&self) -> &StakeLabels {

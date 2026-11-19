@@ -181,6 +181,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
     // path above. They answer different questions: that one builds an immutable
     // snapshot for a finished token, this one serves a live, correcting feed.
     // token-explorer depends on the first and is untouched.
+    let loaded = crate::address_registry::load()?;
     let policy_hub = crate::policy_api::PolicyHub::new(crate::policy_api::HubConfig {
         data_dir: args.data_dir.clone(),
         tokens: args.tokens.clone(),
@@ -192,6 +193,10 @@ pub fn run(args: ServeArgs) -> Result<()> {
             seek_workers: args.seek_workers.max(1),
         },
         bearer: std::env::var("TOKEN_LEDGER_SERVE_TOKEN").ok(),
+        // Once, at startup: every summary this process folds is classified
+        // against these bytes, and each records the stamp beside it.
+        registry: loaded.registry,
+        stamp: loaded.stamp,
     });
 
     // THE VOLATILE TAIL, from the box's chain-tail spool. No-op without

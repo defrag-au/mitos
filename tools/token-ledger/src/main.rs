@@ -15,6 +15,7 @@
 //! - `stats` — derived balances at tip, for reconciliation against a known total
 //! - `export`/`serve` — later; see the design doc's three-tier artifact
 
+mod address_registry;
 mod ambiguous;
 mod archive;
 mod book_prices;

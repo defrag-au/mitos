@@ -21,17 +21,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "address-registry"
-version = "0.1.0"
-source = "git+https://github.com/defrag-au/shared-crates?rev=aa9fe4ab6813576345e9036a9aff2bc3793518e3#aa9fe4ab6813576345e9036a9aff2bc3793518e3"
-dependencies = [
- "phf",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "address-registry-schema"
 version = "0.1.0"
 source = "git+https://github.com/theyexist/address-registry?rev=45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995#45ff9557d0f98ed17fddcf7a8f6edcbfccf2b995"
@@ -2316,7 +2305,6 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 name = "fold-probe"
 version = "0.0.1"
 dependencies = [
- "address-registry",
  "anyhow",
  "cardano-assets",
  "clap",
@@ -2328,6 +2316,7 @@ dependencies = [
  "mitos-holder-table",
  "mitos-marketplace-decode",
  "mitos-meter",
+ "mitos-registry",
  "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",
  "pallas-primitives 1.4.0",
@@ -4201,6 +4190,8 @@ name = "mitos-registry"
 version = "0.0.1"
 dependencies = [
  "address-registry-schema",
+ "reqwest",
+ "sha2",
 ]
 
 [[package]]
@@ -5000,48 +4991,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "phf"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
-dependencies = [
- "phf_macros",
- "phf_shared",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
-dependencies = [
- "phf_shared",
- "rand 0.8.5",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
-dependencies = [
- "phf_generator",
- "phf_shared",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5223,7 +5172,6 @@ dependencies = [
 name = "project-ledger"
 version = "0.0.1"
 dependencies = [
- "address-registry",
  "anyhow",
  "chain-ledger",
  "clap",
@@ -5231,6 +5179,7 @@ dependencies = [
  "memchr",
  "mitos-chain-walk",
  "mitos-koios",
+ "mitos-registry",
  "pallas-addresses 1.4.0",
  "pallas-codec 1.4.0",
  "pallas-crypto 1.4.0",
@@ -6327,12 +6276,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "siphasher"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
-
-[[package]]
 name = "slab"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6820,7 +6763,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token-ledger"
 version = "0.0.1"
 dependencies = [
- "address-registry",
  "anyhow",
  "axum 0.8.4",
  "cardano-assets",
@@ -6839,6 +6781,7 @@ dependencies = [
  "mitos-koios",
  "mitos-launchpad-decode",
  "mitos-pool-observe",
+ "mitos-registry",
  "mitos-vesting-decode",
  "object_store",
  "pallas-addresses 1.4.0",

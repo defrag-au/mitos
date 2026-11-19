@@ -86,6 +86,8 @@ pub fn ambiguous(args: AmbiguousArgs) -> Result<()> {
     let Some(manifest) = load_manifest(&dir)? else {
         bail!("no archive at {}", dir.display());
     };
+    let loaded = crate::address_registry::load()?;
+    let registry = &loaded.registry;
     let observations = read_observations(&dir, &manifest)?;
     let roles = venue_roles_for(&observations);
     let Some(mut history) = History::open(&dir)? else {
@@ -373,16 +375,15 @@ pub fn ambiguous(args: AmbiguousArgs) -> Result<()> {
     let mut by: Vec<_> = unclaimed.into_iter().collect();
     by.sort_by_key(|(_, u)| std::cmp::Reverse(u.0));
     for (address, (n, units, datum)) in by.iter().take(15) {
-        // What the address registry says it is, by address or by script.
-        use address_registry::registry::{
-            RegistryNetwork, lookup_address_match, lookup_payment_credential,
-        };
-        let named = lookup_address_match(address, RegistryNetwork::Mainnet)
-            .map(|(c, _)| c.to_string())
+        // What the address registry says it is, by exact address first and then
+        // by script — the exact form distinguishes one script's two jobs.
+        let named = registry
+            .at_address(address)
+            .map(|(_, use_of)| crate::address_registry::label(use_of))
             .or_else(|| {
                 address_parts(address)
-                    .and_then(|(cred, _)| lookup_payment_credential(&cred))
-                    .map(|e| e.category.to_string())
+                    .and_then(|(cred, _)| registry.uses(&cred).first())
+                    .map(crate::address_registry::label)
             })
             .unwrap_or_else(|| "not in the registry".to_string());
         let (cred, stake) = address_parts(address).unwrap_or_default();
